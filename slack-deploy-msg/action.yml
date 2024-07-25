@@ -1,0 +1,79 @@
+inputs:
+  channel-id:
+    description: "Slack channel ID"
+    required: true
+  status:
+    description: "Status of the deployment"
+    required: true
+  color:
+    description: "Color of message"
+    required: true
+  env-name:
+    description: "Deloy env name"
+    required: true
+  env-url:
+    description: "Deloy env url"
+    required: true
+  slack-token:
+    description: "Slack bot token"
+    required: true
+  update-message-id:
+    description: "ID of the slack message to update"
+    required: false
+    default: ""
+
+outputs:
+  ts:
+    description: "Slack message ID"
+    value: ${{ steps.slack.outputs.ts }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Notify of deployment
+      id: slack
+      uses: slackapi/slack-github-action@v1.26.0
+      with:
+        channel-id: ${{ inputs.channel-id }}
+        update-ts: ${{ inputs.update-message-id }}
+        payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ inputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "*<${{ github.event.repository.html_url }}|${{ github.event.repository.name }}>* has ${{ inputs.status }} deploying to *<${{ inputs.env-url }}|${{ inputs.env-name }}>*"
+                      },
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*PR*\n<${{ github.event.pull_request._links.html.href }}|${{ github.event.pull_request.title }} (#${{ github.event.number }})>"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*User*\n${{ github.triggering_actor }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Commit*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Workflow Run*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|${{ github.workflow }}>"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Branch*\n<${{ github.server_url }}/${{ github.repository }}/tree/${{ github.head_ref || github.ref_name }}|${{ github.head_ref || github.ref_name }}>"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+      env:
+        SLACK_BOT_TOKEN: ${{ inputs.slack-token }}

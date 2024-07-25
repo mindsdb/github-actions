@@ -1,0 +1,22 @@
+# Get a list of environments we want to deploy to, and save it as an output
+outputs:
+  deploy-envs:
+    value: ${{ steps.make-label-list.outputs.deploy-envs }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: make-label-list
+      shell: bash
+      run: |
+        # Get a json list of labels for this PR, and discard anything not starting with "deploy-to-"
+        DEPLOY_ENVS=`echo '${{ toJson(github.event.pull_request.labels.*.name) }}' | jq -c 'map(select(test("^deploy-to-")))'`
+
+        # Delete "deploy-to-" so we're just left with the env names
+        DEPLOY_ENVS=${DEPLOY_ENVS//deploy-to-/}
+
+        # Remove empty strings
+        # DEPLOY_ENVS=${DEPLOY_ENVS//\"\"/}
+
+        # Lowercase the whole list and output it
+        echo "deploy-envs=${DEPLOY_ENVS,,}" >> "$GITHUB_OUTPUT"
