@@ -4,6 +4,10 @@ inputs:
     description: "Whether to push to Dockerhub as well as ECR"
     required: false
     default: false
+  git-sha:
+    description: "The git sha to use as the image tag prefix"
+    required: false
+    default: ${{ github.sha }}
 
 runs:
   using: 'composite'
@@ -19,7 +23,7 @@ runs:
       run: |
         # Get a githash or tag name to use as image prefix
         TAG_NAME=${{ github.event.release.tag_name }}
-        GIT_SHA=${{ env.CI_SHA }}
+        GIT_SHA=${{ inputs.git-sha }}
         IMAGE_PREFIX=${TAG_NAME:-$GIT_SHA}
 
         # Configure our buildkit builders
