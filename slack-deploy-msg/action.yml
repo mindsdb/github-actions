@@ -51,7 +51,7 @@ runs:
                       "fields": [
                         {
                           "type": "mrkdwn",
-                          "text": "*PR*\n<${{ github.event.pull_request._links.html.href }}|${{ github.event.pull_request.title }} (#${{ github.event.number }})>"
+                          "text": "*${{ github.event.pull_request && 'PR' || 'Version' }}*\n<${{ github.event.pull_request && github.event.pull_request._links.html.href || github.event.release.html_url }}|${{ github.event.pull_request && github.event.pull_request.title || github.event.release.name }} (#${{ github.event.pull_request && github.event.number || github.event.release.tag_name }})>"
                         },
                         {
                           "type": "mrkdwn",
