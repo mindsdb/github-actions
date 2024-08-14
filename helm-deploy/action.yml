@@ -67,3 +67,5 @@ runs:
             $VALUES_FILE_ARGS \
             $HELM_EXTRA_ARGS;
         fi
+    - name: Run tmate
+      uses: mxschmitt/action-tmate@v2
