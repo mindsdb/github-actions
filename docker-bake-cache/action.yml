@@ -35,5 +35,7 @@ runs:
         VERSION=$IMAGE_PREFIX BRANCH=${{ inputs.cache-prefix }} PLATFORMS=linux/amd64 docker buildx bake --progress plain -f docker/docker-bake.hcl --print
         VERSION=$IMAGE_PREFIX BRANCH=${{ inputs.cache-prefix }} PLATFORMS=linux/arm64 docker buildx bake --progress plain -f docker/docker-bake.hcl --print
         # Run both builds in parallel (they run on different nodes anyway)
-        VERSION=$IMAGE_PREFIX BRANCH=${{ inputs.cache-prefix }} PLATFORMS=linux/amd64 docker buildx bake --progress plain -f docker/docker-bake.hcl && \
+        VERSION=$IMAGE_PREFIX BRANCH=${{ inputs.cache-prefix }} PLATFORMS=linux/amd64 docker buildx bake --progress plain -f docker/docker-bake.hcl & \
         VERSION=$IMAGE_PREFIX BRANCH=${{ inputs.cache-prefix }} PLATFORMS=linux/arm64 docker buildx bake --progress plain -f docker/docker-bake.hcl
+        # Wait for both builds to finish
+        wait
