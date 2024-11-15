@@ -1,0 +1,15 @@
+defaults:
+  run:
+    shell: bash
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Copy pre-commit config
+      # Only use the default pre-commit config if the repo doesn't have one
+      if: ${{ hashFiles('.pre-commit-config.yaml') == '' }}
+      run: |
+        touch .pre-commit-config.yaml
+        cat "${{ github.action_path }}/.pre-commit-config.yaml" > .pre-commit-config.yaml
+    - name: Run pre-commit
+      uses: pre-commit/action@v3.0.0
