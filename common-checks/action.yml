@@ -1,7 +1,6 @@
 runs:
   using: 'composite'
   steps:
-    - uses: actions/setup-python@v3
     - name: Copy pre-commit config
       # Only use the default pre-commit config if the repo doesn't have one
       if: ${{ hashFiles('.pre-commit-config.yaml') == '' }}
