@@ -9,4 +9,4 @@ runs:
         touch .pre-commit-config.yaml
         cat "${{ github.action_path }}/.pre-commit-config.yaml" > .pre-commit-config.yaml
     - name: Run pre-commit
-      uses: pre-commit/action@v3.0.0
+      uses: pre-commit/action@v3.0.1
