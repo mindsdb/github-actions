@@ -1,0 +1,42 @@
+# Creates a workflow dispatch event and then waits for the workflow to complete
+inputs:
+  token:  # Note this is NOT GITHUB_TOKEN but a PAT
+    description: "The PAT token to use for the dispatch"
+    required: true
+  owner:
+    description: "The owner of the repository to dispatch the workflow to"
+    required: true
+  repo:
+    description: "The repository to dispatch the workflow to"
+    required: true
+  workflow:
+    description: "The workflow to dispatch"
+    required: true
+  workflow_inputs:
+    description: "A flat JSON object, only supports strings, numbers, and booleans (as per workflow inputs API)."
+    required: false
+    default: '{}'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Dispatch workflow
+      uses: codex-/return-dispatch@v1.12.2
+      id: return_dispatch
+      with:
+        token: ${{ secrets.REPO_DISPATCH_PAT_TOKEN }} # Note this is NOT GITHUB_TOKEN but a PAT
+        ref: main # or refs/heads/target_branch
+        repo: ${{ inputs.repo }}
+        owner: ${{ inputs.owner }}
+        workflow: ${{ inputs.workflow }}
+        workflow_inputs: ${{ inputs.workflow_inputs }}
+
+    - name: Await Run ID ${{ steps.return_dispatch.outputs.run_id }}
+      uses: Codex-/await-remote-run@v1.12.2
+      with:
+        token: ${{ github.token }}
+        repo: ${{ inputs.repo }}
+        owner: ${{ inputs.owner }}
+        run_id: ${{ steps.return_dispatch.outputs.run_id }}
+        run_timeout_seconds: 900 # 15mins
+        poll_interval_ms: 10000
