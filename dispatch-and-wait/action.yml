@@ -33,9 +33,6 @@ runs:
 
     - name: Await Run ID ${{ steps.return_dispatch.outputs.run_id }}
       uses: Codex-/await-remote-run@v1.12.2
-      permissions:
-        actions: read
-        repo: read
       with:
         token: ${{ github.token }}
         repo: ${{ inputs.repo }}
