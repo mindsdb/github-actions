@@ -25,7 +25,7 @@ runs:
       id: return_dispatch
       with:
         token: ${{ inputs.token }} # Note this is NOT GITHUB_TOKEN but a PAT
-        ref: fix/disp # or refs/heads/target_branch
+        ref: refs/heads/fix/disp # or refs/heads/target_branch
         repo: ${{ inputs.repo }}
         owner: ${{ inputs.owner }}
         workflow: ${{ inputs.workflow }}
