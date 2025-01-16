@@ -24,7 +24,7 @@ runs:
       uses: codex-/return-dispatch@v1.12.2
       id: return_dispatch
       with:
-        token: ${{ secrets.REPO_DISPATCH_PAT_TOKEN }} # Note this is NOT GITHUB_TOKEN but a PAT
+        token: ${{ inputs.token }} # Note this is NOT GITHUB_TOKEN but a PAT
         ref: main # or refs/heads/target_branch
         repo: ${{ inputs.repo }}
         owner: ${{ inputs.owner }}
