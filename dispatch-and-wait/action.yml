@@ -21,7 +21,7 @@ runs:
   using: 'composite'
   steps:
     - name: Dispatch workflow
-      uses: codex-/return-dispatch@v1.12.2
+      uses: codex-/return-dispatch@v2.0.4
       id: return_dispatch
       with:
         token: ${{ inputs.token }} # Note this is NOT GITHUB_TOKEN but a PAT
