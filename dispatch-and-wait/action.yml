@@ -38,5 +38,5 @@ runs:
         repo: ${{ inputs.repo }}
         owner: ${{ inputs.owner }}
         run_id: ${{ steps.return_dispatch.outputs.run_id }}
-        run_timeout_seconds: 900 # 15mins
+        run_timeout_seconds: 1800 # 30mins
         poll_interval_ms: 10000
