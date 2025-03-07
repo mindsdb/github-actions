@@ -25,8 +25,8 @@ runs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
       with:
-        driver-opts: |
-          default-load=false
+        driver: remote
+        endpoint: tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v2
     - name: Build and push
@@ -38,7 +38,7 @@ runs:
         IMAGE_PREFIX=${TAG_NAME:-$GIT_SHA}
 
         # Configure our buildkit builders
-        docker buildx create --name remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
+        # docker buildx create --name remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
 
         # Print what bake is going to do
         VERSION=$IMAGE_PREFIX BRANCH=${{ env.CI_ACTION_REF_NAME }} PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake -f docker/docker-bake.hcl --print ${{ inputs.target }}
