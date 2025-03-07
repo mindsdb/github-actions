@@ -8,6 +8,10 @@ inputs:
     description: "The git sha to use as the image tag prefix"
     required: false
     default: ${{ github.sha }}
+  target:
+    description: "Target"
+    required: false
+    default: ""
 
 runs:
   using: 'composite'
@@ -31,7 +35,7 @@ runs:
         docker buildx create --name=remote-buildkit-agent --node mdb_arm64 --platform linux/arm64 --append --driver=remote --use tcp://remote-buildkit-agent-arm.infrastructure.svc.cluster.local:80 || true # Same for ARM
 
         # Print what bake is going to do
-        VERSION=$IMAGE_PREFIX BRANCH=${{ env.CI_ACTION_REF_NAME }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} PLATFORM="" docker buildx bake -f docker/docker-bake.hcl --print
+        VERSION=$IMAGE_PREFIX BRANCH=${{ env.CI_ACTION_REF_NAME }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} PLATFORM="" docker buildx bake -f docker/docker-bake.hcl --print ${{ inputs.target }}
 
         # Build amd64 and arm64 images and push to repos
-        VERSION=$IMAGE_PREFIX BRANCH=${{ env.CI_ACTION_REF_NAME }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake --progress plain --push -f docker/docker-bake.hcl
+        VERSION=$IMAGE_PREFIX BRANCH=${{ env.CI_ACTION_REF_NAME }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake --progress plain --push -f docker/docker-bake.hcl ${{ inputs.target }}
