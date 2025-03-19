@@ -36,12 +36,20 @@ runs:
         TAG_NAME=${{ github.event.release.tag_name }}
         GIT_SHA=${{ inputs.git-sha }}
         IMAGE_PREFIX=${TAG_NAME:-$GIT_SHA}
+        # Get the PR head branch for PR updates, the main branch for pushes to main and releases
+        TARGET_BRANCH: ${{ 
+            github.event_name == 'pull_request' 
+              ? (github.event.action == 'closed' 
+                  ? github.event.pull_request.base.ref 
+                  : github.event.pull_request.head.ref)
+              : (github.event_name == 'release' ? github.event.release.target_commitish : '')
+          }}
 
         # Configure our buildkit builders
         # docker buildx create --name remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
 
         # Print what bake is going to do
-        VERSION=$IMAGE_PREFIX BRANCH=${{ env.CI_ACTION_REF_NAME }} PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake -f docker/docker-bake.hcl --print ${{ inputs.target }}
+        VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake -f docker/docker-bake.hcl --print ${{ inputs.target }}
 
         # Build amd64 and arm64 images and push to repos
-        VERSION=$IMAGE_PREFIX BRANCH=${{ env.CI_ACTION_REF_NAME }} PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake --progress plain --push -f docker/docker-bake.hcl ${{ inputs.target }}
+        VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake --progress plain --push -f docker/docker-bake.hcl ${{ inputs.target }}
