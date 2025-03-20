@@ -37,13 +37,9 @@ runs:
         GIT_SHA=${{ inputs.git-sha }}
         IMAGE_PREFIX=${TAG_NAME:-$GIT_SHA}
         # Get the PR head branch for PR updates, the main branch for pushes to main and releases
-        echo "event: ${{ github.event_name }}"
-        echo "action: ${{ github.event.action }}"
-        echo "base: ${{ github.event.pull_request.base.ref }}"
-        echo "head: ${{ github.event.pull_request.head.ref }}"
         TARGET_BRANCH=${{ 
             (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.base.ref)
-            || (github.event_name == 'pull_request' && github.event.pull_request.head.ref)
+            || (github.event_name == 'pull_request_target' && github.event.pull_request.head.ref)
             || (github.event_name == 'release' && github.event.release.target_commitish)
             || '' 
         }}
