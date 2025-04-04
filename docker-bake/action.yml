@@ -16,6 +16,14 @@ inputs:
     description: "Platforms"
     required: false
     default: "linux/amd64,linux/arm64"
+  push-cache:
+    description: "Should cache be pushed to registry"
+    required: false
+    default: true
+  cache-only:
+    description: "Only push cache, don't export images"
+    required: false
+    default: false
 
 runs:
   using: 'composite'
@@ -48,7 +56,7 @@ runs:
         # docker buildx create --name remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
 
         # Print what bake is going to do
-        VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake -f docker/docker-bake.hcl --print ${{ inputs.target }}
+        VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} PUSH_CACHE=${{ inputs.push-cache }} CACHE_ONLY=${{ inputs.cache-only }} docker buildx bake -f docker/docker-bake.hcl --print ${{ inputs.target }}
 
         # Build amd64 and arm64 images and push to repos
         VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake --progress plain --push -f docker/docker-bake.hcl ${{ inputs.target }}
