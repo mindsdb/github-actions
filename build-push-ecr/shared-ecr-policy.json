@@ -17,6 +17,7 @@
       ]
     },
     {
+      "Effect": "Allow",
       "Principal": {
         "AWS": "arn:aws:iam::168681354662:root"
       },
