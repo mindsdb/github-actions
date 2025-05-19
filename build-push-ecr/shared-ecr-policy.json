@@ -6,9 +6,8 @@
       "Effect": "Allow",
       "Principal": {
         "AWS": [
-          "arn:aws:iam::454861456664:root",
-          "arn:aws:iam::551913903968:root",
-          "arn:aws:iam::040931223031:root"
+          "arn:aws:iam::065786718370:root",
+          "arn:aws:iam::168681354662:root"
         ]
       },
       "Action": [
@@ -18,10 +17,9 @@
       ]
     },
     {
-      "Sid": "AllowMasterAccountOrRolesWhichNeedsWriteAccess",
       "Effect": "Allow",
       "Principal": {
-        "AWS": "arn:aws:iam::454861456664:root"
+        "AWS": "arn:aws:iam::168681354662:root"
       },
       "Action": [
         "ecr:BatchCheckLayerAvailability",
