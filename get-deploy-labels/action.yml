@@ -19,4 +19,5 @@ runs:
         # DEPLOY_ENVS=${DEPLOY_ENVS//\"\"/}
 
         # Lowercase the whole list and output it
+        echo "Writing ${DEPLOY_ENVS,,} to github output"
         echo "deploy-envs=${DEPLOY_ENVS,,}" >> "$GITHUB_OUTPUT"
