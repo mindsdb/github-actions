@@ -59,4 +59,4 @@ runs:
         VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} PUSH_CACHE=${{ inputs.push-cache }} CACHE_ONLY=${{ inputs.cache-only }} docker buildx bake -f docker/docker-bake.hcl --print ${{ inputs.target }}
 
         # Build amd64 and arm64 images and push to repos
-        VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} docker buildx bake --progress plain --push -f docker/docker-bake.hcl ${{ inputs.target }}
+        VERSION=$IMAGE_PREFIX BRANCH=$TARGET_BRANCH PLATFORMS=${{ inputs.platforms }} PUSH_TO_DOCKERHUB=${{ inputs.push-to-dockerhub }} PUSH_CACHE=${{ inputs.push-cache }} CACHE_ONLY=${{ inputs.cache-only }} docker buildx bake --progress plain --push -f docker/docker-bake.hcl ${{ inputs.target }}
