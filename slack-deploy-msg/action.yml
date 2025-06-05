@@ -30,10 +30,11 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - uses: FranzDiebold/github-env-vars-action@v2
     - name: Notify of deployment
       id: slack
       uses: slackapi/slack-github-action@v1.26.0
+      env:
+        PR_TITLE: ${{ github.event.pull_request.title }}
       with:
         channel-id: ${{ inputs.channel-id }}
         update-ts: ${{ inputs.update-message-id }}
@@ -52,7 +53,7 @@ runs:
                       "fields": [
                         {
                           "type": "mrkdwn",
-                          "text": "*${{ github.event.pull_request && 'PR' || 'Version' }}*\n<${{ github.event.pull_request && github.event.pull_request._links.html.href || github.event.release.html_url }}|${{ github.event.pull_request && env.CI_PR_TITLE || github.event.release.name }} (${{ github.event.pull_request && '#' || ''}}${{ github.event.pull_request && github.event.number || github.event.release.tag_name }})>"
+                          "text": "*${{ github.event.pull_request && 'PR' || 'Version' }}*\n<${{ github.event.pull_request && github.event.pull_request._links.html.href || github.event.release.html_url }}|${{ github.event.pull_request && env.PR_TITLE || github.event.release.name }} (${{ github.event.pull_request && '#' || ''}}${{ github.event.pull_request && github.event.number || github.event.release.tag_name }})>"
                         },
                         {
                           "type": "mrkdwn",
