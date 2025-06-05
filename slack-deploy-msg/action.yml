@@ -30,6 +30,10 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Clean PR Title
+      run: |
+        PR_TITLE=$(echo "${{ github.event.pull_request.title }}" | sed 's/"/\\"/g')
+        echo "PR_TITLE=$PR_TITLE" >> $GITHUB_ENV
     - name: Notify of deployment
       id: slack
       uses: slackapi/slack-github-action@v1.26.0
@@ -76,5 +80,4 @@ runs:
               ]
             }
       env:
-        PR_TITLE: ${{ github.event.pull_request.title | replace('"', '\\"') }}
         SLACK_BOT_TOKEN: ${{ inputs.slack-token }}
