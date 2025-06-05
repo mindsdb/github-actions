@@ -33,8 +33,6 @@ runs:
     - name: Notify of deployment
       id: slack
       uses: slackapi/slack-github-action@v1.26.0
-      env:
-        PR_TITLE: ${{ github.event.pull_request.title }}
       with:
         channel-id: ${{ inputs.channel-id }}
         update-ts: ${{ inputs.update-message-id }}
@@ -78,4 +76,5 @@ runs:
               ]
             }
       env:
+        PR_TITLE: ${{ github.event.pull_request.title }}
         SLACK_BOT_TOKEN: ${{ inputs.slack-token }}
