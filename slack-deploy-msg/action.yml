@@ -51,7 +51,7 @@ runs:
                       "fields": [
                         {
                           "type": "mrkdwn",
-                          "text": "*${{ github.event.pull_request && 'PR' || 'Version' }}*\n<${{ github.event.pull_request && github.event.pull_request._links.html.href || github.event.release.html_url }}|${{ github.event.pull_request && github.event.pull_request.title | replace('"', '\\"') || github.event.release.name }} (${{ github.event.pull_request && '#' || ''}}${{ github.event.pull_request && github.event.number || github.event.release.tag_name }})>"
+                          "text": "*${{ github.event.pull_request && 'PR' || 'Version' }}*\n<${{ github.event.pull_request && github.event.pull_request._links.html.href || github.event.release.html_url }}|${{ github.event.pull_request && env.PR_TITLE || github.event.release.name }} (${{ github.event.pull_request && '#' || ''}}${{ github.event.pull_request && github.event.number || github.event.release.tag_name }})>"
                         },
                         {
                           "type": "mrkdwn",
@@ -76,4 +76,5 @@ runs:
               ]
             }
       env:
+        PR_TITLE: ${{ github.event.pull_request.title | replace('"', '\\"') }}
         SLACK_BOT_TOKEN: ${{ inputs.slack-token }}
