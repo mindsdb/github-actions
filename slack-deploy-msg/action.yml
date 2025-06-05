@@ -31,6 +31,7 @@ runs:
   using: 'composite'
   steps:
     - name: Clean PR Title
+      shell: bash
       run: |
         PR_TITLE=$(echo "${{ github.event.pull_request.title }}" | sed 's/"/\\"/g')
         echo "PR_TITLE=$PR_TITLE" >> $GITHUB_ENV
