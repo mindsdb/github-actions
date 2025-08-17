@@ -17,9 +17,6 @@ on:
         description: "The version number or sha used in creating image tag"
         type: string
         required: false
-    secrets:
-      GH_ACTIONS_SLACK_BOT_TOKEN:
-        required: true
 
 
 
