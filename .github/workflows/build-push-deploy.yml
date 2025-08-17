@@ -100,7 +100,7 @@ jobs:
       - uses: mindsdb/github-actions/setup-env@main
       - name: Notify of deployment starting
         id: slack
-        uses: mindsdb/github-actions/slack-deploy-msg
+        uses: mindsdb/github-actions/slack-deploy-msg@main
         with:
           channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
           status: "started"
@@ -116,7 +116,7 @@ jobs:
           timeout: 600s
           wait: "true"  # We need to wait till deployment is finished here, since the calling workflow might test the deployment env
       - name: Notify of deployment finish
-        uses: mindsdb/github-actions/slack-deploy-msg
+        uses: mindsdb/github-actions/slack-deploy-msg@main
         if: always()
         with:
           channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
