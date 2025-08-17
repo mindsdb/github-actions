@@ -3,15 +3,19 @@ on:
     inputs:
       service-name:
         description: "Name of the service to build. Used as the default image name and src dir unless 'image-name' or 'src-path' are used."
+        type: string
         required: true
       environment-name:
         description: "The backend environment we are building for (API calls are pointed to).  This should be one of (development, staging, production)."
+        type: string
         required: true
       docker-build-args:
         description: "Extra args passed to 'docker build'."
+        type: string
         required: false
       docker-image-ref:
         description: "The version number or sha used in creating image tag"
+        type: string
         required: false
     secrets:
 
