@@ -7,11 +7,7 @@ on:
         required: true
       environment-name:
         description: "The backend environment we are building for (API calls are pointed to).  This should be one of (development, staging, production)."
-        type: choice
-        options:
-          - development
-          - staging
-          - production
+        type: string
         required: true
       docker-build-args:
         description: "Extra args passed to 'docker build'."
