@@ -30,6 +30,10 @@ runs:
       uses: aws-actions/amazon-ecr-login@v2
     - shell: bash
       run: |
+        ls
+        pwd
+    - shell: bash
+      run: |
         # Env var parsing
 
         INPUT_SRC_PATH=${{ inputs.src-path }}
