@@ -21,24 +21,6 @@ on:
 
 
 jobs:
-  changes:
-    name: Filter changed files
-    runs-on: mdb-dev
-    outputs:
-      not-docs: ${{ steps.filter.outputs.not-docs }}
-    concurrency:
-      group: ${{ github.workflow_ref }}
-      cancel-in-progress: true
-    steps:
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          predicate-quantifier: "every"
-          filters: |
-            not-docs:
-              - '!docs/**'  
-              - '!**/*.md'
-
   # Looks for labels like "deploy-to-<env>" attached to a PR so we can deploy to those envs
   get-deploy-labels:
     name: Get Deploy Envs
