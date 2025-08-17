@@ -47,6 +47,7 @@ jobs:
     env:
       AWS_REGION: us-east-1
     steps:
+      - uses: actions/checkout@v4
       - uses: mindsdb/github-actions/build-push-ecr@add/build-push-deploy
         with:
           module-name: ${{ inputs.service-name }}
