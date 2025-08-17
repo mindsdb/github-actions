@@ -52,7 +52,7 @@ jobs:
       deploy-envs: ${{ steps.get-labels.outputs.deploy-envs }}
     steps:
       - id: get-labels
-        uses: ./github-actions/get-deploy-labels
+        uses: mindsdb/github-actions/get-deploy-labels
 
   # Build our docker images based on our bake file
   build:
