@@ -5,7 +5,7 @@ on:
         description: "Name of the service to build. Used as the default image name and src dir unless 'image-name' or 'src-path' are used."
         type: string
         required: true
-      environment-name:
+      stage-name:
         description: "The backend environment we are building for (API calls are pointed to).  This should be one of (development, staging, production)."
         type: string
         required: true
@@ -17,7 +17,10 @@ on:
         description: "The version number or sha used in creating image tag"
         type: string
         required: false
-    #secrets:
+    secrets:
+      GH_ACTIONS_SLACK_BOT_TOKEN:
+        required: true
+
 
 
 jobs:
@@ -48,10 +51,10 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
-      - uses: mindsdb/github-actions/build-push-ecr@add/build-push-deploy
+      - uses: mindsdb/github-actions/build-push-ecr@main
         with:
           module-name: ${{ inputs.service-name }}
-          build-for-environment: ${{ inputs.environment-name }}
+          build-for-environment: ${{ inputs.stage-name }}
 
   # Push cache layers to docker registry
   # This is separate to the build step so we can do other stuff in parallel
@@ -83,12 +86,46 @@ jobs:
   # Call our deployment workflow, so long as this is not a forked PR
   # This will run the deployment workflow in the base branch, not in the PR.
   # So if you change the deploy workflow in your PR, the changes won't be reflected in this run.
-  # deploy:
-  #   name: Deploy
-  #   needs: [build, get-deploy-labels]
-  #   if: needs.get-deploy-labels.outputs.deploy-envs != '[]'
-  #   uses: ./.github/workflows/deploy.yml
-  #   with:
-  #     deploy-envs: ${{ needs.get-deploy-labels.outputs.deploy-envs }}
-  #     image-tag: ${{ github.event.pull_request.head.sha }}
-  #   secrets: inherit
+  deploy:
+    runs-on: mdb-dev
+    needs: [ get-deploy-labels, build ]
+    strategy:
+      matrix:
+        deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
+    concurrency:
+      group: deploy-${{ matrix.deploy-env }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ matrix.deploy-env }}
+      url: ${{ vars.ENV_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mindsdb/github-actions/setup-env@main
+      - name: Notify of deployment starting
+        id: slack
+        uses: ./github-actions/slack-deploy-msg
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
+          status: "started"
+          color: "#0099CC"
+          env-name: ${{ matrix.deploy-env }}
+          env-url: ${{ vars.ENV_URL }}
+          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+      - uses: DevOps-Nirvana/aws-helm-multi-deploy-nodocker@v4
+        with:
+          environment-slug: ${{matrix.deploy-env}}
+          k8s-namespace: ${{matrix.deploy-env}}
+          image-tag: ${{ inputs.stage-name }}-${{ github.sha }}
+          timeout: 600s
+          wait: "true"  # We need to wait till deployment is finished here, since the calling workflow might test the deployment env
+      - name: Notify of deployment finish
+        uses: ./github-actions/slack-deploy-msg
+        if: always()
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL_ID }}
+          status: "${{ job.status == 'success' && 'finished' || 'failed' }}"
+          color: "${{ job.status == 'success' && '#00C851' || '#FF4444' }}"
+          env-name: ${{ matrix.deploy-env }}
+          env-url: ${{ vars.ENV_URL }}
+          slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+          update-message-id: ${{ steps.slack.outputs.ts }}
