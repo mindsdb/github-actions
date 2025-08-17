@@ -100,12 +100,12 @@ jobs:
   # Call our deployment workflow, so long as this is not a forked PR
   # This will run the deployment workflow in the base branch, not in the PR.
   # So if you change the deploy workflow in your PR, the changes won't be reflected in this run.
-  deploy:
-    name: Deploy
-    needs: [build, get-deploy-labels]
-    if: needs.get-deploy-labels.outputs.deploy-envs != '[]'
-    uses: ./.github/workflows/deploy.yml
-    with:
-      deploy-envs: ${{ needs.get-deploy-labels.outputs.deploy-envs }}
-      image-tag: ${{ github.event.pull_request.head.sha }}
-    secrets: inherit
+  # deploy:
+  #   name: Deploy
+  #   needs: [build, get-deploy-labels]
+  #   if: needs.get-deploy-labels.outputs.deploy-envs != '[]'
+  #   uses: ./.github/workflows/deploy.yml
+  #   with:
+  #     deploy-envs: ${{ needs.get-deploy-labels.outputs.deploy-envs }}
+  #     image-tag: ${{ github.event.pull_request.head.sha }}
+  #   secrets: inherit
