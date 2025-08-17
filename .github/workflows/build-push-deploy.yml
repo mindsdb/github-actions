@@ -7,7 +7,11 @@ on:
         required: true
       environment-name:
         description: "The backend environment we are building for (API calls are pointed to).  This should be one of (development, staging, production)."
-        type: string
+        type: choice
+        options:
+          - development
+          - staging
+          - production
         required: true
       docker-build-args:
         description: "Extra args passed to 'docker build'."
@@ -65,10 +69,10 @@ jobs:
     env:
       AWS_REGION: us-east-1
     steps:
-      - uses: ./github-actions/build-push-ecr
+      - uses: mindsdb/github-actions/build-push-ecr@main
         with:
           module-name: ${{ inputs.service-name }}
-          build-for-environment: development
+          build-for-environment: ${{ inputs.environment-name }}
 
   # Push cache layers to docker registry
   # This is separate to the build step so we can do other stuff in parallel
