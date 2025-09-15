@@ -23,19 +23,14 @@ on:
         type: string
         required: false
         default: "['Dockerfile']"
-      # docker-bake:
-      #   description: "Run docker bake instead of a regular build."
-      #   type: boolean
-      #   required: false
-      #   default: false
-      # docker-bake-target:
-      #   description: "The target to build with docker bake."
-      #   type: string
-      #   required: false
-      # docker-bake-platforms:
-      #   description: "The platforms to build with docker bake."
-      #   type: string
-      #   required: false
+      docker-bake-target:
+        description: "The target to build with docker bake."
+        type: string
+        required: false
+      docker-bake-platforms:
+        description: "The platforms to build with docker bake."
+        type: string
+        required: false
 
 
 jobs:
@@ -46,9 +41,6 @@ jobs:
     concurrency:
       group: ${{ github.workflow_ref }} # workflow_ref contains the workflow name and branch ref
       cancel-in-progress: true          # Cancel any in-progress runs on this branch - this one is newer
-    environment:
-      # If this is a forked PR, set environment to 'manual-approval'
-      name: ${{ github.event.pull_request.head.repo.fork && 'manual-approval' || '' }}
     outputs:
       deploy-envs: ${{ steps.get-labels.outputs.deploy-envs }}
     steps:
@@ -56,11 +48,11 @@ jobs:
         uses: mindsdb/github-actions/get-deploy-labels@main
 
 
-  # Build a docker image and push it to ECR
+  # Build docker image(s) based on Dockerfile(s) and push to ECR
   build:
     runs-on: mdb-dev
     needs: [get-deploy-labels]
-    if: needs.get-deploy-labels.outputs.deploy-envs != '[]'
+    if: ${{ !inputs.docker-bake && needs.get-deploy-labels.outputs.deploy-envs != '[]' }}
     strategy:
       matrix:
         dockerfile: ${{fromJson(inputs.dockerfiles)}}
@@ -71,32 +63,22 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
-      - uses: mindsdb/github-actions/build-push-ecr@main
+      # Build via docker-bake if a bakefile is specified
+      - if: ${{ contains(matrix.dockerfile, '.hcl') }}
+        uses: mindsdb/github-actions/docker-bake@main
+        with:
+          git-sha: ${{ inputs.docker-image-ref }}
+          target: ${{ inputs.docker-bake-target }}
+          platforms: ${{ inputs.docker-bake-platforms }}
+          push-cache: false
+      # Otherwise build via regular docker
+      - if: ${{ !contains(matrix.dockerfile, '.hcl') }}
+        uses: mindsdb/github-actions/build-push-ecr@main
         with:
           module-name: ${{ inputs.service-name }}
           build-for-environment: ${{ inputs.stage-name }}
           extra-build-args: "-f ${{ matrix.dockerfile }}"
 
-  # build-bake:
-  #   runs-on: mdb-dev
-  #   needs: [get-deploy-labels]
-  #   if: inputs.docker-bake && needs.get-deploy-labels.outputs.deploy-envs != '[]'
-  #   concurrency:
-  #     group: ${{ github.workflow_ref }} # workflow_ref contains the workflow name and branch ref
-  #     cancel-in-progress: true          # Cancel any in-progress runs on this branch - this one is newer
-  #   env:
-  #     AWS_REGION: us-east-1
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: mindsdb/github-actions/docker-bake@main
-  #       with:
-  #       - uses: ./github-actions/docker-bake
-  #       with:
-  #         git-sha: ${{ inputs.docker-image-ref }}
-  #         target: ${{ inputs.docker-bake-target }}
-  #         platforms: ${{ inputs.docker-bake-platforms }}
-  #         push-cache: false
-          
 
   # Deploy the built image to the specified environments
   # Deploys to all environments at once
