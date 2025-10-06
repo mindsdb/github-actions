@@ -9,6 +9,10 @@ on:
         description: "The backend environment we are building for (API calls are pointed to).  This should be one of (development, staging, production)."
         type: string
         required: true
+      deploy-namespace:
+        description: "The Kubernetes namespace to deploy the service to."
+        type: string
+        required: false
       docker-build-args:
         description: "Extra args passed to 'docker build'."
         type: string
@@ -63,6 +67,8 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.docker-image-ref }}
       # Build via docker-bake if a bakefile is specified
       - if: ${{ contains(matrix.dockerfile, '.hcl') }}
         uses: mindsdb/github-actions/docker-bake@main
@@ -114,7 +120,7 @@ jobs:
         # Do the actual deployment
         with:
           environment-slug: ${{matrix.deploy-env}}
-          k8s-namespace: ${{matrix.deploy-env}}
+          k8s-namespace: ${{inputs.deploy-namespace || matrix.deploy-env}}
           image-tag: ${{ inputs.stage-name }}-${{ github.sha }}
           timeout: 600s
           # We need to wait till deployment is finished here, since the calling workflow might test the deployment env once this job is done
