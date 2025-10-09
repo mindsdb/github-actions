@@ -94,8 +94,11 @@ jobs:
 
   migrate:
     runs-on: mdb-dev
-    container: ${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ inputs.stage-name }}-${{ inputs.docker-image-ref }}
     needs: [get-deploy-labels, build]
+    strategy:
+      matrix:
+        deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
+    container: ${{ vars.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ inputs.stage-name }}-${{ inputs.docker-image-ref }}
     if: ${{ needs.get-deploy-labels.outputs.deploy-envs != '[]' }}
     steps:
       - name: Run migrations
