@@ -35,10 +35,11 @@ on:
         description: "The platforms to build with docker bake."
         type: string
         required: false
-      migrate-command:
-        description: "The command to run migrations."
+      migration-job-file:
+        description: "The file path to the migration k8s job YAML."
         type: string
         required: false
+        default: "deployment/migration-job.yaml"
 
 
 
@@ -98,17 +99,23 @@ jobs:
     strategy:
       matrix:
         deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
-    container: ${{ vars.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ inputs.stage-name }}-${{ inputs.docker-image-ref }}
-    if: ${{ needs.get-deploy-labels.outputs.deploy-envs != '[]' }}
+    concurrency:
+      group: deploy-${{ matrix.deploy-env }}  # All deployments for this env are grouped together
+      cancel-in-progress: false               # Don't cancel in-progress deployments, it breaks helm
     steps:
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-      - name: Run migrations
-        if: ${{ inputs.migrate-command }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.docker-image-ref }}
+      - name: Migrate
         run: |
-          ${{ inputs.migrate-command }}
+          export NAMESPACE=${{inputs.deploy-namespace || matrix.deploy-env}}
+          export IMAGE_TAG=${{ inputs.stage-name }}-${{ inputs.docker-image-ref }}
+          export JOB_NAME=$(grep -E '^ *name:' ${{ inputs.migration-job-file }} | head -1 | awk '{print $2}')
 
+          kubectl -n $NAMESPACE delete job --ignore-not-found $JOB_NAME
+          envsubst '${IMAGE_TAG} ${NAMESPACE}' < ${{ inputs.migration-job-file }} | kubectl apply -f -
+
+          kubectl -n "$NAMESPACE" wait --for=condition=complete --timeout=1m "job/$JOB_NAME"
 
   # Deploy the built image to the specified environments
   # Deploys to all environments at once
