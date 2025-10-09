@@ -35,6 +35,11 @@ on:
         description: "The platforms to build with docker bake."
         type: string
         required: false
+      migrate-command:
+        description: "The command to run migrations."
+        type: string
+        required: false
+
 
 
 jobs:
@@ -83,14 +88,27 @@ jobs:
         with:
           module-name: ${{ inputs.service-name }}
           build-for-environment: ${{ inputs.stage-name }}
+          image-ref: ${{ inputs.docker-image-ref }}
           extra-build-args: "-f ${{ matrix.dockerfile }}"
+
+
+  migrate:
+    runs-on: mdb-dev
+    container: ${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ inputs.stage-name }}-${{ inputs.docker-image-ref }}
+    needs: [get-deploy-labels, build]
+    if: ${{ needs.get-deploy-labels.outputs.deploy-envs != '[]' }}
+    steps:
+      - name: Run migrations
+        if: ${{ inputs.migrate-command }}
+        run: |
+          ${{ inputs.migrate-command }}
 
 
   # Deploy the built image to the specified environments
   # Deploys to all environments at once
   deploy:
     runs-on: mdb-dev
-    needs: [ get-deploy-labels, build ]
+    needs: [ get-deploy-labels, build, migrate ]
     strategy:
       matrix:
         deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
