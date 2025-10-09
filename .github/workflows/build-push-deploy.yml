@@ -101,6 +101,9 @@ jobs:
     container: ${{ vars.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ inputs.stage-name }}-${{ inputs.docker-image-ref }}
     if: ${{ needs.get-deploy-labels.outputs.deploy-envs != '[]' }}
     steps:
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
       - name: Run migrations
         if: ${{ inputs.migrate-command }}
         run: |
