@@ -1,5 +1,10 @@
 # Builds a docker image, then tags it with the github sha and pushes it to our Amazon ECR registry
 
+outputs:
+  image:
+    description: 'The full image reference of the built Docker image'
+    value: ${{ steps.build.outputs.image }}
+
 inputs:
   module-name:
     description: "Name of the module to build. Used as the default image name and src dir unless 'image-name' or 'src-path' are used."
@@ -29,6 +34,7 @@ runs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
     - shell: bash
+      id: build
       run: |
         # Env var parsing
 
@@ -55,3 +61,5 @@ runs:
 
         # Finally, build our runner container
         docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:latest --push .
+        
+        echo "image=$REPO_IMAGE:$IMAGE_TAG" >> $GITHUB_OUTPUT
