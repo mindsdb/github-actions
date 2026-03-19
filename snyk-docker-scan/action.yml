@@ -1,0 +1,41 @@
+# Install Snyk CLI, authenticate to Amazon ECR, and run snyk container test on a built image.
+# Expects repository secret SNYK_TOKEN. If repository/org variable ALLOW_SNYK_VULNS is set (any
+# non-empty value), the scan may exit 0 even when Snyk reports issues (`|| true`).
+
+inputs:
+  image:
+    description: "Full image reference to scan (repository/image:tag)."
+    required: true
+  dockerfile:
+    description: "Path to the Dockerfile passed to snyk container test --file."
+    required: false
+    default: "./Dockerfile"
+  severity-threshold:
+    description: "Minimum severity to report (low, medium, high, critical)."
+    required: false
+    default: "high"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Snyk CLI
+      uses: snyk/actions/setup@master
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+    - name: Run Snyk container test
+      shell: bash
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      run: |
+        snyk auth "$SNYK_TOKEN"
+        snyk_container_test() {
+          snyk container test \
+            --severity-threshold=${{ inputs.severity-threshold }} \
+            --file=${{ inputs.dockerfile }} \
+            "${{ inputs.image }}"
+        }
+        if [ -n "${{ vars.ALLOW_SNYK_VULNS }}" ]; then
+          snyk_container_test || true
+        else
+          snyk_container_test
+        fi
