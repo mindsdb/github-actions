@@ -42,6 +42,7 @@ runs:
           exit 1
         fi
         snyk auth "$SNYK_TOKEN"
+        snyk config set disableSuggestions=true
         snyk_container_test() {
           snyk container test \
             --severity-threshold=${{ inputs.severity-threshold }} \
