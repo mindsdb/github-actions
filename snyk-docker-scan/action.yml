@@ -47,6 +47,7 @@ runs:
           snyk container test \
             --severity-threshold=${{ inputs.severity-threshold }} \
             --file=${{ inputs.dockerfile }} \
+            --fail-on=upgradable \
             "${{ inputs.image }}"
         }
         if [ -n "${{ vars.ALLOW_SNYK_VULNS }}" ]; then
