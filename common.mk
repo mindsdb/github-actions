@@ -11,7 +11,7 @@
 #   VENV            - Virtual environment path (default: env)
 #   REQUIREMENTS_FILE - Requirements file for CI (default: requirements/requirements.txt)
 
-.PHONY: help activate deps lint check/lint format/check format check/fix test/unit test/unit/coverage test/unit/fast docker/build docker/run docker/stop docker/clean bootstrap
+.PHONY: help activate deps lint check/lint check/format format check/fix test/unit test/unit/coverage test/unit/fast test/report docker/build docker/run docker/stop docker/clean
 
 # --- Configuration ---
 SHELL := /bin/bash
@@ -41,21 +41,6 @@ ifeq ($(IN_CONTAINER),1)
 else
   PYTHON ?= $(VENV)/$(VENV_DIR)/$(PYTHON_EXE)
 endif
-
-# --- Bootstrap Target ---
-bootstrap: ## Clone/pull github-actions repo into .make/ for shared artifacts
-	@if [ ! -d .make ]; then \
-		echo "Creating .make directory..."; \
-		mkdir -p .make; \
-	fi
-	@if [ ! -d .make/.git ]; then \
-		echo "Cloning github-actions repo..."; \
-		git clone --depth 1 https://github.com/mindsdb/github-actions.git .make; \
-	else \
-		echo "Pulling latest github-actions..."; \
-		cd .make && git pull --ff-only && cd ..; \
-	fi
-	@echo "Bootstrap complete. Common artifacts available in .make/"
 
 # --- Help Target ---
 help: ## Display this help message
@@ -98,12 +83,12 @@ ifndef DOCKER_COMMAND
 endif
 
 # --- Linting and Formatting Targets ---
-lint: check/lint format/check ## Run all linting and formatting checks
+lint: check/lint check/format ## Run all linting and formatting checks
 
 check/lint: activate ## Check code style with Ruff
 	$(PYTHON) -m ruff check $(MODULE)
 
-format/check: activate ## Check code formatting with Ruff
+check/format: activate ## Check code formatting with Ruff
 	$(PYTHON) -m ruff format $(MODULE) --check
 
 format: activate ## Format code with Ruff
@@ -122,7 +107,7 @@ test/unit/coverage: activate ## Run unit tests with coverage
 test/unit/fast: activate ## Run only tests affected by changed files (pytest-testmon)
 	$(PYTHON) -m pytest --testmon $(TEST_PATHS) -p no:randomly --no-header -q
 
-coverage/html: activate ## Generate HTML coverage report
+test/report: activate ## Generate HTML coverage report
 	$(PYTHON) -m pytest --cov=$(MODULE) $(TEST_PATHS) --cov-report html
 
 # --- Docker Targets ---
