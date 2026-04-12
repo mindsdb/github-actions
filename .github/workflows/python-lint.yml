@@ -4,30 +4,30 @@ on:
   workflow_call:
     inputs:
       python-version:
-        description: 'Python version to use'
+        description: "Python version to use"
         type: string
         required: false
-        default: '3.12'
+        default: "3.12"
       runner:
-        description: 'Runner to use'
+        description: "Runner to use"
         type: string
         required: false
-        default: 'mdb-dev'
+        default: "mdb-dev"
       requirements-file:
-        description: 'Path to requirements file'
+        description: "Path to requirements file"
         type: string
         required: false
-        default: 'requirements/requirements.txt'
+        default: "requirements/requirements.txt"
       has-private-packages:
-        description: 'Whether private GitHub packages need authentication'
+        description: "Whether private GitHub packages need authentication"
         type: boolean
         required: false
         default: true
       make-target:
-        description: 'Make target to run for linting'
+        description: "Make target to run for linting"
         type: string
         required: false
-        default: 'lint'
+        default: "lint"
 
 jobs:
   lint:
@@ -51,7 +51,7 @@ jobs:
           chmod 600 ~/.netrc
 
       - name: Install dependencies
-        run: uv pip install --system --reinstall -r ${{ inputs.requirements-file }}
+        run: uv pip install --system -r ${{ inputs.requirements-file }}
 
       - name: Clean up netrc
         if: ${{ inputs.has-private-packages }}
