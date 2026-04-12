@@ -1,0 +1,69 @@
+name: Python Unit Tests
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        type: string
+        required: false
+        default: '3.12'
+      runner:
+        description: 'Runner to use'
+        type: string
+        required: false
+        default: 'mdb-dev'
+      requirements-file:
+        description: 'Path to requirements file'
+        type: string
+        required: false
+        default: 'requirements/requirements.txt'
+      has-private-packages:
+        description: 'Whether private GitHub packages need authentication'
+        type: boolean
+        required: false
+        default: true
+      make-target:
+        description: 'Make target to run for tests'
+        type: string
+        required: false
+        default: 'test/unit/coverage'
+
+jobs:
+  unit-tests:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ inputs.python-version }}
+
+      - name: Configure GitHub auth for private packages
+        if: ${{ inputs.has-private-packages }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PRIVATE_ACCESS_TOKEN }}
+        run: |
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "$GITHUB_TOKEN" > ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Install dependencies
+        run: uv pip install --system --reinstall -r ${{ inputs.requirements-file }}
+
+      - name: Clean up netrc
+        if: ${{ inputs.has-private-packages }}
+        run: rm -f ~/.netrc
+
+      - name: Set up CI environment
+        run: |
+          if [ -f .env.ci ]; then
+            cp .env.ci .env
+          fi
+
+      - name: Run unit tests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PRIVATE_ACCESS_TOKEN }}
+        run: make ${{ inputs.make-target }}
