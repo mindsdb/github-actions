@@ -21,6 +21,14 @@ inputs:
   image-ref:
     description: "The version number or sha used in creating image tag"
     required: false
+  public:
+    description: "If 'true', use ECR Public (public.ecr.aws) instead of private ECR."
+    required: false
+    default: "false"
+  aws-region:
+    description: "AWS region for ECR API calls. For public ECR this must be us-east-1."
+    required: false
+    default: "us-east-1"
 
 
 runs:
@@ -33,6 +41,8 @@ runs:
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
+      with:
+        registry-type: ${{ inputs.public == 'true' && 'public' || 'private' }}
     - shell: bash
       id: build
       run: |
@@ -50,9 +60,15 @@ runs:
         IMAGE_TAG=$ENVIRONMENT-$IMAGE_REF
 
         # Create repo if needed
-        aws ecr create-repository --repository-name $IMAGE_NAME && \
-        aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
-        true # Just let this fail if the repo already exists
+        if [ "${{ inputs.public }}" = "true" ]; then
+          aws ecr-public create-repository \
+            --repository-name $IMAGE_NAME \
+            --region ${{ inputs.aws-region }} || true # Let this fail if the repo already exists
+        else
+          aws ecr create-repository --repository-name $IMAGE_NAME && \
+          aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
+          true # Just let this fail if the repo already exists
+        fi
 
         docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
 
