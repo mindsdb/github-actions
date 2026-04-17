@@ -21,14 +21,6 @@ inputs:
   image-ref:
     description: "The version number or sha used in creating image tag"
     required: false
-  public:
-    description: "If 'true', use ECR Public (public.ecr.aws) instead of private ECR."
-    required: false
-    default: "false"
-  aws-region:
-    description: "AWS region for ECR API calls. For public ECR this must be us-east-1."
-    required: false
-    default: "us-east-1"
 
 
 runs:
@@ -41,8 +33,6 @@ runs:
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
-      with:
-        registry-type: ${{ inputs.public == 'true' && 'public' || 'private' }}
     - shell: bash
       id: build
       run: |
@@ -53,34 +43,16 @@ runs:
         INPUT_IMAGE_REF=${{ inputs.image-ref }}
         IMAGE_REF=${INPUT_IMAGE_REF:-$CI_SHA}
         IMAGE_NAME=${{ inputs.module-name }}
+        REPO_IMAGE=${{ steps.login-ecr.outputs.registry }}/$IMAGE_NAME
         DOCKER_BUILDKIT=1
         ENVIRONMENT=${{ inputs.build-for-environment }}
         BRANCH_NAME=${{env.ENV_NAME}}
         IMAGE_TAG=$ENVIRONMENT-$IMAGE_REF
 
-        # Create repo if needed and build REPO_IMAGE path
-        if [ "${{ inputs.public }}" = "true" ]; then
-          aws ecr-public create-repository \
-            --repository-name $IMAGE_NAME \
-            --region ${{ inputs.aws-region }} || true # Let this fail if the repo already exists
-
-          # Public ECR pushes require the registry alias: public.ecr.aws/<alias>/<repo>
-          REGISTRY_ALIAS=$(aws ecr-public describe-registries \
-            --region ${{ inputs.aws-region }} \
-            --query 'registries[0].aliases[?status==`ACTIVE`].name | [0]' \
-            --output text)
-          if [ -z "$REGISTRY_ALIAS" ] || [ "$REGISTRY_ALIAS" = "None" ]; then
-            echo "ERROR: Could not determine an ACTIVE ECR Public registry alias." >&2
-            exit 1
-          fi
-          REPO_IMAGE=${{ steps.login-ecr.outputs.registry }}/$REGISTRY_ALIAS/$IMAGE_NAME
-        else
-          aws ecr create-repository --repository-name $IMAGE_NAME && \
-          aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
-          true # Just let this fail if the repo already exists
-
-          REPO_IMAGE=${{ steps.login-ecr.outputs.registry }}/$IMAGE_NAME
-        fi
+        # Create repo if needed
+        aws ecr create-repository --repository-name $IMAGE_NAME && \
+        aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
+        true # Just let this fail if the repo already exists
 
         docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
 
