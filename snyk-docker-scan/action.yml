@@ -23,6 +23,10 @@ inputs:
   snyk-token:
     description: "Snyk API token. Pass secrets.SNYK_TOKEN. Optional if the job already sets env SNYK_TOKEN."
     required: false
+  policy-path:
+    description: "Path to a .snyk policy file with ignore rules. snyk container test does not auto-load .snyk; pass it explicitly here."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -35,6 +39,7 @@ runs:
       shell: bash
       env:
         SNYK_TOKEN_FROM_INPUT: ${{ inputs.snyk-token }}
+        POLICY_PATH: ${{ inputs.policy-path }}
       run: |
         SNYK_TOKEN="${SNYK_TOKEN_FROM_INPUT:-$SNYK_TOKEN}"
         if [ -z "$SNYK_TOKEN" ]; then
@@ -43,11 +48,20 @@ runs:
         fi
         snyk auth "$SNYK_TOKEN"
         snyk config set disableSuggestions=true
+        EXTRA_ARGS=()
+        if [ -n "$POLICY_PATH" ]; then
+          if [ ! -f "$POLICY_PATH" ]; then
+            echo "::error::policy-path '$POLICY_PATH' does not exist."
+            exit 1
+          fi
+          EXTRA_ARGS+=("--policy-path=$POLICY_PATH")
+        fi
         snyk_container_test() {
           snyk container test \
             --severity-threshold=${{ inputs.severity-threshold }} \
             --file=${{ inputs.dockerfile }} \
             --fail-on=upgradable \
+            "${EXTRA_ARGS[@]}" \
             "${{ inputs.image }}"
         }
         if [ -n "${{ vars.ALLOW_SNYK_VULNS }}" ]; then
