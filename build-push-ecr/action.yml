@@ -1,5 +1,10 @@
 # Builds a docker image, then tags it with the github sha and pushes it to our Amazon ECR registry
 
+outputs:
+  image:
+    description: "Full ECR image URI with tag (e.g. 123456.dkr.ecr.us-east-1.amazonaws.com/my-service:production-abc123)"
+    value: ${{ steps.push.outputs.image }}
+
 inputs:
   module-name:
     description: "Name of the module to build. Used as the default image name and src dir unless 'image-name' or 'src-path' are used."
@@ -30,28 +35,26 @@ runs:
       uses: aws-actions/amazon-ecr-login@v2
     - shell: bash
       run: |
-        # Env var parsing
-
         INPUT_SRC_PATH=${{ inputs.src-path }}
         SRC_PATH=${INPUT_SRC_PATH:-"./"}
         INPUT_IMAGE_REF=${{ inputs.image-ref }}
         IMAGE_REF=${INPUT_IMAGE_REF:-$CI_SHA}
         IMAGE_NAME=${{ inputs.module-name }}
         REPO_IMAGE=${{ steps.login-ecr.outputs.registry }}/$IMAGE_NAME
-        DOCKER_BUILDKIT=1
         ENVIRONMENT=${{ inputs.build-for-environment }}
-        BRANCH_NAME=${{env.ENV_NAME}}
         IMAGE_TAG=$ENVIRONMENT-$IMAGE_REF
 
-        # Create repo if needed
+        # Create repo if needed (ignore error if it already exists)
         aws ecr create-repository --repository-name $IMAGE_NAME && \
-        aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
-        true # Just let this fail if the repo already exists
+        aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || true
 
-        docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
+        docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true
 
         cd $SRC_PATH
         BUILD_ARGS="--build-arg BUILD_FOR_ENVIRONMENT=$ENVIRONMENT --build-arg IMAGE_TAG=$IMAGE_TAG"
-
-        # Finally, build our runner container
         docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:latest --push .
+
+        echo "BUILT_IMAGE=$REPO_IMAGE:$IMAGE_TAG" >> "$GITHUB_ENV"
+    - id: push
+      shell: bash
+      run: echo "image=$BUILT_IMAGE" >> "$GITHUB_OUTPUT"
