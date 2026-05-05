@@ -35,6 +35,11 @@ on:
         description: "The platforms to build with docker bake."
         type: string
         required: false
+      run-migrations:
+        description: "Whether to run the migration job before deploying."
+        type: boolean
+        required: false
+        default: false
       migration-job-file:
         description: "The file path to the migration k8s job YAML."
         type: string
@@ -96,6 +101,7 @@ jobs:
 
   migrate:
     runs-on: mdb-dev
+    if: inputs.run-migrations
     needs: [get-deploy-labels, build]
     strategy:
       matrix:
