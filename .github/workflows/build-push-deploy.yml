@@ -35,6 +35,11 @@ on:
         description: "The platforms to build with docker bake."
         type: string
         required: false
+      deploy:
+        description: "Whether to deploy after building. Set to false to build and push only."
+        type: boolean
+        required: false
+        default: true
       run-migrations:
         description: "Whether to run the migration job before deploying."
         type: boolean
@@ -71,7 +76,7 @@ jobs:
   build:
     runs-on: mdb-dev
     needs: [get-deploy-labels]
-    if: ${{ !inputs.docker-bake && needs.get-deploy-labels.outputs.deploy-envs != '[]' }}
+    if: ${{ !inputs.docker-bake && (!inputs.deploy || needs.get-deploy-labels.outputs.deploy-envs != '[]') }}
     strategy:
       matrix:
         dockerfile: ${{fromJson(inputs.dockerfiles)}}
@@ -101,7 +106,7 @@ jobs:
 
   migrate:
     runs-on: mdb-dev
-    if: inputs.run-migrations
+    if: inputs.deploy && inputs.run-migrations
     needs: [get-deploy-labels, build]
     strategy:
       matrix:
@@ -126,7 +131,7 @@ jobs:
   deploy:
     runs-on: mdb-dev
     needs: [ get-deploy-labels, build, migrate ]
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && inputs.deploy }}
     strategy:
       matrix:
         deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
