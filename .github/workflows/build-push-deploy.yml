@@ -10,7 +10,7 @@ on:
         type: string
         required: true
       deploy-namespace:
-        description: "The Kubernetes namespace to deploy the service to."
+        description: "The Kubernetes namespace to deploy the service to. Disables getting deploy envs from PR labels."
         type: string
         required: false
       docker-build-args:
@@ -41,6 +41,9 @@ on:
         required: false
         default: "deployment/migration-job.yaml"
 
+concurrency:
+  group: ${{ github.workflow_ref }} # workflow_ref contains the workflow name and branch ref
+  cancel-in-progress: true          # Cancel any in-progress runs on this branch - this one is newer
 
 
 jobs:
@@ -48,14 +51,15 @@ jobs:
   get-deploy-labels:
     name: Get Deploy Envs
     runs-on: mdb-dev
-    concurrency:
-      group: ${{ github.workflow_ref }} # workflow_ref contains the workflow name and branch ref
-      cancel-in-progress: true          # Cancel any in-progress runs on this branch - this one is newer
     outputs:
-      deploy-envs: ${{ steps.get-labels.outputs.deploy-envs }}
+      deploy-envs: ${{ steps.override.outputs.deploy-envs || steps.get-labels.outputs.deploy-envs }}
     steps:
       - id: get-labels
+        if: inputs.deploy-namespace == ''
         uses: mindsdb/github-actions/get-deploy-labels@main
+      - id: override
+        if: inputs.deploy-namespace != ''
+        run: echo 'deploy-envs=["${{ inputs.deploy-namespace }}"]' >> $GITHUB_OUTPUT
 
 
   # Build docker image(s) based on Dockerfile(s) and push to ECR
@@ -66,9 +70,6 @@ jobs:
     strategy:
       matrix:
         dockerfile: ${{fromJson(inputs.dockerfiles)}}
-    concurrency:
-      group: ${{ github.workflow_ref }} # workflow_ref contains the workflow name and branch ref
-      cancel-in-progress: true          # Cancel any in-progress runs on this branch - this one is newer
     env:
       AWS_REGION: us-east-1
     steps:
@@ -99,16 +100,13 @@ jobs:
     strategy:
       matrix:
         deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
-    concurrency:
-      group: deploy-${{ matrix.deploy-env }}  # All deployments for this env are grouped together
-      cancel-in-progress: false               # Don't cancel in-progress deployments, it breaks helm
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.docker-image-ref }}
       - name: Migrate
         run: |
-          export NAMESPACE=${{inputs.deploy-namespace || matrix.deploy-env}}
+          export NAMESPACE=${{ matrix.deploy-env }}
           export IMAGE_TAG=${{ inputs.stage-name }}-${{ inputs.docker-image-ref }}
           export JOB_NAME=$(grep -E '^ *name:' ${{ inputs.migration-job-file }} | head -1 | awk '{print $2}')
 
@@ -125,9 +123,6 @@ jobs:
     strategy:
       matrix:
         deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
-    concurrency:
-      group: deploy-${{ matrix.deploy-env }}  # All deployments for this env are grouped together
-      cancel-in-progress: false               # Don't cancel in-progress deployments, it breaks helm
     environment:
       # Assuming that ENV_URL is set in a github environment in the repo
       # If not the link in the slack message will be borked, thats all
@@ -147,11 +142,11 @@ jobs:
           env-name: ${{ matrix.deploy-env }}
           env-url: ${{ vars.ENV_URL }}
           slack-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
-      - uses: DevOps-Nirvana/aws-helm-multi-deploy-nodocker@v4
+      - uses: DevOps-Nirvana/aws-helm-multi-deploy-nodocker@v6
         # Do the actual deployment
         with:
           environment-slug: ${{matrix.deploy-env}}
-          k8s-namespace: ${{inputs.deploy-namespace || matrix.deploy-env}}
+          k8s-namespace: ${{ matrix.deploy-env }}
           image-tag: ${{ inputs.stage-name }}-${{ github.sha }}
           timeout: 600s
           # We need to wait till deployment is finished here, since the calling workflow might test the deployment env once this job is done
