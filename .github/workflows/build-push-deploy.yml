@@ -126,6 +126,7 @@ jobs:
   deploy:
     runs-on: mdb-dev
     needs: [ get-deploy-labels, build, migrate ]
+    if: ${{ always() && !failure() && !cancelled() }}
     strategy:
       matrix:
         deploy-env: ${{fromJson(needs.get-deploy-labels.outputs.deploy-envs)}}
