@@ -1,12 +1,12 @@
 # Install Snyk CLI, authenticate to Amazon ECR, and run snyk container test on a built image.
 #
-# Token: composite actions in another repo cannot use `${{ secrets.* }}` inside this file — it is
-# always empty there. Set the token either:
+# Token: composite actions in another repo cannot use `${{ secrets.* }}` or `${{ vars.* }}` inside
+# this file — they are always empty there. Set the token either:
 #   - job env: `env: { SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }} }`, or
 #   - `with: snyk-token: ${{ secrets.SNYK_TOKEN }}`
 #
-# If repository/org variable ALLOW_SNYK_VULNS is set (any non-empty value), the scan may exit 0
-# even when Snyk reports issues (`|| true`).
+# If input allow-vulns is set (any non-empty value), the scan may exit 0 even when Snyk reports
+# issues (`|| true`). Callers typically pass `allow-vulns: ${{ vars.ALLOW_SNYK_VULNS }}`.
 
 inputs:
   image:
@@ -23,6 +23,10 @@ inputs:
   snyk-token:
     description: "Snyk API token. Pass secrets.SNYK_TOKEN. Optional if the job already sets env SNYK_TOKEN."
     required: false
+  allow-vulns:
+    description: "If non-empty, scan may exit 0 even when Snyk reports issues. Pass vars.ALLOW_SNYK_VULNS."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -50,7 +54,7 @@ runs:
             --fail-on=upgradable \
             "${{ inputs.image }}"
         }
-        if [ -n "${{ vars.ALLOW_SNYK_VULNS }}" ]; then
+        if [ -n "${{ inputs.allow-vulns }}" ]; then
           snyk_container_test || true
         else
           snyk_container_test
