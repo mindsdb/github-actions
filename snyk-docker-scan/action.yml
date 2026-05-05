@@ -44,6 +44,7 @@ runs:
       env:
         SNYK_TOKEN_FROM_INPUT: ${{ inputs.snyk-token }}
         POLICY_PATH: ${{ inputs.policy-path }}
+        ALLOW_VULNS: ${{ inputs.allow-vulns }}
       run: |
         SNYK_TOKEN="${SNYK_TOKEN_FROM_INPUT:-$SNYK_TOKEN}"
         if [ -z "$SNYK_TOKEN" ]; then
@@ -68,7 +69,7 @@ runs:
             "${EXTRA_ARGS[@]}" \
             "${{ inputs.image }}"
         }
-        if [ -n "${{ inputs.allow-vulns }}" ]; then
+        if [ -n "$ALLOW_VULNS" ]; then
           snyk_container_test || true
         else
           snyk_container_test
