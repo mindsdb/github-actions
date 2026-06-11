@@ -48,6 +48,11 @@ runs:
       run: |
         set -euo pipefail
 
+        # Fail fast on empty tokens — otherwise argocd silently falls back to
+        # an interactive `Username:` prompt and dies with `fatal msg=EOF`.
+        : "${ARGOCD_AUTH_TOKEN:?ARGOCD_AUTH_TOKEN is empty — check the org/repo secret is set and visible to this repo}"
+        : "${GH_TOKEN:?GH_TOKEN is empty — pass GH_PRIVATE_ACCESS_TOKEN via the gh-token input}"
+
         OWN_REPO="$GITHUB_REPOSITORY"
         OWN_SHORT="${OWN_REPO##*/}"
         PR_NUMBER="$(jq -r .pull_request.number  "$GITHUB_EVENT_PATH")"
