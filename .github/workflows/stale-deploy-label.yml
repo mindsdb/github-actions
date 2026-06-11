@@ -1,0 +1,60 @@
+# Strip the `deploy` label from PRs that haven't seen any activity in 3 days.
+#
+# The label drives the per-PR ArgoCD environment ApplicationSet's pullRequest
+# generator filter — removing the label causes ArgoCD to delete the generated
+# Applications and prune the namespace.
+#
+# Called as a reusable workflow by per-repo scheduled wrappers. See e.g.
+#   auth/.github/workflows/stale-deploy.yml
+#   mindshub_frontend/.github/workflows/stale-deploy.yml
+
+name: Stale deploy-label cleanup
+on:
+  workflow_call:
+    inputs:
+      target-repo:
+        description: "owner/repo to scan (e.g. mindsdb/auth)"
+        type: string
+        required: true
+      stale-days:
+        description: "How many days of inactivity before stripping the label"
+        type: number
+        required: false
+        default: 3
+
+jobs:
+  prune:
+    runs-on: mdb-dev
+    env:
+      GH_TOKEN: ${{ secrets.GH_PRIVATE_ACCESS_TOKEN }}
+      TARGET_REPO: ${{ inputs.target-repo }}
+      STALE_DAYS: ${{ inputs.stale-days }}
+    steps:
+      - name: Strip `deploy` from idle PRs
+        run: |
+          set -euo pipefail
+
+          # Cross-platform `date` cutoff. Self-hosted mdb-dev runners are Linux —
+          # `date -u -d` is GNU coreutils. If this workflow ever moves to macOS
+          # runners, swap to `date -u -v-${STALE_DAYS}d -Iseconds`.
+          THRESHOLD_ISO="$(date -u -d "${STALE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Threshold: ${THRESHOLD_ISO} (PRs older than this lose the label)"
+
+          mapfile -t STALE_PRS < <(
+            gh pr list --repo "${TARGET_REPO}" --label deploy --state open \
+              --json number,updatedAt,title \
+              --jq ".[] | select(.updatedAt < \"${THRESHOLD_ISO}\") | .number"
+          )
+
+          if [[ ${#STALE_PRS[@]} -eq 0 ]]; then
+            echo "No stale deploy-labeled PRs in ${TARGET_REPO}."
+            exit 0
+          fi
+
+          for n in "${STALE_PRS[@]}"; do
+            echo "::group::Removing label from ${TARGET_REPO}#${n}"
+            gh pr edit "$n" --repo "${TARGET_REPO}" --remove-label deploy
+            gh pr comment "$n" --repo "${TARGET_REPO}" --body \
+              "PR has been idle for ${STALE_DAYS}+ days. Removed the \`deploy\` label and tore down the per-PR env. Re-add the label to redeploy."
+            echo "::endgroup::"
+          done
