@@ -97,6 +97,9 @@ runs:
           fi
         fi
 
-        "$ARGOCD_BIN" login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web
+        # Skip `argocd login` — it doesn't honour --auth-token (login only
+        # accepts username/password/sso), and the ARGOCD_SERVER +
+        # ARGOCD_AUTH_TOKEN env vars set above are picked up by every
+        # subsequent argocd command directly.
         echo "argocd app set ${PARENT_APP} ${set_args[*]}"
-        "$ARGOCD_BIN" app set "$PARENT_APP" "${set_args[@]}"
+        "$ARGOCD_BIN" app set "$PARENT_APP" --grpc-web "${set_args[@]}"
