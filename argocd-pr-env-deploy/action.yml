@@ -1,0 +1,77 @@
+# Apply per-PR image tags to the anchor PR's ArgoCD environment.
+#
+# Resolves:
+#   - This PR (anchor) — own head SHA, repo short name from $GITHUB_REPOSITORY.
+#   - Any `Deploys: org/repo#N` line in the anchor PR body — looks up each
+#     linked PR's head SHA via the GitHub API.
+#
+# Issues a single `argocd app set` against the parent Application
+# (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
+# resolved repo. ArgoCD's automated sync + the sync-wave annotations on the
+# parent's children handle the rest — no `argocd app sync` is issued here.
+#
+# Must run from a `pull_request` event; PR number and head SHA are read from
+# $GITHUB_EVENT_PATH so callers don't have to pass them.
+
+name: ArgoCD Deploy (PR env)
+description: Update the per-PR env's parent Application with own + linked image tags.
+
+inputs:
+  argocd-token:
+    description: ArgoCD API token (for the ci-pr-envs account).
+    required: true
+  gh-token:
+    description: GitHub PAT used to query cross-referenced PRs' head SHAs.
+    required: true
+  argocd-server:
+    description: ArgoCD server hostname.
+    required: false
+    default: argo.dev.mindsdb.com
+  argocd-version:
+    description: ArgoCD CLI version installed when missing from the runner.
+    required: false
+    default: v2.13.1
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ARGOCD_SERVER: ${{ inputs.argocd-server }}
+        ARGOCD_AUTH_TOKEN: ${{ inputs.argocd-token }}
+        ARGOCD_VERSION: ${{ inputs.argocd-version }}
+        GH_TOKEN: ${{ inputs.gh-token }}
+      run: |
+        set -euo pipefail
+
+        OWN_REPO="$GITHUB_REPOSITORY"
+        OWN_SHORT="${OWN_REPO##*/}"
+        PR_NUMBER="$(jq -r .pull_request.number  "$GITHUB_EVENT_PATH")"
+        OWN_SHA="$(  jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
+        PARENT_APP="pr-${OWN_SHORT}-${PR_NUMBER}"
+
+        # Build the helm-set list: own PR first, then any linked PRs resolved
+        # from `Deploys: org/repo#N` lines in the anchor's PR body. Self-links
+        # and unresolvable PRs are silently skipped.
+        set_args=( --helm-set "tags.${OWN_SHORT}=development-${OWN_SHA}" )
+        while IFS=: read -r repo sha; do
+          set_args+=( --helm-set "tags.${repo}=development-${sha}" )
+        done < <(
+          gh pr view "$PR_NUMBER" --repo "$OWN_REPO" --json body --jq .body \
+            | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#[0-9]+' \
+            | while read -r _kw ref; do
+                full="${ref%%#*}"; num="${ref##*#}"
+                [ "$full" = "$OWN_REPO" ] && continue
+                sha="$(gh pr view "$num" --repo "$full" --json headRefOid --jq .headRefOid 2>/dev/null)" || continue
+                [ -n "$sha" ] && echo "${full##*/}:${sha}"
+              done
+        )
+
+        if ! command -v argocd >/dev/null 2>&1; then
+          curl -sSLo /tmp/argocd "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
+          install -m 0755 /tmp/argocd /usr/local/bin/argocd
+        fi
+
+        argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web
+        echo "argocd app set ${PARENT_APP} ${set_args[*]}"
+        argocd app set "$PARENT_APP" "${set_args[@]}"
