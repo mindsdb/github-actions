@@ -56,14 +56,20 @@ runs:
         OWN_REPO="$GITHUB_REPOSITORY"
         OWN_SHORT="${OWN_REPO##*/}"
         PR_NUMBER="$(jq -r .pull_request.number "$GITHUB_EVENT_PATH")"
-        # IMPORTANT: $GITHUB_SHA (not .pull_request.head.sha). On pull_request
-        # events GitHub sets $GITHUB_SHA to the synthetic *merge commit* SHA
-        # (PR head merged into base, for build validation). build-push-ecr
-        # tags images as `development-${GITHUB_SHA}`, so the deploy must
-        # reference the same SHA — `.pull_request.head.sha` (PR branch tip)
-        # is a *different* commit on every PR and produces tags that don't
-        # exist in ECR.
-        OWN_SHA="$GITHUB_SHA"
+
+        # Two SHAs, used for two different things:
+        #   $GITHUB_SHA              = merge SHA (PR head merged into base, a
+        #                              synthetic commit only reachable via
+        #                              refs/pull/N/merge). build-push-ecr tags
+        #                              images as `development-${GITHUB_SHA}`,
+        #                              so the image-tag override uses this.
+        #   .pull_request.head.sha   = PR branch tip — the commit ArgoCD's
+        #                              repo-server can actually fetch as a
+        #                              `targetRevision`. Used for the chart
+        #                              revision so chart changes on the PR
+        #                              branch deploy with the PR.
+        OWN_MERGE_SHA="$GITHUB_SHA"
+        OWN_HEAD_SHA="$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
         PARENT_APP="pr-${OWN_SHORT}-${PR_NUMBER}"
 
         # GitHub REST helper — auth + sensible headers in one place. No `gh`
@@ -74,11 +80,23 @@ runs:
                "https://api.github.com$1"
         }
 
-        # Build `--helm-set tags.<repo>=development-<sha>` for own + any linked
-        # PRs in the anchor body. Self-links and unresolvable PRs are skipped.
-        set_args=( --helm-set "tags.${OWN_SHORT}=development-${OWN_SHA}" )
-        while IFS=: read -r repo sha; do
-          set_args+=( --helm-set "tags.${repo}=development-${sha}" )
+        # Build the override list — for each known PR (own + every linked
+        # one) we emit two helm-set args:
+        #   tags.<repo>=development-<merge-sha>   image tag (matches ECR push)
+        #   revisions.<repo>=<head-sha>           chart git revision (ArgoCD
+        #                                          fetches the chart at this
+        #                                          commit; pr-branch chart
+        #                                          changes deploy with the PR)
+        # Self-links and unresolvable PRs are skipped silently.
+        set_args=(
+          --helm-set "tags.${OWN_SHORT}=development-${OWN_MERGE_SHA}"
+          --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
+        )
+        while IFS=: read -r repo merge_sha head_sha; do
+          set_args+=(
+            --helm-set "tags.${repo}=development-${merge_sha}"
+            --helm-set "revisions.${repo}=${head_sha}"
+          )
         done < <(
           gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" \
             | jq -r '.body // ""' \
@@ -86,12 +104,14 @@ runs:
             | while read -r _kw ref; do
                 full="${ref%%#*}"; num="${ref##*#}"
                 [ "$full" = "$OWN_REPO" ] && continue
-                # .merge_commit_sha, not .head.sha — the linked PR's build
-                # also ran under $GITHUB_SHA (the merge SHA), so that's what
-                # the ECR tag will be. merge_commit_sha is null when the PR
-                # is unmergeable (conflicts); we skip those silently.
-                sha="$(gh_api "/repos/$full/pulls/$num" | jq -r '.merge_commit_sha // empty')" || continue
-                [ -n "$sha" ] && echo "${full##*/}:${sha}"
+                # One API call, both SHAs out. merge_commit_sha is null on
+                # unmergeable PRs; we skip those.
+                read -r merge_sha head_sha < <(
+                  gh_api "/repos/$full/pulls/$num" \
+                    | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
+                ) || continue
+                [ -n "$merge_sha" ] && [ -n "$head_sha" ] \
+                  && echo "${full##*/}:${merge_sha}:${head_sha}"
               done
         )
 
