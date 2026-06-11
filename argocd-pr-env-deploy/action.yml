@@ -3,15 +3,19 @@
 # Resolves:
 #   - This PR (anchor) — own head SHA, repo short name from $GITHUB_REPOSITORY.
 #   - Any `Deploys: org/repo#N` line in the anchor PR body — looks up each
-#     linked PR's head SHA via the GitHub API.
+#     linked PR's head SHA via the GitHub REST API.
 #
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
 # resolved repo. ArgoCD's automated sync + the sync-wave annotations on the
-# parent's children handle the rest — no `argocd app sync` is issued here.
+# parent's children handle the rollout — no `argocd app sync` is issued here.
 #
 # Must run from a `pull_request` event; PR number and head SHA are read from
 # $GITHUB_EVENT_PATH so callers don't have to pass them.
+#
+# Requires `curl` + `jq` on the runner. Does NOT require `gh` (the action
+# talks to the GitHub REST API directly). Installs `argocd` to $RUNNER_TEMP
+# if it's not already on PATH.
 
 name: ArgoCD Deploy (PR env)
 description: Update the per-PR env's parent Application with own + linked image tags.
@@ -50,28 +54,44 @@ runs:
         OWN_SHA="$(  jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
         PARENT_APP="pr-${OWN_SHORT}-${PR_NUMBER}"
 
-        # Build the helm-set list: own PR first, then any linked PRs resolved
-        # from `Deploys: org/repo#N` lines in the anchor's PR body. Self-links
-        # and unresolvable PRs are silently skipped.
+        # GitHub REST helper — auth + sensible headers in one place. No `gh`
+        # dependency: self-hosted runners may not have it.
+        gh_api() {
+          curl -sfH "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "https://api.github.com$1"
+        }
+
+        # Build `--helm-set tags.<repo>=development-<sha>` for own + any linked
+        # PRs in the anchor body. Self-links and unresolvable PRs are skipped.
         set_args=( --helm-set "tags.${OWN_SHORT}=development-${OWN_SHA}" )
         while IFS=: read -r repo sha; do
           set_args+=( --helm-set "tags.${repo}=development-${sha}" )
         done < <(
-          gh pr view "$PR_NUMBER" --repo "$OWN_REPO" --json body --jq .body \
+          gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" \
+            | jq -r '.body // ""' \
             | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#[0-9]+' \
             | while read -r _kw ref; do
                 full="${ref%%#*}"; num="${ref##*#}"
                 [ "$full" = "$OWN_REPO" ] && continue
-                sha="$(gh pr view "$num" --repo "$full" --json headRefOid --jq .headRefOid 2>/dev/null)" || continue
+                sha="$(gh_api "/repos/$full/pulls/$num" | jq -r '.head.sha // empty')" || continue
                 [ -n "$sha" ] && echo "${full##*/}:${sha}"
               done
         )
 
-        if ! command -v argocd >/dev/null 2>&1; then
-          curl -sSLo /tmp/argocd "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
-          install -m 0755 /tmp/argocd /usr/local/bin/argocd
+        # Install argocd CLI to a writable location if missing. /usr/local/bin
+        # is owned by root on self-hosted runners; $RUNNER_TEMP is per-job
+        # and always user-writable.
+        if command -v argocd >/dev/null 2>&1; then
+          ARGOCD_BIN=argocd
+        else
+          ARGOCD_BIN="${RUNNER_TEMP:-/tmp}/argocd"
+          if [ ! -x "$ARGOCD_BIN" ]; then
+            curl -sSLo "$ARGOCD_BIN" "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
+            chmod +x "$ARGOCD_BIN"
+          fi
         fi
 
-        argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web
+        "$ARGOCD_BIN" login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web
         echo "argocd app set ${PARENT_APP} ${set_args[*]}"
-        argocd app set "$PARENT_APP" "${set_args[@]}"
+        "$ARGOCD_BIN" app set "$PARENT_APP" "${set_args[@]}"
