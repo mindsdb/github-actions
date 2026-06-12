@@ -178,3 +178,20 @@ runs:
 
         echo "argocd app set ${PARENT_APP} ${set_args[*]}"
         "$ARGOCD_BIN" app set "$PARENT_APP" --grpc-web "${set_args[@]}"
+
+        # A sync operation may be in flight — e.g. the parent's very first
+        # automated sync, or a rollout from a previous commit stuck waiting on
+        # an unhealthy wave. `app set` updates the spec but does NOT interrupt
+        # a running operation, and ArgoCD won't start the auto-sync carrying
+        # the new parameters until the current operation ends — which it never
+        # does if a wave is wedged (e.g. ImagePullBackOff). Terminate it; the
+        # terminated operation ran with the OLD parameters, so automated sync
+        # immediately starts a fresh one with the parameters set above. When
+        # nothing is running the CLI errors ("Unable to terminate operation.
+        # No operation is in progress"), which is the normal case and fine.
+        # (TerminateOperation requires the `applications, sync` RBAC grant.)
+        if term_err="$("$ARGOCD_BIN" app terminate-op "$PARENT_APP" --grpc-web 2>&1)"; then
+          echo "Terminated in-flight sync on ${PARENT_APP}; automated sync will restart with the new parameters."
+        else
+          echo "No in-flight sync to terminate on ${PARENT_APP} (${term_err})."
+        fi
