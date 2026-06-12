@@ -2,8 +2,9 @@
 #
 # Resolves:
 #   - This PR (anchor) — own head SHA, repo short name from $GITHUB_REPOSITORY.
-#   - Any `Deploys: org/repo#N` line in the anchor PR body — looks up each
-#     linked PR's head SHA via the GitHub REST API.
+#   - Any `Deploys: repo#N` or `Deploys: org/repo#N` line in the anchor PR
+#     body (owner defaults to this repo's org) — looks up each linked PR's
+#     head SHA via the GitHub REST API.
 #
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
@@ -87,7 +88,9 @@ runs:
         #                                          fetches the chart at this
         #                                          commit; pr-branch chart
         #                                          changes deploy with the PR)
-        # Self-links and unresolvable PRs are skipped silently.
+        # Links accept `Deploys: repo#N` (owner defaults to this repo's org)
+        # or `Deploys: org/repo#N`. Self-links are skipped; unresolvable PRs
+        # are skipped with a warning.
         set_args=(
           --helm-set "tags.${OWN_SHORT}=development-${OWN_MERGE_SHA}"
           --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
@@ -103,15 +106,23 @@ runs:
             | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#[0-9]+' \
             | while read -r _kw ref; do
                 full="${ref%%#*}"; num="${ref##*#}"
+                case "$full" in
+                  */*) ;;
+                  *)   full="${OWN_REPO%%/*}/$full" ;;
+                esac
                 [ "$full" = "$OWN_REPO" ] && continue
                 # One API call, both SHAs out. merge_commit_sha is null on
                 # unmergeable PRs; we skip those.
+                merge_sha=""; head_sha=""
                 read -r merge_sha head_sha < <(
                   gh_api "/repos/$full/pulls/$num" \
                     | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
-                ) || continue
-                [ -n "$merge_sha" ] && [ -n "$head_sha" ] \
-                  && echo "${full##*/}:${merge_sha}:${head_sha}"
+                ) || true
+                if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
+                  echo "${full##*/}:${merge_sha}:${head_sha}"
+                else
+                  echo "::warning::Deploys link ${full}#${num} could not be resolved (PR missing or unmergeable); skipping" >&2
+                fi
               done
         )
 
@@ -132,5 +143,22 @@ runs:
         # accepts username/password/sso), and the ARGOCD_SERVER +
         # ARGOCD_AUTH_TOKEN env vars set above are picked up by every
         # subsequent argocd command directly.
+
+        # The parent Application is created by the pr-environments
+        # ApplicationSet, which polls GitHub every 60s (requeueAfterSeconds) —
+        # on a fresh `deploy` label the app may not exist yet when this step
+        # runs (builds can be cache-fast). Poll before `app set` instead of
+        # failing hard; 5 minutes is comfortably past the AppSet requeue.
+        for i in $(seq 1 30); do
+          "$ARGOCD_BIN" app get "$PARENT_APP" --grpc-web >/dev/null 2>&1 && break
+          if [ "$i" -eq 30 ]; then
+            echo "Timed out waiting for Application ${PARENT_APP} to be created by the pr-environments ApplicationSet." >&2
+            echo "Check the PR carries the 'deploy' label and the ApplicationSet controller is healthy." >&2
+            exit 1
+          fi
+          echo "Application ${PARENT_APP} not found yet (attempt ${i}/30); retrying in 10s..."
+          sleep 10
+        done
+
         echo "argocd app set ${PARENT_APP} ${set_args[*]}"
         "$ARGOCD_BIN" app set "$PARENT_APP" --grpc-web "${set_args[@]}"
