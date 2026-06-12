@@ -150,13 +150,29 @@ runs:
         # runs (builds can be cache-fast). Poll before `app set` instead of
         # failing hard; 5 minutes is comfortably past the AppSet requeue.
         for i in $(seq 1 30); do
-          "$ARGOCD_BIN" app get "$PARENT_APP" --grpc-web >/dev/null 2>&1 && break
+          if get_err="$("$ARGOCD_BIN" app get "$PARENT_APP" --grpc-web 2>&1 >/dev/null)"; then
+            break
+          fi
+          # ArgoCD reports a non-existent app as PermissionDenied for
+          # API-key accounts (existence is hidden), so both NotFound and
+          # PermissionDenied mean "keep waiting". Anything else (bad token,
+          # TLS/connection errors, version mismatch) won't fix itself —
+          # fail immediately with the real error instead of looping.
+          case "$get_err" in
+            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*) ;;
+            *)
+              echo "argocd app get ${PARENT_APP} failed with an unexpected error:" >&2
+              echo "$get_err" >&2
+              exit 1
+              ;;
+          esac
           if [ "$i" -eq 30 ]; then
             echo "Timed out waiting for Application ${PARENT_APP} to be created by the pr-environments ApplicationSet." >&2
+            echo "Last error: $get_err" >&2
             echo "Check the PR carries the 'deploy' label and the ApplicationSet controller is healthy." >&2
             exit 1
           fi
-          echo "Application ${PARENT_APP} not found yet (attempt ${i}/30); retrying in 10s..."
+          echo "Application ${PARENT_APP} not available yet (attempt ${i}/30): $get_err"
           sleep 10
         done
 
