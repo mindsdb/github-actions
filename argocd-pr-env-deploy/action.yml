@@ -195,3 +195,12 @@ runs:
         else
           echo "No in-flight sync to terminate on ${PARENT_APP} (${term_err})."
         fi
+
+        # Explicitly request a sync rather than waiting for the application
+        # controller's reconciliation poll to notice the spec change. The CLI
+        # call returns once the operation has been *queued* (--async); we
+        # don't wait for the full rollout here because parent syncs are
+        # wave-gated and can take minutes — that's argocd's job to drive
+        # from this point on. Failing to queue is fatal (likely RBAC).
+        echo "argocd app sync ${PARENT_APP} --async"
+        "$ARGOCD_BIN" app sync "$PARENT_APP" --grpc-web --async
