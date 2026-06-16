@@ -222,6 +222,24 @@ runs:
         # call returns once the operation has been *queued* (--async); we
         # don't wait for the full rollout here because parent syncs are
         # wave-gated and can take minutes — that's argocd's job to drive
-        # from this point on. Failing to queue is fatal (likely RBAC).
+        # from this point on.
+        #
+        # FailedPrecondition: "another operation is already in progress"
+        # means automated.sync ALREADY queued an op in response to our
+        # `app set` (which happens within ~ms when automated sync is on).
+        # That's the success case for us — bail with a friendly log, not
+        # exit 1. Any other failure (RBAC, connectivity) still fatals.
         echo "argocd app sync ${PARENT_APP} --async"
-        "$ARGOCD_BIN" app sync "$PARENT_APP" --grpc-web --async
+        if sync_err="$("$ARGOCD_BIN" app sync "$PARENT_APP" --grpc-web --async 2>&1)"; then
+          echo "Sync queued."
+        else
+          case "$sync_err" in
+            *"another operation is already in progress"*)
+              echo "Sync was already in progress (automated.sync picked up the app set change); nothing to do."
+              ;;
+            *)
+              echo "$sync_err" >&2
+              exit 1
+              ;;
+          esac
+        fi
