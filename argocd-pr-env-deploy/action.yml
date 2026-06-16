@@ -149,30 +149,51 @@ runs:
         # on a fresh `deploy` label the app may not exist yet when this step
         # runs (builds can be cache-fast). Poll before `app set` instead of
         # failing hard; 5 minutes is comfortably past the AppSet requeue.
+        # Two states make this poll non-trivial:
+        #   1. App doesn't exist yet — ApplicationSet hasn't run its requeue
+        #      cycle (60s) and created it. `argocd app get` returns NotFound
+        #      (or PermissionDenied — API-key accounts can't tell existence).
+        #   2. App exists but is being DELETED — happens when the user removed
+        #      the `deploy` label then re-added it: the AppSet starts deleting
+        #      the old Application before recreating, and `argocd app get`
+        #      returns the deleting object successfully. If we proceed,
+        #      `argocd app sync` fails with FailedPrecondition: application
+        #      is deleting. Detect that via `.metadata.deletionTimestamp` on
+        #      the JSON output and treat it the same as "not ready yet".
+        # 5 minutes is comfortably past both the AppSet requeue and the
+        # typical Application finaliser cleanup.
         for i in $(seq 1 30); do
-          if get_err="$("$ARGOCD_BIN" app get "$PARENT_APP" --grpc-web 2>&1 >/dev/null)"; then
-            break
+          if get_out="$("$ARGOCD_BIN" app get "$PARENT_APP" --grpc-web -o json 2>&1)"; then
+            # App exists. Is it being deleted? If so, keep waiting until the
+            # new one (which won't have a deletionTimestamp) comes up.
+            del_ts="$(printf '%s' "$get_out" | jq -r '.metadata.deletionTimestamp // empty' 2>/dev/null || true)"
+            if [ -z "${del_ts:-}" ]; then
+              break
+            fi
+            get_err="application is being deleted (deletionTimestamp=${del_ts}); waiting for ApplicationSet to recreate"
+          else
+            get_err="$get_out"
+            # ArgoCD reports a non-existent app as PermissionDenied for
+            # API-key accounts (existence is hidden), so both NotFound and
+            # PermissionDenied mean "keep waiting". Anything else (bad token,
+            # TLS/connection errors, version mismatch) won't fix itself —
+            # fail immediately with the real error instead of looping.
+            case "$get_err" in
+              *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*) ;;
+              *)
+                echo "argocd app get ${PARENT_APP} failed with an unexpected error:" >&2
+                echo "$get_err" >&2
+                exit 1
+                ;;
+            esac
           fi
-          # ArgoCD reports a non-existent app as PermissionDenied for
-          # API-key accounts (existence is hidden), so both NotFound and
-          # PermissionDenied mean "keep waiting". Anything else (bad token,
-          # TLS/connection errors, version mismatch) won't fix itself —
-          # fail immediately with the real error instead of looping.
-          case "$get_err" in
-            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*) ;;
-            *)
-              echo "argocd app get ${PARENT_APP} failed with an unexpected error:" >&2
-              echo "$get_err" >&2
-              exit 1
-              ;;
-          esac
           if [ "$i" -eq 30 ]; then
-            echo "Timed out waiting for Application ${PARENT_APP} to be created by the pr-environments ApplicationSet." >&2
-            echo "Last error: $get_err" >&2
+            echo "Timed out waiting for Application ${PARENT_APP} to be ready." >&2
+            echo "Last status: $get_err" >&2
             echo "Check the PR carries the 'deploy' label and the ApplicationSet controller is healthy." >&2
             exit 1
           fi
-          echo "Application ${PARENT_APP} not available yet (attempt ${i}/30): $get_err"
+          echo "Application ${PARENT_APP} not ready (attempt ${i}/30): $get_err"
           sleep 10
         done
 
