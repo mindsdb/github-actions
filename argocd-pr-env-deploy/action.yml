@@ -9,10 +9,16 @@
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
 # resolved repo, kicks the auto-sync via `argocd app sync --async`, and then
-# blocks on `argocd app wait --health` (up to 30m) so the GH job stays open
-# until the env is actually up. The GH Deployment sidebar entry on the PR
-# is driven by the caller workflow's `environment:` block (native GH), not
-# by this action — its job is solely to deploy and gate on Healthy.
+# blocks on `argocd app wait` (up to 30m) so the GH job stays open until
+# the env is actually up.
+#
+# Two surfaces are kept in sync with the rollout state:
+#   * Native GH Deployment — driven by the caller workflow's `environment:`
+#     block. Shows in the PR sidebar + repo Environments tab. Status is
+#     just the job's exit code.
+#   * Commit status (this file) — one `pr-env/hub` row in the PR's checks
+#     panel, clickable through to the env hub URL. Posted as `pending`
+#     before the sync, `success`/`failure` after the wait returns.
 #
 # Must run from a `pull_request` event; PR number and head SHA are read from
 # $GITHUB_EVENT_PATH so callers don't have to pass them.
@@ -76,12 +82,37 @@ runs:
         OWN_HEAD_SHA="$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
         PARENT_APP="pr-${OWN_SHORT}-${PR_NUMBER}"
 
-        # GitHub REST helper — auth + sensible headers in one place. No `gh`
-        # dependency: self-hosted runners may not have it.
+        # Hub URL — env entry point and the target_url of the commit status
+        # below. Hub host equals the env name.
+        HUB_URL="https://pr-${OWN_SHORT}-${PR_NUMBER}.dev.mindshub.ai"
+
+        # GitHub REST helpers (GET + POST) — auth + sensible headers in one
+        # place. No `gh` dependency: self-hosted runners may not have it.
         gh_api() {
           curl -sfH "Authorization: Bearer $GH_TOKEN" \
                -H "Accept: application/vnd.github+json" \
                "https://api.github.com$1"
+        }
+        gh_api_post() {
+          curl -sfH "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               -H "Content-Type: application/json" \
+               -d "$2" \
+               "https://api.github.com$1"
+        }
+
+        # Post a `pr-env/hub` commit status. Renders as a row in the PR's
+        # checks panel, clickable through to the env hub URL. Called twice:
+        # `pending` before the sync, then `success`/`failure` after wait.
+        post_pr_env_status() {
+          local state="$1" desc="$2"
+          if ! gh_api_post "/repos/${OWN_REPO}/statuses/${OWN_HEAD_SHA}" \
+              "$(jq -nc \
+                  --arg state "$state" --arg url "$HUB_URL" --arg desc "$desc" \
+                  '{state:$state, context:"pr-env/hub", target_url:$url, description:$desc}')" \
+              >/dev/null; then
+            echo "::warning::Failed to post commit status pr-env/hub=${state}"
+          fi
         }
 
         # Build the override list — for each known PR (own + every linked
@@ -203,6 +234,8 @@ runs:
         echo "argocd app set ${PARENT_APP} ${set_args[*]}"
         "$ARGOCD_BIN" app set "$PARENT_APP" --grpc-web "${set_args[@]}"
 
+        post_pr_env_status "pending" "Env spinning up"
+
         # A sync operation may be in flight — e.g. the parent's very first
         # automated sync, or a rollout from a previous commit stuck waiting on
         # an unhealthy wave. `app set` updates the spec but does NOT interrupt
@@ -258,4 +291,9 @@ runs:
         # onto every child, so this one selector covers both.
         WAIT_SELECTOR="pr-env.mindsdb.com/anchor-repo=${OWN_SHORT},pr-env.mindsdb.com/pr-number=${PR_NUMBER}"
         echo "argocd app wait -l ${WAIT_SELECTOR} --sync --health --operation --timeout 1800"
-        "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" --grpc-web --sync --health --operation --timeout 1800
+        if "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" --grpc-web --sync --health --operation --timeout 1800; then
+          post_pr_env_status "success" "Ready"
+        else
+          post_pr_env_status "failure" "Env did not become Healthy within 30 minutes"
+          exit 1
+        fi
