@@ -8,8 +8,11 @@
 #
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
-# resolved repo. ArgoCD's automated sync + the sync-wave annotations on the
-# parent's children handle the rollout — no `argocd app sync` is issued here.
+# resolved repo, kicks the auto-sync via `argocd app sync --async`, and then
+# blocks on `argocd app wait --health` (up to 30m) so the GH job stays open
+# until the env is actually up. The GH Deployment sidebar entry on the PR
+# is driven by the caller workflow's `environment:` block (native GH), not
+# by this action — its job is solely to deploy and gate on Healthy.
 #
 # Must run from a `pull_request` event; PR number and head SHA are read from
 # $GITHUB_EVENT_PATH so callers don't have to pass them.
@@ -243,3 +246,12 @@ runs:
               ;;
           esac
         fi
+
+        # Block until the parent reports Healthy, or fail the job after 30m.
+        # The parent is wave-gated, so Healthy implies every child rolled
+        # out. While we wait the GH Actions job log stays attached so devs
+        # can tail progress, and the job's exit code drives the native GH
+        # Deployment status (set via the caller workflow's `environment:`
+        # block): success → green "deployed" pill, failure → red.
+        echo "argocd app wait ${PARENT_APP} --health --timeout 1800"
+        "$ARGOCD_BIN" app wait "$PARENT_APP" --grpc-web --health --timeout 1800
