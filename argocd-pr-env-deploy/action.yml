@@ -61,6 +61,12 @@ runs:
 
         OWN_REPO="$GITHUB_REPOSITORY"
         OWN_SHORT="${OWN_REPO##*/}"
+        # Slugified form for K8s resource names + labels. RFC 1123 forbids
+        # underscores in Application names / Namespaces / hostnames, but
+        # `mindshub_frontend` is the canonical GitHub repo name and stays
+        # underscored everywhere it identifies the repo (helm parameter
+        # keys, the `Deploys:` regex, ECR image tags).
+        OWN_SLUG="${OWN_SHORT//_/-}"
         PR_NUMBER="$(jq -r .pull_request.number "$GITHUB_EVENT_PATH")"
 
         # Two SHAs, used for two different things:
@@ -76,7 +82,7 @@ runs:
         #                              branch deploy with the PR.
         OWN_MERGE_SHA="$GITHUB_SHA"
         OWN_HEAD_SHA="$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
-        PARENT_APP="pr-${OWN_SHORT}-${PR_NUMBER}"
+        PARENT_APP="pr-${OWN_SLUG}-${PR_NUMBER}"
 
         # GitHub REST helper — auth + sensible headers in one place. No `gh`
         # dependency: self-hosted runners may not have it.
@@ -236,6 +242,6 @@ runs:
         # return immediately on the old pods' Healthy state. The label is
         # written by the AppSet template onto the parent and by `prenv.labels`
         # onto every child, so this one selector covers both.
-        WAIT_SELECTOR="pr-env.mindsdb.com/anchor-repo=${OWN_SHORT},pr-env.mindsdb.com/pr-number=${PR_NUMBER}"
+        WAIT_SELECTOR="pr-env.mindsdb.com/anchor-repo=${OWN_SLUG},pr-env.mindsdb.com/pr-number=${PR_NUMBER}"
         echo "argocd app wait -l ${WAIT_SELECTOR} --sync --health --operation --timeout 1800"
         "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" --grpc-web --sync --health --operation --timeout 1800
