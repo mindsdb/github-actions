@@ -2,13 +2,19 @@
 #
 # Resolves:
 #   - This PR (anchor) — own head SHA, repo short name from $GITHUB_REPOSITORY.
-#   - Any `Deploys: org/repo#N` line in the anchor PR body — looks up each
-#     linked PR's head SHA via the GitHub REST API.
+#   - Any `Deploys: repo#N` or `Deploys: org/repo#N` line in the anchor PR
+#     body (owner defaults to this repo's org) — looks up each linked PR's
+#     head SHA via the GitHub REST API.
 #
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
-# resolved repo. ArgoCD's automated sync + the sync-wave annotations on the
-# parent's children handle the rollout — no `argocd app sync` is issued here.
+# resolved repo, kicks the auto-sync via `argocd app sync --async`, and then
+# blocks on `argocd app wait` (up to 30m) so the GH job stays open until
+# the env is actually up.
+#
+# Rollout state surfaces in the PR via the caller workflow's `environment:`
+# block (native GH Deployment). The PR sidebar pill is `in_progress` while
+# the job runs and flips to `success`/`failure` on the job's exit code.
 #
 # Must run from a `pull_request` event; PR number and head SHA are read from
 # $GITHUB_EVENT_PATH so callers don't have to pass them.
@@ -55,16 +61,28 @@ runs:
 
         OWN_REPO="$GITHUB_REPOSITORY"
         OWN_SHORT="${OWN_REPO##*/}"
+        # Slugified form for K8s resource names + labels. RFC 1123 forbids
+        # underscores in Application names / Namespaces / hostnames, but
+        # `mindshub_frontend` is the canonical GitHub repo name and stays
+        # underscored everywhere it identifies the repo (helm parameter
+        # keys, the `Deploys:` regex, ECR image tags).
+        OWN_SLUG="${OWN_SHORT//_/-}"
         PR_NUMBER="$(jq -r .pull_request.number "$GITHUB_EVENT_PATH")"
-        # IMPORTANT: $GITHUB_SHA (not .pull_request.head.sha). On pull_request
-        # events GitHub sets $GITHUB_SHA to the synthetic *merge commit* SHA
-        # (PR head merged into base, for build validation). build-push-ecr
-        # tags images as `development-${GITHUB_SHA}`, so the deploy must
-        # reference the same SHA — `.pull_request.head.sha` (PR branch tip)
-        # is a *different* commit on every PR and produces tags that don't
-        # exist in ECR.
-        OWN_SHA="$GITHUB_SHA"
-        PARENT_APP="pr-${OWN_SHORT}-${PR_NUMBER}"
+
+        # Two SHAs, used for two different things:
+        #   $GITHUB_SHA              = merge SHA (PR head merged into base, a
+        #                              synthetic commit only reachable via
+        #                              refs/pull/N/merge). build-push-ecr tags
+        #                              images as `development-${GITHUB_SHA}`,
+        #                              so the image-tag override uses this.
+        #   .pull_request.head.sha   = PR branch tip — the commit ArgoCD's
+        #                              repo-server can actually fetch as a
+        #                              `targetRevision`. Used for the chart
+        #                              revision so chart changes on the PR
+        #                              branch deploy with the PR.
+        OWN_MERGE_SHA="$GITHUB_SHA"
+        OWN_HEAD_SHA="$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
+        PARENT_APP="pr-${OWN_SLUG}-${PR_NUMBER}"
 
         # GitHub REST helper — auth + sensible headers in one place. No `gh`
         # dependency: self-hosted runners may not have it.
@@ -74,24 +92,48 @@ runs:
                "https://api.github.com$1"
         }
 
-        # Build `--helm-set tags.<repo>=development-<sha>` for own + any linked
-        # PRs in the anchor body. Self-links and unresolvable PRs are skipped.
-        set_args=( --helm-set "tags.${OWN_SHORT}=development-${OWN_SHA}" )
-        while IFS=: read -r repo sha; do
-          set_args+=( --helm-set "tags.${repo}=development-${sha}" )
+        # Build the override list — for each known PR (own + every linked
+        # one) we emit two helm-set args:
+        #   tags.<repo>=development-<merge-sha>   image tag (matches ECR push)
+        #   revisions.<repo>=<head-sha>           chart git revision (ArgoCD
+        #                                          fetches the chart at this
+        #                                          commit; pr-branch chart
+        #                                          changes deploy with the PR)
+        # Links accept `Deploys: repo#N` (owner defaults to this repo's org)
+        # or `Deploys: org/repo#N`. Self-links are skipped; unresolvable PRs
+        # are skipped with a warning.
+        set_args=(
+          --helm-set "tags.${OWN_SHORT}=development-${OWN_MERGE_SHA}"
+          --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
+        )
+        while IFS=: read -r repo merge_sha head_sha; do
+          set_args+=(
+            --helm-set "tags.${repo}=development-${merge_sha}"
+            --helm-set "revisions.${repo}=${head_sha}"
+          )
         done < <(
           gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" \
             | jq -r '.body // ""' \
             | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#[0-9]+' \
             | while read -r _kw ref; do
                 full="${ref%%#*}"; num="${ref##*#}"
+                case "$full" in
+                  */*) ;;
+                  *)   full="${OWN_REPO%%/*}/$full" ;;
+                esac
                 [ "$full" = "$OWN_REPO" ] && continue
-                # .merge_commit_sha, not .head.sha — the linked PR's build
-                # also ran under $GITHUB_SHA (the merge SHA), so that's what
-                # the ECR tag will be. merge_commit_sha is null when the PR
-                # is unmergeable (conflicts); we skip those silently.
-                sha="$(gh_api "/repos/$full/pulls/$num" | jq -r '.merge_commit_sha // empty')" || continue
-                [ -n "$sha" ] && echo "${full##*/}:${sha}"
+                # One API call, both SHAs out. merge_commit_sha is null on
+                # unmergeable PRs; we skip those.
+                merge_sha=""; head_sha=""
+                read -r merge_sha head_sha < <(
+                  gh_api "/repos/$full/pulls/$num" \
+                    | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
+                ) || true
+                if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
+                  echo "${full##*/}:${merge_sha}:${head_sha}"
+                else
+                  echo "::warning::Deploys link ${full}#${num} could not be resolved (PR missing or unmergeable); skipping" >&2
+                fi
               done
         )
 
@@ -112,5 +154,94 @@ runs:
         # accepts username/password/sso), and the ARGOCD_SERVER +
         # ARGOCD_AUTH_TOKEN env vars set above are picked up by every
         # subsequent argocd command directly.
+
+        # Retry `app set` directly until the parent App is set-able. Three
+        # transient states are tolerated; anything else is fatal:
+        #   1. App doesn't exist yet — ApplicationSet hasn't run its 60s
+        #      requeue cycle and created it (NotFound, or PermissionDenied
+        #      for API-key accounts that can't see non-existent apps).
+        #   2. App exists but is being DELETED — label was removed then
+        #      re-added; AppSet is mid-delete before recreating. `app set`
+        #      returns "application is being deleted".
+        #   3. Network blip — covered by the same retry.
+        # 5 minutes is comfortably past both the AppSet requeue and the
+        # typical Application finaliser cleanup.
         echo "argocd app set ${PARENT_APP} ${set_args[*]}"
-        "$ARGOCD_BIN" app set "$PARENT_APP" --grpc-web "${set_args[@]}"
+        for i in $(seq 1 30); do
+          if set_err="$("$ARGOCD_BIN" app set "$PARENT_APP" --grpc-web "${set_args[@]}" 2>&1)"; then
+            break
+          fi
+          case "$set_err" in
+            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*|*"being deleted"*) ;;
+            *)
+              echo "argocd app set ${PARENT_APP} failed unexpectedly:" >&2
+              echo "$set_err" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$i" -eq 30 ]; then
+            echo "Timed out waiting for Application ${PARENT_APP} to be set-able." >&2
+            echo "Last error: $set_err" >&2
+            echo "Check the PR carries the 'deploy' label and the ApplicationSet controller is healthy." >&2
+            exit 1
+          fi
+          echo "Application ${PARENT_APP} not set-able (attempt ${i}/30): $set_err"
+          sleep 10
+        done
+
+        # A sync operation may be in flight — e.g. the parent's very first
+        # automated sync, or a rollout from a previous commit stuck waiting on
+        # an unhealthy wave. `app set` updates the spec but does NOT interrupt
+        # a running operation, and ArgoCD won't start the auto-sync carrying
+        # the new parameters until the current operation ends — which it never
+        # does if a wave is wedged (e.g. ImagePullBackOff). Terminate it; the
+        # terminated operation ran with the OLD parameters, so automated sync
+        # immediately starts a fresh one with the parameters set above. When
+        # nothing is running the CLI errors ("Unable to terminate operation.
+        # No operation is in progress"), which is the normal case and fine.
+        # (TerminateOperation requires the `applications, sync` RBAC grant.)
+        if term_err="$("$ARGOCD_BIN" app terminate-op "$PARENT_APP" --grpc-web 2>&1)"; then
+          echo "Terminated in-flight sync on ${PARENT_APP}; automated sync will restart with the new parameters."
+        else
+          echo "No in-flight sync to terminate on ${PARENT_APP} (${term_err})."
+        fi
+
+        # Explicitly request a sync rather than waiting for the application
+        # controller's reconciliation poll to notice the spec change. The CLI
+        # call returns once the operation has been *queued* (--async); we
+        # don't wait for the full rollout here because parent syncs are
+        # wave-gated and can take minutes — that's argocd's job to drive
+        # from this point on.
+        #
+        # FailedPrecondition: "another operation is already in progress"
+        # means automated.sync ALREADY queued an op in response to our
+        # `app set` (which happens within ~ms when automated sync is on).
+        # That's the success case for us — bail with a friendly log, not
+        # exit 1. Any other failure (RBAC, connectivity) still fatals.
+        echo "argocd app sync ${PARENT_APP} --async"
+        if sync_err="$("$ARGOCD_BIN" app sync "$PARENT_APP" --grpc-web --async 2>&1)"; then
+          echo "Sync queued."
+        else
+          case "$sync_err" in
+            *"another operation is already in progress"*)
+              echo "Sync was already in progress (automated.sync picked up the app set change); nothing to do."
+              ;;
+            *)
+              echo "$sync_err" >&2
+              exit 1
+              ;;
+          esac
+        fi
+
+        # Block until the whole env reaches Synced+Healthy with no in-flight
+        # sync, or fail the job after 30m. We wait on the LABEL SET (parent
+        # + every child Application), not just the parent: the parent's
+        # status.health.status is Healthy as soon as its rendered children
+        # exist, even when those children are still OutOfSync from the spec
+        # we just `app set`. Without `--sync` and `--operation`, wait would
+        # return immediately on the old pods' Healthy state. The label is
+        # written by the AppSet template onto the parent and by `prenv.labels`
+        # onto every child, so this one selector covers both.
+        WAIT_SELECTOR="pr-env.mindsdb.com/anchor-repo=${OWN_SLUG},pr-env.mindsdb.com/pr-number=${PR_NUMBER}"
+        echo "argocd app wait -l ${WAIT_SELECTOR} --sync --health --operation --timeout 1800"
+        "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" --grpc-web --sync --health --operation --timeout 1800
