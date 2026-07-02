@@ -5,6 +5,9 @@
 #   - Any `Deploys: repo#N` or `Deploys: org/repo#N` line in the anchor PR
 #     body (owner defaults to this repo's org) — looks up each linked PR's
 #     head SHA via the GitHub REST API.
+#   - `Deploys: repo#staging` — no API lookup; pins that repo to the
+#     `staging` ECR image tag + `staging` git branch. Useful for testing
+#     the anchor PR against non-PR-branch versions of a sibling service.
 #
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
@@ -99,22 +102,25 @@ runs:
         #                                          fetches the chart at this
         #                                          commit; pr-branch chart
         #                                          changes deploy with the PR)
-        # Links accept `Deploys: repo#N` (owner defaults to this repo's org)
-        # or `Deploys: org/repo#N`. Self-links are skipped; unresolvable PRs
+        # Links accept `Deploys: repo#N` (owner defaults to this repo's
+        # org), `Deploys: org/repo#N`, or `Deploys: repo#staging` (pin the
+        # linked repo to that env's moving image tag + `staging` branch —
+        # no API lookup, both values reused verbatim from that env's
+        # release pipeline). Self-links are skipped; unresolvable PRs
         # are skipped with a warning.
         set_args=(
           --helm-set "tags.${OWN_SHORT}=development-${OWN_MERGE_SHA}"
           --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
         )
-        while IFS=: read -r repo merge_sha head_sha; do
+        while IFS=: read -r repo tag rev; do
           set_args+=(
-            --helm-set "tags.${repo}=development-${merge_sha}"
-            --helm-set "revisions.${repo}=${head_sha}"
+            --helm-set "tags.${repo}=${tag}"
+            --helm-set "revisions.${repo}=${rev}"
           )
         done < <(
           gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" \
             | jq -r '.body // ""' \
-            | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#[0-9]+' \
+            | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)' \
             | while read -r _kw ref; do
                 full="${ref%%#*}"; num="${ref##*#}"
                 case "$full" in
@@ -122,6 +128,12 @@ runs:
                   *)   full="${OWN_REPO%%/*}/$full" ;;
                 esac
                 [ "$full" = "$OWN_REPO" ] && continue
+                # `#staging` — reuse the linked repo's staging pipeline
+                # outputs: `staging` ECR image tag + `staging` git branch.
+                if [ "$num" = "staging" ]; then
+                  echo "${full##*/}:staging:staging"
+                  continue
+                fi
                 # One API call, both SHAs out. merge_commit_sha is null on
                 # unmergeable PRs; we skip those.
                 merge_sha=""; head_sha=""
@@ -130,7 +142,7 @@ runs:
                     | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
                 ) || true
                 if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
-                  echo "${full##*/}:${merge_sha}:${head_sha}"
+                  echo "${full##*/}:development-${merge_sha}:${head_sha}"
                 else
                   echo "::warning::Deploys link ${full}#${num} could not be resolved (PR missing or unmergeable); skipping" >&2
                 fi
