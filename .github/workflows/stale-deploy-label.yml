@@ -53,8 +53,16 @@ jobs:
 
           for n in "${STALE_PRS[@]}"; do
             echo "::group::Removing label from ${TARGET_REPO}#${n}"
-            gh pr edit "$n" --repo "${TARGET_REPO}" --remove-label deploy
-            gh pr comment "$n" --repo "${TARGET_REPO}" --body \
-              "PR has been idle for ${STALE_DAYS}+ days. Removed the \`deploy\` label and tore down the per-PR env. Re-add the label to redeploy."
+            # Direct REST calls, not `gh pr edit` / `gh pr comment`. Those
+            # wrappers construct an editor-form GraphQL query that fetches
+            # projectCards, milestones, review requests, etc. — none of which
+            # a scripted label mutation needs — and the projectCards field
+            # currently trips a Projects (classic) deprecation error on the
+            # API side. `gh api` bypasses the wrapper entirely.
+            gh api --method DELETE \
+              "repos/${TARGET_REPO}/issues/${n}/labels/deploy"
+            gh api --method POST \
+              "repos/${TARGET_REPO}/issues/${n}/comments" \
+              -f body="PR has been idle for ${STALE_DAYS}+ days. Removed the \`deploy\` label and tore down the per-PR env. Re-add the label to redeploy."
             echo "::endgroup::"
           done
