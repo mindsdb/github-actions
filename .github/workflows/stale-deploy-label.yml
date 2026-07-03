@@ -26,7 +26,7 @@ jobs:
   prune:
     runs-on: mdb-dev
     env:
-      GH_TOKEN: ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
       TARGET_REPO: ${{ inputs.target-repo }}
       STALE_DAYS: ${{ inputs.stale-days }}
     steps:
