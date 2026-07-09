@@ -60,6 +60,9 @@ on:
     - cron: '47 13 * * 5'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   freeze:
     uses: mindsdb/github-actions/.github/workflows/staging-freeze.yml@main
@@ -75,6 +78,9 @@ on:
     workflows: ["Staging Freeze"]
     types: [completed]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   create-pr:
@@ -94,6 +100,9 @@ on:
     types: [closed]
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   unfreeze:
