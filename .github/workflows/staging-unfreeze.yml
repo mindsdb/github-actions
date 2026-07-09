@@ -1,0 +1,106 @@
+# Reusable workflow: unfreeze staging when the weekly release PR merges, then
+# sync main back into staging.
+#
+# Unfreezing flips the pre-provisioned `staging-freeze` ruleset back to
+# `disabled`, reopening staging for normal development the moment the release
+# ships — no fixed Monday-morning wait.
+#
+# The sync-back merge (main -> staging) is load-bearing on squash-merge repos:
+# without it, every previously shipped commit reappears in the next release
+# PR's commit list. The push is performed with the `mindsdb-release-train` App
+# token; the App is the ruleset bypass actor on staging, so the push lands even
+# though the ruleset is disabled and staging otherwise requires review.
+#
+# Called by a per-repo wrapper, e.g.
+#   cowork-server/.github/workflows/staging-unfreeze.yml
+# The wrapper carries the merged-release-PR guard (head.ref == staging AND
+# head.repo.full_name == the repo, to reject fork PRs). Keep the name
+# "Staging Unfreeze".
+#
+# Requires: vars.RELEASE_APP_CLIENT_ID + secrets.RELEASE_APP_PRIVATE_KEY
+# (org-provisioned; secret reaches here via `secrets: inherit`).
+
+name: Staging Unfreeze
+
+on:
+  workflow_call:
+    inputs:
+      staging-branch:
+        description: "Branch to unfreeze and sync into"
+        type: string
+        default: staging
+      base-branch:
+        description: "Production branch to sync back from"
+        type: string
+        default: main
+      ruleset-name:
+        description: "Name of the pre-provisioned freeze ruleset to toggle"
+        type: string
+        default: staging-freeze
+
+permissions:
+  contents: read
+
+jobs:
+  unfreeze-staging:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint release-train App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Unfreeze staging (disable ruleset)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          RULESET_NAME: ${{ inputs.ruleset-name }}
+          STAGING: ${{ inputs.staging-branch }}
+        run: |
+          set -euo pipefail
+          RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
+            --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id")
+          if [ -z "$RULESET_ID" ]; then
+            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO}. It must be pre-provisioned."
+            exit 1
+          fi
+          gh api --method PUT "repos/${REPO}/rulesets/${RULESET_ID}" -f enforcement=disabled
+          PR_NUMBER='${{ github.event.pull_request.number }}'
+          echo "Ruleset '${RULESET_NAME}' (#${RULESET_ID}) set to disabled — ${STAGING} is UNFROZEN."
+          {
+            echo "## Staging branch UNFROZEN"
+            echo ""
+            echo "The \`${STAGING}\` branch is **unfrozen** via ruleset \`${RULESET_NAME}\` (triggered by PR #${PR_NUMBER:-manual})."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Only the sync-back checkout carries credentials — it is the one step
+      # that pushes. Skipped on manual dispatch (no PR merged, nothing to sync).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Sync main back into staging
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          STAGING: ${{ inputs.staging-branch }}
+          BASE: ${{ inputs.base-branch }}
+        run: |
+          set -euo pipefail
+          # Attribute the merge commit to the App's bot identity.
+          APP_USER_ID=$(gh api "users/${APP_SLUG}[bot]" --jq '.id')
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          git checkout -B "${STAGING}" "origin/${STAGING}"
+          if git merge-base --is-ancestor "origin/${BASE}" HEAD; then
+            echo "${STAGING} already contains ${BASE} — nothing to sync."
+            exit 0
+          fi
+          git merge --no-ff "origin/${BASE}" -m "Sync ${BASE} back into ${STAGING} after release"
+          git push origin "HEAD:${STAGING}"
