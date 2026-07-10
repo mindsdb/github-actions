@@ -16,7 +16,7 @@
 # "Create staging to main release PR" workflow chains off it via workflow_run.
 #
 # Requires (provisioned at the org level, scoped to the release-train repos):
-#   - vars.RELEASE_APP_CLIENT_ID     (org variable)
+#   - vars.RELEASE_APP_CLIENT_ID      (org variable)
 #   - secrets.RELEASE_APP_PRIVATE_KEY (org secret; reaches this workflow via
 #                                      `secrets: inherit` in the caller)
 
@@ -44,12 +44,15 @@ permissions:
 jobs:
   freeze-staging:
     runs-on: ubuntu-latest
+    outputs:
+      should_freeze: ${{ steps.check.outputs.should_freeze }}
+      ahead: ${{ steps.check.outputs.ahead }}
     steps:
       - name: Mint release-train App token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       # fetch-depth: 0 pulls every branch, so origin/<base> and origin/<staging>
@@ -92,16 +95,24 @@ jobs:
           REPO: ${{ github.repository }}
           RULESET_NAME: ${{ inputs.ruleset-name }}
           STAGING: ${{ inputs.staging-branch }}
+          ENFORCEMENT: active
         run: |
           set -euo pipefail
-          RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
+          RID=$(gh api "repos/${REPO}/rulesets" \
             --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id")
-          if [ -z "$RULESET_ID" ]; then
-            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO}. It must be pre-provisioned (disabled, with the release-train App as a bypass actor)."
+          if [ -z "$RID" ]; then
+            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO} — provisioning has drifted."
             exit 1
           fi
-          gh api --method PUT "repos/${REPO}/rulesets/${RULESET_ID}" -f enforcement=active
-          echo "Ruleset '${RULESET_NAME}' (#${RULESET_ID}) set to active — ${STAGING} is FROZEN."
+          # GET the full ruleset, flip only `enforcement`, PUT the whole body back.
+          # A partial PUT is not guaranteed to preserve omitted fields. The body is
+          # written to a temp file (never echoed) so ruleset internals don't leak
+          # into logs — three of these repos are public.
+          BODY="${RUNNER_TEMP}/ruleset-${RID}.json"
+          gh api "repos/${REPO}/rulesets/${RID}" \
+            --jq "{name, target, enforcement: \"${ENFORCEMENT}\", bypass_actors, conditions, rules}" > "$BODY"
+          gh api --method PUT "repos/${REPO}/rulesets/${RID}" --input "$BODY" > /dev/null
+          echo "Ruleset '${RULESET_NAME}' (#${RID}) enforcement set to ${ENFORCEMENT} — ${STAGING} is FROZEN."
           {
             echo "## Staging branch FROZEN"
             echo ""

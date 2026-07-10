@@ -5,11 +5,14 @@
 # `disabled`, reopening staging for normal development the moment the release
 # ships — no fixed Monday-morning wait.
 #
+# Order is load-bearing: unlock first, then push. If the sync-back push fails,
+# staging is left unlocked, which is the acceptable failure mode.
+#
 # The sync-back merge (main -> staging) is load-bearing on squash-merge repos:
 # without it, every previously shipped commit reappears in the next release
 # PR's commit list. The push is performed with the `mindsdb-release-train` App
 # token; the App is the ruleset bypass actor on staging, so the push lands even
-# though the ruleset is disabled and staging otherwise requires review.
+# though staging otherwise requires review.
 #
 # Called by a per-repo wrapper, e.g.
 #   cowork-server/.github/workflows/staging-unfreeze.yml
@@ -49,7 +52,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       - name: Unfreeze staging (disable ruleset)
@@ -58,25 +61,32 @@ jobs:
           REPO: ${{ github.repository }}
           RULESET_NAME: ${{ inputs.ruleset-name }}
           STAGING: ${{ inputs.staging-branch }}
+          ENFORCEMENT: disabled
         run: |
           set -euo pipefail
-          RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
+          RID=$(gh api "repos/${REPO}/rulesets" \
             --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id")
-          if [ -z "$RULESET_ID" ]; then
-            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO}. It must be pre-provisioned."
+          if [ -z "$RID" ]; then
+            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO} — provisioning has drifted."
             exit 1
           fi
-          gh api --method PUT "repos/${REPO}/rulesets/${RULESET_ID}" -f enforcement=disabled
+          # GET the full ruleset, flip only `enforcement`, PUT the whole body back
+          # (partial PUT is not guaranteed to preserve omitted fields). Body goes to
+          # a temp file, never echoed, so ruleset internals stay out of public logs.
+          BODY="${RUNNER_TEMP}/ruleset-${RID}.json"
+          gh api "repos/${REPO}/rulesets/${RID}" \
+            --jq "{name, target, enforcement: \"${ENFORCEMENT}\", bypass_actors, conditions, rules}" > "$BODY"
+          gh api --method PUT "repos/${REPO}/rulesets/${RID}" --input "$BODY" > /dev/null
           PR_NUMBER='${{ github.event.pull_request.number }}'
-          echo "Ruleset '${RULESET_NAME}' (#${RULESET_ID}) set to disabled — ${STAGING} is UNFROZEN."
+          echo "Ruleset '${RULESET_NAME}' (#${RID}) enforcement set to ${ENFORCEMENT} — ${STAGING} is UNFROZEN."
           {
             echo "## Staging branch UNFROZEN"
             echo ""
             echo "The \`${STAGING}\` branch is **unfrozen** via ruleset \`${RULESET_NAME}\` (triggered by PR #${PR_NUMBER:-manual})."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Only the sync-back checkout carries credentials — it is the one step
-      # that pushes. Skipped on manual dispatch (no PR merged, nothing to sync).
+      # Only the sync-back checkout carries credentials — it is the one step that
+      # pushes. Skipped on manual dispatch (no PR merged, nothing to sync).
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         if: github.event_name == 'pull_request'
         with:
@@ -92,11 +102,13 @@ jobs:
           BASE: ${{ inputs.base-branch }}
         run: |
           set -euo pipefail
-          # Attribute the merge commit to the App's bot identity.
-          APP_USER_ID=$(gh api "users/${APP_SLUG}[bot]" --jq '.id')
+          # Attribute the merge commit to the App's bot identity. The username is
+          # URL-encoded (`[` -> %5B, `]` -> %5D) for the users API lookup.
+          APP_USER_ID=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq '.id')
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
+          git fetch origin "${BASE}" "${STAGING}"
           git checkout -B "${STAGING}" "origin/${STAGING}"
           if git merge-base --is-ancestor "origin/${BASE}" HEAD; then
             echo "${STAGING} already contains ${BASE} — nothing to sync."

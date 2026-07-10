@@ -21,9 +21,9 @@ They live in `.github/workflows/` and are called from ~25-line per-repo wrappers
 
 | Reusable workflow | Name (keep identical in callers) | What it does |
 |---|---|---|
-| `staging-freeze.yml` | `Staging Freeze` | Activates the `staging-freeze` ruleset to lock staging (skips if staging == main) |
-| `weekly-merge-staging.yml` | `Create staging to main release PR` | Opens the `staging → main` PR (idempotent) |
-| `staging-unfreeze.yml` | `Staging Unfreeze` | Disables the ruleset when the release PR merges, then syncs `main` back into `staging` |
+| `release-freeze.yml` | `Staging Freeze` | Activates the `staging-freeze` ruleset to lock staging (skips if staging == main) |
+| `release-pr.yml` | `Create staging to main release PR` | Opens the `staging → main` PR (idempotent) |
+| `release-unfreeze.yml` | `Staging Unfreeze` | Disables the ruleset when the release PR merges, then syncs `main` back into `staging` |
 
 The chain is event-driven: `Staging Freeze` finishing fires the release-PR
 workflow via `workflow_run`; merging that PR fires `Staging Unfreeze`. The
@@ -49,6 +49,10 @@ keep the names above verbatim.
 Drop these three files into each repo's `.github/workflows/`. Adjust the cron
 per repo if desired; branch names default to `staging`/`main`.
 
+> **Pinning:** the examples below use `@main` for readability. For production,
+> pin each `uses:` to a full commit SHA with a version comment
+> (e.g. `…/release-freeze.yml@<sha> # v1`) so Dependabot can manage bumps.
+
 `staging-freeze.yml`:
 
 ```yaml
@@ -65,7 +69,7 @@ permissions:
 
 jobs:
   freeze:
-    uses: mindsdb/github-actions/.github/workflows/staging-freeze.yml@main
+    uses: mindsdb/github-actions/.github/workflows/release-freeze.yml@main
     secrets: inherit
 ```
 
@@ -87,7 +91,7 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
-    uses: mindsdb/github-actions/.github/workflows/weekly-merge-staging.yml@main
+    uses: mindsdb/github-actions/.github/workflows/release-pr.yml@main
     secrets: inherit
 ```
 
@@ -111,6 +115,6 @@ jobs:
       (github.event.pull_request.merged == true &&
        github.event.pull_request.head.ref == 'staging' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: mindsdb/github-actions/.github/workflows/staging-unfreeze.yml@main
+    uses: mindsdb/github-actions/.github/workflows/release-unfreeze.yml@main
     secrets: inherit
 ```

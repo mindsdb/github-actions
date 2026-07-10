@@ -4,6 +4,9 @@
 # trigger. Idempotent: if an open staging -> main PR already exists it is left
 # untouched. Skips entirely when staging has no unreleased changes.
 #
+# The ahead-check is kept even though the caller guards on freeze success — a
+# manual workflow_dispatch can invoke this workflow directly.
+#
 # The PR is created with the `mindsdb-release-train` App token (NOT the default
 # GITHUB_TOKEN) so that opening the PR triggers the normal CI checks — PRs
 # created by GITHUB_TOKEN do not fire `pull_request` workflows.
@@ -40,7 +43,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
