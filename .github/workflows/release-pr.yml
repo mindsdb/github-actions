@@ -1,0 +1,126 @@
+# Reusable workflow: open (or update) the weekly staging -> main release PR.
+#
+# Chains off a successful "Staging Freeze" run via the caller's workflow_run
+# trigger. Idempotent: if an open staging -> main PR already exists it is left
+# untouched. Skips entirely when staging has no unreleased changes.
+#
+# The ahead-check is kept even though the caller guards on freeze success — a
+# manual workflow_dispatch can invoke this workflow directly.
+#
+# The PR is created with the `mindsdb-release-train` App token (NOT the default
+# GITHUB_TOKEN) so that opening the PR triggers the normal CI checks — PRs
+# created by GITHUB_TOKEN do not fire `pull_request` workflows.
+#
+# Called by a per-repo wrapper, e.g.
+#   cowork-server/.github/workflows/weekly-merge-staging.yml
+# Keep the workflow name "Create staging to main release PR".
+#
+# Requires: vars.RELEASE_APP_CLIENT_ID + secrets.RELEASE_APP_PRIVATE_KEY
+# (org-provisioned; secret reaches here via `secrets: inherit`).
+
+name: Create staging to main release PR
+
+on:
+  workflow_call:
+    inputs:
+      staging-branch:
+        description: "Source branch for the release PR"
+        type: string
+        default: staging
+      base-branch:
+        description: "Target branch for the release PR"
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint release-train App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for unreleased changes
+        id: check
+        env:
+          STAGING: ${{ inputs.staging-branch }}
+          BASE: ${{ inputs.base-branch }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "origin/${BASE}" "origin/${STAGING}"; then
+            AHEAD=0
+          else
+            AHEAD=$(git rev-list --count "origin/${BASE}..origin/${STAGING}")
+          fi
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          if [ "$AHEAD" -eq 0 ]; then
+            echo "${STAGING} is up to date with ${BASE} — nothing to release."
+          else
+            echo "${STAGING} is ${AHEAD} commit(s) ahead of ${BASE}."
+          fi
+
+      - name: Create or update PR
+        if: steps.check.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          AHEAD: ${{ steps.check.outputs.ahead }}
+          STAGING: ${{ inputs.staging-branch }}
+          BASE: ${{ inputs.base-branch }}
+        run: |
+          set -euo pipefail
+
+          # Skip if a staging -> main PR is already open.
+          EXISTING=$(gh pr list --repo "${REPO}" --base "${BASE}" --head "${STAGING}" \
+            --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "PR #${EXISTING} already exists — skipping creation."
+            echo "::notice title=Weekly release PR::https://github.com/${REPO}/pull/${EXISTING}"
+            exit 0
+          fi
+
+          COMMITS=$(git log --oneline --no-merges "origin/${BASE}..origin/${STAGING}")
+          CONTRIBUTORS=$(git log --format='%an' "origin/${BASE}..origin/${STAGING}" | sort -u | sed 's/^/- /')
+
+          BODY=$(cat <<EOF
+          ## Weekly release: ${STAGING} → ${BASE}
+
+          **${AHEAD} commit(s)** ready for production release.
+
+          ### Changes
+          \`\`\`
+          ${COMMITS}
+          \`\`\`
+
+          ### Contributors
+          ${CONTRIBUTORS}
+
+          ### Review checklist
+          - [ ] Staging has been validated
+          - [ ] No known blockers
+
+          > Created automatically at staging freeze time. Merge when ready to release.
+          EOF
+          )
+
+          # Dedent (the heredoc inside the run block gets indented)
+          BODY=$(echo "$BODY" | sed 's/^          //')
+
+          PR_URL=$(gh pr create \
+            --repo "${REPO}" \
+            --base "${BASE}" \
+            --head "${STAGING}" \
+            --title "Weekly release: ${STAGING} → ${BASE}" \
+            --body "$BODY")
+          echo "::notice title=Weekly release PR::${PR_URL}"
