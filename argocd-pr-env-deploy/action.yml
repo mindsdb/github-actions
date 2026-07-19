@@ -221,13 +221,21 @@ runs:
               # synthetic merge SHA whenever base or head moves, so this
               # deploy-time lookup can name a twin commit no build ever
               # pushed; the guard catches exactly that case.
+              #
+              # The head tag is selected ONLY on a positive ECR check. When
+              # the guard is unavailable (no aws CLI / AccessDenied / any
+              # infra error — including one that strikes mid-check and
+              # fabricates a "present" answer), degrade to the merge tag:
+              # exactly the pre-hardening behavior, never worse. A head tag
+              # mostly doesn't exist until the linked repo rebuilds with the
+              # dual-tagging build action, so preferring it unverified would
+              # manufacture the phantom pin this guard exists to prevent.
               head_tag="development-head-${head_sha}"
               merge_tag="development-${merge_sha}"
-              if ecr_tag_exists "$repo" "$head_tag"; then
+              tag="$merge_tag"
+              if [ "$ECR_CHECKS" = on ] && ecr_tag_exists "$repo" "$head_tag" && [ "$ECR_CHECKS" = on ]; then
                 tag="$head_tag"
-              elif ecr_tag_exists "$repo" "$merge_tag"; then
-                tag="$merge_tag"
-              else
+              elif [ "$ECR_CHECKS" = on ] && ! ecr_tag_exists "$repo" "$merge_tag"; then
                 echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in mindsdb-${repo//_/-}. The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
                 exit 1
               fi
