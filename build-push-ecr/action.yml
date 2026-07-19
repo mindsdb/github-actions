@@ -1,4 +1,11 @@
-# Builds a docker image, then tags it with the github sha and pushes it to our Amazon ECR registry
+# Builds a docker image, then tags it with the github sha and pushes it to our Amazon ECR registry.
+#
+# On pull_request events the image is ALSO tagged
+# <environment>-head-<pr head sha>. $GITHUB_SHA on those events is the
+# synthetic merge commit (refs/pull/N/merge), which GitHub regenerates —
+# new hash, identical content — whenever the PR's base or head moves, so
+# it's not a stable handle. The head SHA is immutable, making the extra
+# tag the one deploy-time consumers can pin race-free.
 
 outputs:
   image:
@@ -48,6 +55,15 @@ runs:
         ENVIRONMENT=${{ inputs.build-for-environment }}
         BRANCH_NAME=${{env.ENV_NAME}}
         IMAGE_TAG=$ENVIRONMENT-$IMAGE_REF
+        PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+        # On pull_request events, also tag by the immutable PR head SHA (see
+        # header comment). HEAD_TAG is expanded unquoted on the build line —
+        # like $BUILD_ARGS — so the empty non-PR case contributes zero args.
+        HEAD_TAG=""
+        if [ -n "$PR_HEAD_SHA" ]; then
+          HEAD_TAG="-t $REPO_IMAGE:$ENVIRONMENT-head-$PR_HEAD_SHA"
+        fi
 
         # Create repo if needed
         aws ecr create-repository --repository-name $IMAGE_NAME && \
@@ -60,6 +76,6 @@ runs:
         BUILD_ARGS="--build-arg BUILD_FOR_ENVIRONMENT=$ENVIRONMENT --build-arg IMAGE_TAG=$IMAGE_TAG"
 
         # Finally, build our runner container
-        docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:$ENVIRONMENT -t $REPO_IMAGE:latest --push .
+        docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS $HEAD_TAG -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:$ENVIRONMENT -t $REPO_IMAGE:latest --push .
         
         echo "image=$REPO_IMAGE:$IMAGE_TAG" >> $GITHUB_OUTPUT
