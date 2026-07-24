@@ -1,0 +1,120 @@
+# Reusable workflow: freeze the staging branch to open the weekly QA window.
+#
+# Freezing flips a *pre-provisioned* repository ruleset (default name
+# `staging-freeze`) from `disabled` to `active`. That ruleset carries a single
+# `update` rule on the staging branch with the `mindsdb-release-train` GitHub
+# App as a bypass actor, so ordinary pushes to staging are blocked while the
+# App (and the release sync-back push) can still write. Because rulesets layer
+# on top of classic branch protection, toggling enforcement can never clobber
+# the underlying protection config.
+#
+# If staging has no unreleased changes (staging == main), the freeze is skipped.
+#
+# Called by a per-repo wrapper that owns the cron / manual triggers, e.g.
+#   cowork-server/.github/workflows/staging-freeze.yml
+# The wrapper MUST keep the workflow name "Staging Freeze" so the downstream
+# "Create staging to main release PR" workflow chains off it via workflow_run.
+#
+# Requires (provisioned at the org level, scoped to the release-train repos):
+#   - vars.RELEASE_APP_CLIENT_ID      (org variable)
+#   - secrets.RELEASE_APP_PRIVATE_KEY (org secret; reaches this workflow via
+#                                      `secrets: inherit` in the caller)
+
+name: Staging Freeze
+
+on:
+  workflow_call:
+    inputs:
+      staging-branch:
+        description: "Branch to freeze"
+        type: string
+        default: staging
+      base-branch:
+        description: "Production branch staging is compared against"
+        type: string
+        default: main
+      ruleset-name:
+        description: "Name of the pre-provisioned freeze ruleset to toggle"
+        type: string
+        default: staging-freeze
+
+permissions:
+  contents: read
+
+jobs:
+  freeze-staging:
+    runs-on: ubuntu-latest
+    outputs:
+      should_freeze: ${{ steps.check.outputs.should_freeze }}
+      ahead: ${{ steps.check.outputs.ahead }}
+    steps:
+      - name: Mint release-train App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      # fetch-depth: 0 pulls every branch, so origin/<base> and origin/<staging>
+      # are already present locally — no second, unauthenticated `git fetch`
+      # needed (which is why persist-credentials: false is safe here).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for unreleased changes
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          STAGING: ${{ inputs.staging-branch }}
+          BASE: ${{ inputs.base-branch }}
+        run: |
+          set -euo pipefail
+          AHEAD=$(git rev-list --count "origin/${BASE}..origin/${STAGING}")
+          SHOULD_FREEZE=true
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            if [ "$AHEAD" -eq 0 ] || git diff --quiet "origin/${BASE}" "origin/${STAGING}"; then
+              SHOULD_FREEZE=false
+            fi
+          fi
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "should_freeze=$SHOULD_FREEZE" >> "$GITHUB_OUTPUT"
+          if [ "$SHOULD_FREEZE" != "true" ]; then
+            echo "${STAGING} is up to date with ${BASE} — nothing to freeze."
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "manual freeze requested — freezing ${STAGING}."
+          else
+            echo "${STAGING} is ${AHEAD} commit(s) ahead of ${BASE} — freezing."
+          fi
+
+      - name: Freeze staging (activate ruleset)
+        if: steps.check.outputs.should_freeze == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          RULESET_NAME: ${{ inputs.ruleset-name }}
+          STAGING: ${{ inputs.staging-branch }}
+          ENFORCEMENT: active
+        run: |
+          set -euo pipefail
+          RID=$(gh api "repos/${REPO}/rulesets" \
+            --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id")
+          if [ -z "$RID" ]; then
+            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO} — provisioning has drifted."
+            exit 1
+          fi
+          # GET the full ruleset, flip only `enforcement`, PUT the whole body back.
+          # A partial PUT is not guaranteed to preserve omitted fields. The body is
+          # written to a temp file (never echoed) so ruleset internals don't leak
+          # into logs — three of these repos are public.
+          BODY="${RUNNER_TEMP}/ruleset-${RID}.json"
+          gh api "repos/${REPO}/rulesets/${RID}" \
+            --jq "{name, target, enforcement: \"${ENFORCEMENT}\", bypass_actors, conditions, rules}" > "$BODY"
+          gh api --method PUT "repos/${REPO}/rulesets/${RID}" --input "$BODY" > /dev/null
+          echo "Ruleset '${RULESET_NAME}' (#${RID}) enforcement set to ${ENFORCEMENT} — ${STAGING} is FROZEN."
+          {
+            echo "## Staging branch FROZEN"
+            echo ""
+            echo "The \`${STAGING}\` branch is **frozen** via ruleset \`${RULESET_NAME}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

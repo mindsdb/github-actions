@@ -1,13 +1,34 @@
 # Apply per-PR image tags to the anchor PR's ArgoCD environment.
 #
 # Resolves:
-#   - This PR (anchor) — own head SHA, repo short name from $GITHUB_REPOSITORY.
+#   - This PR (anchor) — own merge SHA (image built in this same run), repo
+#     short name from $GITHUB_REPOSITORY.
 #   - Any `Deploys: repo#N` or `Deploys: org/repo#N` line in the anchor PR
 #     body (owner defaults to this repo's org) — looks up each linked PR's
-#     head SHA via the GitHub REST API.
+#     head + merge SHAs via the GitHub REST API.
 #   - `Deploys: repo#staging` — no API lookup; pins that repo to the
 #     `staging` ECR image tag + `staging` git branch. Useful for testing
 #     the anchor PR against non-PR-branch versions of a sibling service.
+#
+# Linked-PR image tags resolve in order:
+#   1. `development-head-<head sha>` — pushed by build-push-ecr's PR
+#      dual-tag. Head SHAs are immutable, so this pin can't go stale.
+#   2. `development-<merge sha>` — back-compat with images built before
+#      dual-tagging. GitHub regenerates the synthetic merge SHA whenever
+#      base or head moves, so resolving it at deploy time can name a twin
+#      commit no build ever pushed.
+#   3. Neither exists in ECR → the job fails loudly with a fix (re-run the
+#      linked repo's pipeline), instead of pinning a phantom tag and leaving
+#      the env in ImagePullBackOff silently.
+# Every pinned tag — the anchor's own included — is existence-checked
+# against ECR (`aws ecr describe-images`; GitHub short name maps to the
+# `mindsdb-<name-with-hyphens>` ECR repo). Only Image/RepositoryNotFound
+# count as absent; if the aws CLI is missing or errors for infra reasons
+# (auth, throttle, network) the checks are skipped with one warning rather
+# than blocking a deploy that would have worked.
+#
+# `Deploys:`-looking body lines that don't match the accepted forms (e.g. a
+# pasted PR URL) emit a ::warning:: instead of being silently ignored.
 #
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
@@ -23,8 +44,9 @@
 # $GITHUB_EVENT_PATH so callers don't have to pass them.
 #
 # Requires `curl` + `jq` on the runner. Does NOT require `gh` (the action
-# talks to the GitHub REST API directly). Installs `argocd` to $RUNNER_TEMP
-# if it's not already on PATH.
+# talks to the GitHub REST API directly). Uses the ambient `aws` CLI for
+# the ECR existence checks when present (degrades to a warning when not).
+# Installs `argocd` to $RUNNER_TEMP if it's not already on PATH.
 
 name: ArgoCD Deploy (PR env)
 description: Update the per-PR env's parent Application with own + linked image tags.
@@ -95,13 +117,65 @@ runs:
                "https://api.github.com$1"
         }
 
+        # ECR image-existence guard. Maps a GitHub repo short name to its
+        # ECR repository (`mindsdb-` + short name, underscores to hyphens)
+        # and asks ECR whether <tag> exists. Returns 0 = present, 1 = absent.
+        # Only ImageNotFoundException / RepositoryNotFoundException count as
+        # absent; any other failure (no aws CLI, auth, throttle, network)
+        # must never brick a deploy that would have worked — warn ONCE,
+        # remember ECR is unusable, and report every tag as present from
+        # then on.
+        ECR_CHECKS=on
+        ecr_tag_exists() {
+          local ecr_repo="mindsdb-${1//_/-}" tag="$2" err
+          [ "$ECR_CHECKS" = on ] || return 0
+          if ! command -v aws >/dev/null 2>&1; then
+            ECR_CHECKS=off
+            echo "::warning::aws CLI not found on this runner — ECR image-existence checks skipped, tags assumed present."
+            return 0
+          fi
+          if err="$(aws ecr describe-images \
+                      --repository-name "$ecr_repo" \
+                      --image-ids "imageTag=${tag}" \
+                      --region "${AWS_REGION:-us-east-1}" 2>&1 >/dev/null)"; then
+            return 0
+          fi
+          case "$err" in
+            *ImageNotFoundException*|*RepositoryNotFoundException*)
+              return 1
+              ;;
+            *)
+              ECR_CHECKS=off
+              echo "::warning::ECR describe-images failed (${err//$'\n'/ }) — image-existence checks skipped, tags assumed present."
+              return 0
+              ;;
+          esac
+        }
+
+        # Fetch the PR body ONCE — the strict `Deploys:` extraction and the
+        # lint below both reuse it. Strip \r so CRLF bodies don't trip the
+        # line-anchored lint pattern. Fail with a diagnosable message rather
+        # than letting `set -e` kill the step mutely on an API blip.
+        PR_BODY="$(gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" | jq -r '.body // ""' | tr -d '\r')" || {
+          echo "::error::Could not fetch PR #${PR_NUMBER} body from the GitHub API (needed to resolve Deploys: links) — transient API failure or bad GH_TOKEN. Re-run the job."
+          exit 1
+        }
+
+        # Lint: `Deploys:`-looking lines that don't match the strict form
+        # would otherwise be silently ignored and the env would quietly run
+        # defaults — the classic offender is a pasted PR URL. Warn per line.
+        while IFS= read -r line; do
+          if ! printf '%s\n' "$line" | grep -qE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)'; then
+            echo "::warning::Ignoring unrecognised Deploys line: '${line}'. Accepted forms: 'Deploys: repo#N', 'Deploys: org/repo#N', 'Deploys: repo#staging' (PR URLs are not parsed)."
+          fi
+        done < <(printf '%s\n' "$PR_BODY" | grep -iE '^[[:space:]]*deploys?:' || true)
+
         # Build the override list — for each known PR (own + every linked
         # one) we emit two helm-set args:
-        #   tags.<repo>=development-<merge-sha>   image tag (matches ECR push)
-        #   revisions.<repo>=<head-sha>           chart git revision (ArgoCD
-        #                                          fetches the chart at this
-        #                                          commit; pr-branch chart
-        #                                          changes deploy with the PR)
+        #   tags.<repo>=<image tag>      resolved per the header's order
+        #   revisions.<repo>=<head-sha>  chart git revision (ArgoCD fetches
+        #                                the chart at this commit; pr-branch
+        #                                chart changes deploy with the PR)
         # Links accept `Deploys: repo#N` (owner defaults to this repo's
         # org), `Deploys: org/repo#N`, or `Deploys: repo#staging` (pin the
         # linked repo to that env's moving image tag + `staging` branch —
@@ -109,51 +183,112 @@ runs:
         # release pipeline). Self-links are skipped; an unresolvable link
         # (missing/closed/unmergeable PR) fails the job and comments on the
         # anchor PR rather than silently deploying from the default branch.
+        #
+        # The anchor's own image is tagged from the merge SHA by the build
+        # job in this same run — no cross-PR race — but it still gets the
+        # existence check so a failed/skipped build fails HERE, not as an
+        # ImagePullBackOff in the env.
+        OWN_TAG="development-${OWN_MERGE_SHA}"
+        if ! ecr_tag_exists "$OWN_SHORT" "$OWN_TAG"; then
+          echo "::error::ECR image mindsdb-${OWN_SLUG}:${OWN_TAG} not found — did the build job in this run succeed?"
+          exit 1
+        fi
         set_args=(
-          --helm-set "tags.${OWN_SHORT}=development-${OWN_MERGE_SHA}"
+          --helm-set "tags.${OWN_SHORT}=${OWN_TAG}"
           --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
         )
-        # Resolve every `Deploys:` link into a `repo:tag:rev` line. Resolved
-        # links append to $resolved; links we cannot resolve (linked PR
-        # missing, closed, or unmergeable, i.e. no merge_commit_sha) append to
-        # $unresolved and become a HARD ERROR below. Silently falling back to
-        # the linked repo's default branch is how a dirty PR shipped the wrong
-        # chart. `|| true` on grep tolerates a body with no Deploys links.
-        resolved="$(mktemp)"; unresolved="$(mktemp)"
-        gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" \
-          | jq -r '.body // ""' \
-          | { grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)' || true; } \
-          | while read -r _kw ref; do
-              full="${ref%%#*}"; num="${ref##*#}"
-              case "$full" in
-                */*) ;;
-                *)   full="${OWN_REPO%%/*}/$full" ;;
-              esac
-              [ "$full" = "$OWN_REPO" ] && continue
-              # `#staging`: reuse the linked repo's staging pipeline outputs
-              # (`staging` ECR image tag + `staging` git branch); no API lookup.
-              if [ "$num" = "staging" ]; then
-                echo "${full##*/}:staging:staging" >> "$resolved"
-                continue
-              fi
-              # One API call, both SHAs out. merge_commit_sha is null on
-              # unmergeable PRs; those are recorded as unresolved below.
-              merge_sha=""; head_sha=""
-              read -r merge_sha head_sha < <(
-                gh_api "/repos/$full/pulls/$num" \
-                  | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
-              ) || true
-              if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
-                echo "${full##*/}:development-${merge_sha}:${head_sha}" >> "$resolved"
-              else
-                echo "${full}#${num}" >> "$unresolved"
-              fi
-            done
 
-        # Fail closed on any unresolvable link, and comment on the anchor PR so
-        # the cause is visible without digging through the job log.
-        if [ -s "$unresolved" ]; then
-          links="$(paste -sd', ' "$unresolved")"
+        # Linked PRs resolve in two phases. Phase 1 (inside the process
+        # substitution): parse the body + hit the GitHub API, emitting one
+        # colon-delimited line per link — colons are safe, SHAs and repo
+        # names never contain them. Phase 2 (the while loop, which runs in
+        # the MAIN shell): pick an image tag via the ECR guard and abort
+        # when nothing exists. The split matters: `exit 1` inside `< <(...)`
+        # only kills that subshell, so the existence checks and the abort
+        # must live out here where exit actually terminates the step (and
+        # where the guard's warn-once cache persists across iterations).
+        unresolved_links=()
+        while IFS=: read -r kind link repo merge_sha head_sha; do
+          case "$kind" in
+            unresolved)
+              # Linked PR could not be resolved (missing/closed/unmergeable;
+              # see phase 1). Collect for a single blocking comment + failure
+              # after the loop, in the main shell where exit actually works.
+              unresolved_links+=("$link")
+              ;;
+            staging)
+              set_args+=(
+                --helm-set "tags.${repo}=staging"
+                --helm-set "revisions.${repo}=staging"
+              )
+              ;;
+            pr)
+              # Prefer the head-SHA tag: PR head SHAs are immutable, so the
+              # pin can't go stale. Fall back to the merge-SHA tag for
+              # images built before dual-tagging — GitHub regenerates the
+              # synthetic merge SHA whenever base or head moves, so this
+              # deploy-time lookup can name a twin commit no build ever
+              # pushed; the guard catches exactly that case.
+              #
+              # The head tag is selected ONLY on a positive ECR check. When
+              # the guard is unavailable (no aws CLI / AccessDenied / any
+              # infra error — including one that strikes mid-check and
+              # fabricates a "present" answer), degrade to the merge tag:
+              # exactly the pre-hardening behavior, never worse. A head tag
+              # mostly doesn't exist until the linked repo rebuilds with the
+              # dual-tagging build action, so preferring it unverified would
+              # manufacture the phantom pin this guard exists to prevent.
+              head_tag="development-head-${head_sha}"
+              merge_tag="development-${merge_sha}"
+              tag="$merge_tag"
+              if [ "$ECR_CHECKS" = on ] && ecr_tag_exists "$repo" "$head_tag" && [ "$ECR_CHECKS" = on ]; then
+                tag="$head_tag"
+              elif [ "$ECR_CHECKS" = on ] && ! ecr_tag_exists "$repo" "$merge_tag"; then
+                echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in mindsdb-${repo//_/-}. The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
+                exit 1
+              fi
+              set_args+=(
+                --helm-set "tags.${repo}=${tag}"
+                --helm-set "revisions.${repo}=${head_sha}"
+              )
+              ;;
+          esac
+        done < <(
+          printf '%s\n' "$PR_BODY" \
+            | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)' \
+            | while read -r _kw ref; do
+                full="${ref%%#*}"; num="${ref##*#}"
+                case "$full" in
+                  */*) ;;
+                  *)   full="${OWN_REPO%%/*}/$full" ;;
+                esac
+                [ "$full" = "$OWN_REPO" ] && continue
+                # `#staging` — reuse the linked repo's staging pipeline
+                # outputs: `staging` ECR image tag + `staging` git branch.
+                if [ "$num" = "staging" ]; then
+                  echo "staging:${full}#staging:${full##*/}::"
+                  continue
+                fi
+                # One API call, both SHAs out. merge_commit_sha is null on
+                # unmergeable PRs; those become an unresolved marker (phase 2
+                # fails the job and comments on the anchor PR).
+                merge_sha=""; head_sha=""
+                read -r merge_sha head_sha < <(
+                  gh_api "/repos/$full/pulls/$num" \
+                    | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
+                ) || true
+                if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
+                  echo "pr:${full}#${num}:${full##*/}:${merge_sha}:${head_sha}"
+                else
+                  echo "unresolved:${full}#${num}:${full##*/}::"
+                fi
+              done
+        )
+
+        # Fail closed on any unresolvable Deploys link, and comment on the
+        # anchor PR so the cause is visible without digging through the log.
+        if [ "${#unresolved_links[@]}" -gt 0 ]; then
+          links="$(printf '%s, ' "${unresolved_links[@]}")"; links="${links%, }"
           comment="$(printf '**PR-env deploy blocked.**\n\nThese `Deploys:` link(s) could not be resolved, so the deploy was refused: %s\n\nA linked PR resolves to no `merge_commit_sha` when it is missing, closed, or unmergeable (a conflicted/`dirty` PR has none). Rather than silently deploy that repo from its default branch, this job fails.\n\nFix: resolve the conflicts (or correct the link), then re-run the deploy by pushing a commit or toggling the `deploy` label.' "$links")"
           jq -n --arg b "$comment" '{body: $b}' \
             | curl -sfX POST -H "Authorization: Bearer $GH_TOKEN" \
@@ -161,18 +296,9 @@ runs:
                  "https://api.github.com/repos/$OWN_REPO/issues/$PR_NUMBER/comments" \
                  --data @- >/dev/null \
             || echo "::warning::could not post the blocking comment to ${OWN_REPO}#${PR_NUMBER} (does the gh-token allow writing issue comments?)" >&2
-          echo "Refusing to deploy: unresolvable Deploys link(s): ${links}" >&2
-          rm -f "$resolved" "$unresolved"
+          echo "::error::Refusing to deploy: unresolvable Deploys link(s): ${links}"
           exit 1
         fi
-
-        while IFS=: read -r repo tag rev; do
-          set_args+=(
-            --helm-set "tags.${repo}=${tag}"
-            --helm-set "revisions.${repo}=${rev}"
-          )
-        done < "$resolved"
-        rm -f "$resolved" "$unresolved"
 
         # Install argocd CLI to a writable location if missing. /usr/local/bin
         # is owned by root on self-hosted runners; $RUNNER_TEMP is per-job
