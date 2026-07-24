@@ -60,6 +60,25 @@ on:
         description: "Runner label for the notify job"
         type: string
         default: mdb-dev
+  # Manual smoke test: run this workflow from the Actions tab to post a sample
+  # message to the eng channel. `status: recovered` always posts here (the
+  # prior-run check only applies to workflow_call runs), so both styles are
+  # testable on demand.
+  workflow_dispatch:
+    inputs:
+      env-name:
+        description: "Label to show in the test message"
+        type: string
+        default: "manual test"
+      status:
+        description: "failed or recovered"
+        type: choice
+        options: [failed, recovered]
+        default: failed
+      runs-on:
+        description: "Runner label"
+        type: string
+        default: ubuntu-latest
 
 permissions:
   contents: read
@@ -69,12 +88,12 @@ jobs:
   notify:
     runs-on: ${{ inputs.runs-on }}
     steps:
-      # For the recovery message, only continue if the PREVIOUS completed run of
-      # this same workflow on this same branch failed. Otherwise this is a normal
-      # green run and we stay quiet.
+      # For the recovery message on a real pipeline run (workflow_call), only
+      # continue if the PREVIOUS completed run of this same workflow on this same
+      # branch failed. A manual workflow_dispatch test always posts.
       - name: Check whether the previous run was failing
         id: prev
-        if: inputs.status == 'recovered'
+        if: github.event_name == 'workflow_call' && inputs.status == 'recovered'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -97,8 +116,9 @@ jobs:
           fi
 
       - name: Notify Slack
-        # Failure mode always posts; recovery mode posts only after a failing run.
-        if: inputs.status != 'recovered' || steps.prev.outputs.should_post == 'true'
+        # Failure mode always posts; on a real pipeline, recovery posts only after
+        # a failing run; a manual dispatch always posts (smoke test).
+        if: inputs.status != 'recovered' || github.event_name == 'workflow_dispatch' || steps.prev.outputs.should_post == 'true'
         uses: slackapi/slack-github-action@v1.26.0
         with:
           channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
