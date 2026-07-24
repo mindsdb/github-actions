@@ -180,8 +180,9 @@ runs:
         # org), `Deploys: org/repo#N`, or `Deploys: repo#staging` (pin the
         # linked repo to that env's moving image tag + `staging` branch —
         # no API lookup, both values reused verbatim from that env's
-        # release pipeline). Self-links are skipped; unresolvable PRs
-        # are skipped with a warning.
+        # release pipeline). Self-links are skipped; an unresolvable link
+        # (missing/closed/unmergeable PR) fails the job and comments on the
+        # anchor PR rather than silently deploying from the default branch.
         #
         # The anchor's own image is tagged from the merge SHA by the build
         # job in this same run — no cross-PR race — but it still gets the
@@ -206,8 +207,15 @@ runs:
         # only kills that subshell, so the existence checks and the abort
         # must live out here where exit actually terminates the step (and
         # where the guard's warn-once cache persists across iterations).
+        unresolved_links=()
         while IFS=: read -r kind link repo merge_sha head_sha; do
           case "$kind" in
+            unresolved)
+              # Linked PR could not be resolved (missing/closed/unmergeable;
+              # see phase 1). Collect for a single blocking comment + failure
+              # after the loop, in the main shell where exit actually works.
+              unresolved_links+=("$link")
+              ;;
             staging)
               set_args+=(
                 --helm-set "tags.${repo}=staging"
@@ -262,7 +270,8 @@ runs:
                   continue
                 fi
                 # One API call, both SHAs out. merge_commit_sha is null on
-                # unmergeable PRs; we skip those.
+                # unmergeable PRs; those become an unresolved marker (phase 2
+                # fails the job and comments on the anchor PR).
                 merge_sha=""; head_sha=""
                 read -r merge_sha head_sha < <(
                   gh_api "/repos/$full/pulls/$num" \
@@ -271,10 +280,25 @@ runs:
                 if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
                   echo "pr:${full}#${num}:${full##*/}:${merge_sha}:${head_sha}"
                 else
-                  echo "::warning::Deploys link ${full}#${num} could not be resolved (PR missing or unmergeable); skipping" >&2
+                  echo "unresolved:${full}#${num}:${full##*/}::"
                 fi
               done
         )
+
+        # Fail closed on any unresolvable Deploys link, and comment on the
+        # anchor PR so the cause is visible without digging through the log.
+        if [ "${#unresolved_links[@]}" -gt 0 ]; then
+          links="$(printf '%s, ' "${unresolved_links[@]}")"; links="${links%, }"
+          comment="$(printf '**PR-env deploy blocked.**\n\nThese `Deploys:` link(s) could not be resolved, so the deploy was refused: %s\n\nA linked PR resolves to no `merge_commit_sha` when it is missing, closed, or unmergeable (a conflicted/`dirty` PR has none). Rather than silently deploy that repo from its default branch, this job fails.\n\nFix: resolve the conflicts (or correct the link), then re-run the deploy by pushing a commit or toggling the `deploy` label.' "$links")"
+          jq -n --arg b "$comment" '{body: $b}' \
+            | curl -sfX POST -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/$OWN_REPO/issues/$PR_NUMBER/comments" \
+                 --data @- >/dev/null \
+            || echo "::warning::could not post the blocking comment to ${OWN_REPO}#${PR_NUMBER} (does the gh-token allow writing issue comments?)" >&2
+          echo "::error::Refusing to deploy: unresolvable Deploys link(s): ${links}"
+          exit 1
+        fi
 
         # Install argocd CLI to a writable location if missing. /usr/local/bin
         # is owned by root on self-hosted runners; $RUNNER_TEMP is per-job
