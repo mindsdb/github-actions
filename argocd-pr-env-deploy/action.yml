@@ -106,48 +106,73 @@ runs:
         # org), `Deploys: org/repo#N`, or `Deploys: repo#staging` (pin the
         # linked repo to that env's moving image tag + `staging` branch —
         # no API lookup, both values reused verbatim from that env's
-        # release pipeline). Self-links are skipped; unresolvable PRs
-        # are skipped with a warning.
+        # release pipeline). Self-links are skipped; an unresolvable link
+        # (missing/closed/unmergeable PR) fails the job and comments on the
+        # anchor PR rather than silently deploying from the default branch.
         set_args=(
           --helm-set "tags.${OWN_SHORT}=development-${OWN_MERGE_SHA}"
           --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
         )
+        # Resolve every `Deploys:` link into a `repo:tag:rev` line. Resolved
+        # links append to $resolved; links we cannot resolve (linked PR
+        # missing, closed, or unmergeable, i.e. no merge_commit_sha) append to
+        # $unresolved and become a HARD ERROR below. Silently falling back to
+        # the linked repo's default branch is how a dirty PR shipped the wrong
+        # chart. `|| true` on grep tolerates a body with no Deploys links.
+        resolved="$(mktemp)"; unresolved="$(mktemp)"
+        gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" \
+          | jq -r '.body // ""' \
+          | { grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)' || true; } \
+          | while read -r _kw ref; do
+              full="${ref%%#*}"; num="${ref##*#}"
+              case "$full" in
+                */*) ;;
+                *)   full="${OWN_REPO%%/*}/$full" ;;
+              esac
+              [ "$full" = "$OWN_REPO" ] && continue
+              # `#staging`: reuse the linked repo's staging pipeline outputs
+              # (`staging` ECR image tag + `staging` git branch); no API lookup.
+              if [ "$num" = "staging" ]; then
+                echo "${full##*/}:staging:staging" >> "$resolved"
+                continue
+              fi
+              # One API call, both SHAs out. merge_commit_sha is null on
+              # unmergeable PRs; those are recorded as unresolved below.
+              merge_sha=""; head_sha=""
+              read -r merge_sha head_sha < <(
+                gh_api "/repos/$full/pulls/$num" \
+                  | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
+              ) || true
+              if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
+                echo "${full##*/}:development-${merge_sha}:${head_sha}" >> "$resolved"
+              else
+                echo "${full}#${num}" >> "$unresolved"
+              fi
+            done
+
+        # Fail closed on any unresolvable link, and comment on the anchor PR so
+        # the cause is visible without digging through the job log.
+        if [ -s "$unresolved" ]; then
+          links="$(paste -sd', ' "$unresolved")"
+          comment="$(printf '**PR-env deploy blocked.**\n\nThese `Deploys:` link(s) could not be resolved, so the deploy was refused: %s\n\nA linked PR resolves to no `merge_commit_sha` when it is missing, closed, or unmergeable (a conflicted/`dirty` PR has none). Rather than silently deploy that repo from its default branch, this job fails.\n\nFix: resolve the conflicts (or correct the link), then re-run the deploy by pushing a commit or toggling the `deploy` label.' "$links")"
+          jq -n --arg b "$comment" '{body: $b}' \
+            | curl -sfX POST -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/$OWN_REPO/issues/$PR_NUMBER/comments" \
+                 --data @- >/dev/null \
+            || echo "::warning::could not post the blocking comment to ${OWN_REPO}#${PR_NUMBER} (does the gh-token allow writing issue comments?)" >&2
+          echo "Refusing to deploy: unresolvable Deploys link(s): ${links}" >&2
+          rm -f "$resolved" "$unresolved"
+          exit 1
+        fi
+
         while IFS=: read -r repo tag rev; do
           set_args+=(
             --helm-set "tags.${repo}=${tag}"
             --helm-set "revisions.${repo}=${rev}"
           )
-        done < <(
-          gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" \
-            | jq -r '.body // ""' \
-            | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)' \
-            | while read -r _kw ref; do
-                full="${ref%%#*}"; num="${ref##*#}"
-                case "$full" in
-                  */*) ;;
-                  *)   full="${OWN_REPO%%/*}/$full" ;;
-                esac
-                [ "$full" = "$OWN_REPO" ] && continue
-                # `#staging` — reuse the linked repo's staging pipeline
-                # outputs: `staging` ECR image tag + `staging` git branch.
-                if [ "$num" = "staging" ]; then
-                  echo "${full##*/}:staging:staging"
-                  continue
-                fi
-                # One API call, both SHAs out. merge_commit_sha is null on
-                # unmergeable PRs; we skip those.
-                merge_sha=""; head_sha=""
-                read -r merge_sha head_sha < <(
-                  gh_api "/repos/$full/pulls/$num" \
-                    | jq -r '[.merge_commit_sha // "", .head.sha // ""] | @tsv'
-                ) || true
-                if [ -n "${merge_sha:-}" ] && [ -n "${head_sha:-}" ]; then
-                  echo "${full##*/}:development-${merge_sha}:${head_sha}"
-                else
-                  echo "::warning::Deploys link ${full}#${num} could not be resolved (PR missing or unmergeable); skipping" >&2
-                fi
-              done
-        )
+        done < "$resolved"
+        rm -f "$resolved" "$unresolved"
 
         # Install argocd CLI to a writable location if missing. /usr/local/bin
         # is owned by root on self-hosted runners; $RUNNER_TEMP is per-job
