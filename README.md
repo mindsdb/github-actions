@@ -30,6 +30,41 @@ workflow via `workflow_run`; merging that PR fires `Staging Unfreeze`. The
 `workflow_run` link matches on the **caller** workflow's name, so callers must
 keep the names above verbatim.
 
+## Merge-to-main panic alerts
+
+`notify-main-failure.yml` posts a "pipeline failed" alert to the engineering
+Slack channel when a workflow that runs on push to `main`/`staging` (or the
+freeze/unfreeze cycle) fails. It posts its own failure-shaped message (repo,
+pipeline label, workflow, branch, commit, triggering actor, run link) rather
+than the deploy-notification composite, whose copy is deploy-specific and reads
+wrong for non-deploy pipelines. It uses the same Slack bot token.
+
+Add one terminal job per push-triggered workflow that depends on **every** job
+in the workflow and runs only `if: failure()`. Depend on all jobs, not just the
+leaves: a mid-graph failure skips its dependents (which is not a failure), so a
+notify job that only needs the leaves could itself be skipped.
+
+```yaml
+  notify-failure:
+    needs: [linter, run-unit-tests, build, scan, migrate, deploy, integration-tests]  # every job
+    if: failure()
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@<sha> # v1
+    with:
+      env-name: "prod build+deploy"     # short label for the failing pipeline
+    secrets: inherit
+```
+
+For a freeze/unfreeze wrapper, `needs:` its single job and label it accordingly
+(`env-name: "staging freeze"`). Pass `runs-on: ubuntu-latest` for repos without
+the self-hosted `mdb-dev` runner. For a workflow that also runs on
+`pull_request`, guard the job with `if: failure() && github.event_name == 'push'`
+so PR-run failures (which the author already sees) don't alert the channel.
+
+Requires two org secrets, reaching the workflow via `secrets: inherit`:
+`SLACK_ENG_CHANNEL_ID` (the engineering channel; distinct from the deploy-chatter
+`SLACK_DEPLOYMENTS_CHANNEL_ID`) and `GH_ACTIONS_SLACK_BOT_TOKEN`. The Slack bot
+must be a member of that channel.
+
 ### Prerequisites (provisioned once, org level, scoped to the release-train repos)
 
 - **`mindsdb-release-train` GitHub App** with `Administration`, `Contents`, and
