@@ -1,0 +1,141 @@
+# Reusable workflow: post a Slack alert to the engineering channel when a
+# workflow that runs on push to main/staging (or the release-train
+# freeze/unfreeze cycle) FAILS, and a follow-up when it RECOVERS.
+#
+# A failed merge pipeline is a silent prod-risk event: main-triggered workflows
+# cut releases and bake + deploy prod images. Callers add terminal jobs that
+# `needs:` EVERY job in the workflow, so the alert fires on a failure in any job
+# — including a mid-graph failure that only skips its dependents rather than
+# failing them.
+#
+# Two modes, selected by `status`:
+#   - failed    (if: failure()): always posts a red alert.
+#   - recovered (if: success()): posts a green "recovered" message ONLY when the
+#     previous completed run of this workflow on this branch concluded in
+#     failure. On a normal green run (prior run already green) it no-ops, so the
+#     channel is not spammed on every merge. This is derived from the GitHub API
+#     rather than cross-run state, so it is self-healing (no cache to go stale).
+#
+# It posts its own message rather than the deploy-notification composite, whose
+# copy is deploy-specific ("has failed deploying to ...") and reads wrong for
+# non-deploy pipelines (freeze, CI, docs). It uses the same Slack bot token.
+#
+# Called by two terminal jobs per push-triggered workflow, e.g.
+#   auth/.github/workflows/prod-build-deploy.yml
+#     notify-failure:
+#       needs: [linter, run-unit-tests, build-auth, scan-auth, migrate, deploy, integration-tests]
+#       if: failure()
+#       uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@<sha> # v1
+#       with:
+#         env-name: "prod build+deploy"
+#       secrets: inherit
+#     notify-recovery:
+#       needs: [linter, run-unit-tests, build-auth, scan-auth, migrate, deploy, integration-tests]
+#       if: success()
+#       uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@<sha> # v1
+#       with:
+#         env-name: "prod build+deploy"
+#         status: recovered
+#       secrets: inherit
+#
+# Requires (reach this workflow via `secrets: inherit` in the caller):
+#   - secrets.SLACK_ENG_CHANNEL_ID       (the engineering channel; org secret)
+#   - secrets.GH_ACTIONS_SLACK_BOT_TOKEN (the Slack bot token; org secret)
+# The Slack bot must be a member of the channel SLACK_ENG_CHANNEL_ID resolves to.
+
+name: Notify main-branch failure
+
+on:
+  workflow_call:
+    inputs:
+      env-name:
+        description: "Short label for the pipeline (e.g. 'prod build+deploy', 'staging freeze')"
+        type: string
+        required: true
+      status:
+        description: "'failed' (red alert) or 'recovered' (green, only if the prior run was failing)"
+        type: string
+        default: failed
+      runs-on:
+        description: "Runner label for the notify job"
+        type: string
+        default: mdb-dev
+
+permissions:
+  contents: read
+  actions: read  # read the previous run's conclusion for recovery detection
+
+jobs:
+  notify:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      # For the recovery message, only continue if the PREVIOUS completed run of
+      # this same workflow on this same branch failed. Otherwise this is a normal
+      # green run and we stay quiet.
+      - name: Check whether the previous run was failing
+        id: prev
+        if: inputs.status == 'recovered'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Most recent completed run of THIS workflow on THIS branch, excluding
+          # the current run. Match on workflow display name to stay filename-agnostic.
+          PREV=$(gh api "repos/${REPO}/actions/runs?branch=${BRANCH}&status=completed&per_page=20" \
+            --jq "[.workflow_runs[] | select(.name == \"${WORKFLOW}\" and (.id|tostring) != \"${RUN_ID}\")][0].conclusion // \"\"")
+          echo "prev_conclusion=${PREV}" >> "$GITHUB_OUTPUT"
+          if [ "$PREV" = "failure" ]; then
+            echo "should_post=true" >> "$GITHUB_OUTPUT"
+            echo "Previous run concluded '${PREV}' — posting recovery."
+          else
+            echo "should_post=false" >> "$GITHUB_OUTPUT"
+            echo "Previous run concluded '${PREV:-none}' — not a recovery, staying quiet."
+          fi
+
+      - name: Notify Slack
+        # Failure mode always posts; recovery mode posts only after a failing run.
+        if: inputs.status != 'recovered' || steps.prev.outputs.should_post == 'true'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ inputs.status == 'recovered' && '#00C851' || '#FF4444' }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "${{ inputs.status == 'recovered' && ':white_check_mark:' || ':rotating_light:' }} *<${{ github.server_url }}/${{ github.repository }}|${{ github.event.repository.name }}>* — *${{ inputs.env-name }}* pipeline ${{ inputs.status == 'recovered' && 'recovered' || 'failed' }} on `${{ github.ref_name }}`"
+                      },
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Workflow*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|${{ github.workflow }}>"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*${{ inputs.status == 'recovered' && 'Fixed by' || 'Triggered by' }}*\n${{ github.triggering_actor }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Commit*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Branch*\n<${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}|${{ github.ref_name }}>"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
