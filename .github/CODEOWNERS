@@ -1,0 +1,5 @@
+# Everything in this repo executes inside other repos' pipelines, with the
+# calling repo's secrets in scope (AWS OIDC roles, ECR push, Slack bot token,
+# PyPI trusted publishing). A change here reaches eight repos' CI, including
+# prod deploys, so review belongs to the team that owns those pipelines.
+* @mindsdb/devops
