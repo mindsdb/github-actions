@@ -9,39 +9,47 @@
 # failing them.
 #
 # Two modes, selected by `status`:
-#   - failed    (if: failure()): always posts a red alert.
-#   - recovered (if: success()): posts a green "recovered" message ONLY when the
-#     previous completed run of this workflow on this branch concluded in
-#     failure. On a normal green run (prior run already green) it no-ops, so the
-#     channel is not spammed on every merge. This is derived from the GitHub API
-#     rather than cross-run state, so it is self-healing (no cache to go stale).
+#   - failed:    always posts a red alert.
+#   - recovered: posts a green "recovered" message ONLY when the previous
+#     conclusive run of this workflow on this branch failed. On a normal green
+#     run (prior run already green) it no-ops, so the channel is not spammed on
+#     every merge. This is derived from the GitHub API rather than cross-run
+#     state, so it is self-healing (no cache to go stale).
 #
 # It posts its own message rather than the deploy-notification composite, whose
 # copy is deploy-specific ("has failed deploying to ...") and reads wrong for
 # non-deploy pipelines (freeze, CI, docs). It uses the same Slack bot token.
 #
-# Called by two terminal jobs per push-triggered workflow, e.g.
+# ONE caller job covers both modes: a `uses:` job cannot branch on status, so
+# the caller derives the aggregate outcome from `needs.*.result` and passes it
+# in. Cancelled runs stay silent.
 #   auth/.github/workflows/prod-build-deploy.yml
-#     notify-failure:
+#     notify:
 #       needs: [linter, run-unit-tests, build-auth, scan-auth, migrate, deploy, integration-tests]
-#       if: failure()
+#       if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+#       permissions:
+#         contents: read
+#         actions: read
 #       uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@<sha> # v1
 #       with:
 #         env-name: "prod build+deploy"
+#         status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
 #       secrets: inherit
-#     notify-recovery:
-#       needs: [linter, run-unit-tests, build-auth, scan-auth, migrate, deploy, integration-tests]
-#       if: success()
-#       uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@<sha> # v1
-#       with:
-#         env-name: "prod build+deploy"
-#         status: recovered
-#       secrets: inherit
+#
+# A failure-only caller (the freeze/unfreeze wrappers) keeps `if: failure()`,
+# takes the default `status: failed`, and needs no `permissions:` block: the
+# prior-run lookup only runs in recovered mode.
 #
 # Requires (reach this workflow via `secrets: inherit` in the caller):
 #   - secrets.SLACK_ENG_CHANNEL_ID       (the engineering channel; org secret)
 #   - secrets.GH_ACTIONS_SLACK_BOT_TOKEN (the Slack bot token; org secret)
 # The Slack bot must be a member of the channel SLACK_ENG_CHANNEL_ID resolves to.
+#
+# Recovery mode also needs `actions: read` on the CALLER's notify job. The
+# default workflow token carries contents + packages read only, and a called
+# workflow can never hold more than its caller grants, so without that block the
+# prior-run lookup is refused. It degrades to silence rather than failing, so a
+# missing grant never turns a green pipeline red.
 
 name: Notify main-branch failure
 
@@ -62,7 +70,7 @@ on:
         default: mdb-dev
   # Manual smoke test: run this workflow from the Actions tab to post a sample
   # message to the eng channel. `status: recovered` always posts here (the
-  # prior-run check only applies to workflow_call runs), so both styles are
+  # prior-run check is skipped on a manual dispatch), so both styles are
   # testable on demand.
   workflow_dispatch:
     inputs:
@@ -88,32 +96,60 @@ jobs:
   notify:
     runs-on: ${{ inputs.runs-on }}
     steps:
-      # For the recovery message on a real pipeline run (workflow_call), only
-      # continue if the PREVIOUS completed run of this same workflow on this same
-      # branch failed. A manual workflow_dispatch test always posts.
+      # For the recovery message on a real pipeline run, only continue if the
+      # PREVIOUS conclusive run of this same workflow on this same branch failed.
+      # A manual dispatch skips the check and always posts (smoke test).
+      #
+      # The discriminator is the dispatch event, not `workflow_call`: a called
+      # workflow inherits the CALLER's `github` context, so `event_name` here is
+      # the caller's trigger (`push`, `workflow_run`, ...) and never
+      # `workflow_call`.
       - name: Check whether the previous run was failing
         id: prev
-        if: github.event_name == 'workflow_call' && inputs.status == 'recovered'
+        if: inputs.status == 'recovered' && github.event_name != 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           WORKFLOW: ${{ github.workflow }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
           BRANCH: ${{ github.ref_name }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          set -euo pipefail
-          # Most recent completed run of THIS workflow on THIS branch, excluding
-          # the current run. Match on workflow display name to stay filename-agnostic.
-          PREV=$(gh api "repos/${REPO}/actions/runs?branch=${BRANCH}&status=completed&per_page=20" \
-            --jq "[.workflow_runs[] | select(.name == \"${WORKFLOW}\" and (.id|tostring) != \"${RUN_ID}\")][0].conclusion // \"\"")
-          echo "prev_conclusion=${PREV}" >> "$GITHUB_OUTPUT"
-          if [ "$PREV" = "failure" ]; then
-            echo "should_post=true" >> "$GITHUB_OUTPUT"
-            echo "Previous run concluded '${PREV}' — posting recovery."
-          else
+          set -uo pipefail
+
+          # Match the workflow FILE rather than its display name, which a
+          # `run-name:` override changes; fall back to the name if the ref does
+          # not resolve to a path inside this repo.
+          WF_PATH="${WORKFLOW_REF%%@*}"
+          export WF_PATH="${WF_PATH#"${REPO}/"}"
+
+          # Most recent CONCLUSIVE run on this branch, excluding the current one:
+          # cancelled and skipped runs are not evidence either way.
+          if ! PREV=$(gh api "repos/${REPO}/actions/runs?branch=${BRANCH}&status=completed&per_page=50" \
+            --jq '[ .workflow_runs[]
+                    | select(.path == env.WF_PATH or .name == env.WORKFLOW)
+                    | select((.id|tostring) != env.RUN_ID)
+                    | select(.conclusion == "success" or .conclusion == "failure"
+                             or .conclusion == "timed_out" or .conclusion == "startup_failure")
+                  ][0].conclusion // ""' 2>&1); then
+            # Almost always a missing `actions: read` grant on the caller job.
+            # Stay quiet rather than fail: a notify job must never redden a green run.
+            echo "Could not read run history, staying quiet: ${PREV}"
             echo "should_post=false" >> "$GITHUB_OUTPUT"
-            echo "Previous run concluded '${PREV:-none}' — not a recovery, staying quiet."
+            exit 0
           fi
+
+          echo "prev_conclusion=${PREV}" >> "$GITHUB_OUTPUT"
+          case "${PREV}" in
+            success|"")
+              echo "should_post=false" >> "$GITHUB_OUTPUT"
+              echo "Previous run concluded '${PREV:-none}', not a recovery, staying quiet."
+              ;;
+            *)
+              echo "should_post=true" >> "$GITHUB_OUTPUT"
+              echo "Previous run concluded '${PREV}', posting recovery."
+              ;;
+          esac
 
       - name: Notify Slack
         # Failure mode always posts; on a real pipeline, recovery posts only after

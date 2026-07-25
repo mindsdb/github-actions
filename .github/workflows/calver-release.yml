@@ -1,0 +1,135 @@
+# Reusable workflow: cut a CalVer tag and a GitHub Release for the calling repo.
+#
+# Version shape is `<major>.<yy>.<m>.<d>.<seq>` (UTC, no zero padding), where
+# `seq` is the next unused sequence for today, so several releases a day are
+# fine. The tag is that string prefixed with `v`.
+#
+# With `prerelease: true` the version gains a PEP 440 `rc<n>` suffix and the
+# GitHub release is flagged as a pre-release. Both streams can run against the
+# same repo: only NUMERIC sequences count towards `seq` (an `rc`-suffixed tag
+# fails that check), so an rc never consumes a stable sequence number, and
+# `X.SEQrcN` PEP 440-precedes the stable `X.SEQ` it leads.
+#
+# The tag, the push, and the release all land in the CALLING repo: `github.*`
+# resolves to the caller, and the checkout is the caller at the triggering SHA.
+#
+# Called as the first job of a push-to-main release pipeline, e.g.
+#   cowork/.github/workflows/release.yml
+#     auto-release:
+#       permissions:
+#         contents: write
+#       uses: mindsdb/github-actions/.github/workflows/calver-release.yml@<sha> # v1
+#       with:
+#         calver-major: "2"
+#     build-deploy-prod:
+#       needs: auto-release
+#       uses: ./.github/workflows/prod-build-installer.yml
+#       with:
+#         tag: ${{ needs.auto-release.outputs.tag }}
+#
+# `contents: write` on the caller job is required (the tag push and the release
+# creation); a called workflow can never hold more than its caller grants.
+#
+# Guards that belong to the caller, not here:
+#   - `concurrency:` (one release at a time) — the caller owns the group name.
+#   - skipping auto-version commits, e.g.
+#     `if: "!contains(github.event.head_commit.message, '[skip ci]')"`.
+
+name: CalVer release
+
+on:
+  workflow_call:
+    inputs:
+      calver-major:
+        description: "Leading major component of the version (per-repo constant)"
+        type: string
+        required: true
+      prerelease:
+        description: "Mint an rc pre-release (v<base>rc<n>) instead of a stable release"
+        type: boolean
+        default: false
+      runs-on:
+        description: "Runner label for the release job"
+        type: string
+        default: ubuntu-latest
+    outputs:
+      tag:
+        description: "The created tag, e.g. v2.26.7.24.1"
+        value: ${{ jobs.release.outputs.tag }}
+      version:
+        description: "The version without the leading v, e.g. 2.26.7.24.1"
+        value: ${{ jobs.release.outputs.version }}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need tags for sequence calculation
+
+      - name: Compute CalVer version
+        id: version
+        env:
+          CALVER_MAJOR: ${{ inputs.calver-major }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          MAJOR="${CALVER_MAJOR}"
+          YY=$(date -u +%y)    # e.g. 26
+          M=$(date -u +%-m)    # e.g. 6 (no zero-pad)
+          DD=$(date -u +%-d)   # e.g. 23 (no zero-pad)
+
+          # Highest NUMERIC sequence for today's date. rc-suffixed tags fail the
+          # numeric check, so the stable and rc streams never fight over one.
+          PREFIX="v${MAJOR}.${YY}.${M}.${DD}."
+          SEQ=0
+          for tag in $(git tag -l "${PREFIX}*" | sort -t. -k5 -n); do
+            N="${tag##*.}"
+            if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$SEQ" ]; then
+              SEQ="$N"
+            fi
+          done
+          SEQ=$((SEQ + 1))
+
+          VERSION="${MAJOR}.${YY}.${M}.${DD}.${SEQ}"
+
+          if [ "${PRERELEASE}" = "true" ]; then
+            # rc counter within that base sequence
+            RC=0
+            for tag in $(git tag -l "${PREFIX}${SEQ}rc*"); do
+              N="${tag##*rc}"
+              if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -gt "$RC" ]; then
+                RC="$N"
+              fi
+            done
+            RC=$((RC + 1))
+            VERSION="${VERSION}rc${RC}"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${VERSION}"
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          git tag "${TAG}"
+          git push origin "${TAG}"
+          if [ "${PRERELEASE}" = "true" ]; then
+            gh release create "${TAG}" --prerelease --generate-notes --title "${TAG}"
+          else
+            gh release create "${TAG}" --generate-notes --title "${TAG}"
+          fi
