@@ -1,0 +1,86 @@
+# CI for this repo.
+#
+# It defines the pipelines of eight other repos and had no checks of its own, so a
+# malformed reusable reached every consumer's next run before anyone noticed. Every
+# call site floats on `@main` (decision 11.BH), which makes that the widest blast
+# radius we have.
+#
+# It runs the same three layers `workflow-lint.yml` gives consumers, but against
+# the PR's own checkout rather than through the reusable, because the reusable
+# pulls the shared script from `main` and this is the repo where the script itself
+# is under review.
+#
+# This is the repo's first `pull_request` trigger, so a fork PR can run it. That
+# is acceptable and deliberate: no secrets, no self-hosted runner, read-only token.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run actionlint
+        env:
+          VERSION: "1.7.12"
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz" \
+            | tar -xz actionlint
+          ./actionlint -color
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Unit-test the shared CI scripts
+        run: uv run --with pyyaml --with pytest --python 3.12 -m pytest tests/ -q
+
+      - name: Check that this repo's own reusables compose
+        run: |
+          uv run --with pyyaml --python 3.12 scripts/workflow_permissions.py \
+            --workflow-dir .github/workflows
+
+      - name: Audit workflows with zizmor (advisory)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          uvx zizmor@1.28.0 .github/workflows | tee zizmor.out || true
+          {
+            echo "### zizmor (advisory)"
+            echo
+            echo '```'
+            tail -40 zizmor.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    # One job covers both outcomes: a `uses:` job cannot branch on status, so
+    # the aggregate result picks the failed or recovered message, and a
+    # cancelled run stays silent. Push-only: a PR author already sees their own
+    # red check, and this repo's PRs can come from forks.
+    needs: [lint]
+    if: ${{ github.event_name == 'push' && !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      actions: read # the prior-run lookup behind the recovery message
+    uses: ./.github/workflows/notify-main-failure.yml
+    with:
+      env-name: "github-actions CI"
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+      runs-on: ubuntu-latest
+    secrets: inherit

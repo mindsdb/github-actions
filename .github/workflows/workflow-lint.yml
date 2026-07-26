@@ -1,0 +1,165 @@
+# Reusable workflow: lint the CALLING repo's GitHub Actions workflows.
+#
+# One place for the checks every service repo wants on its own pipelines, so they
+# are not eight copies of a lint step drifting apart. Three layers, deliberately
+# in this order, because they catch different things and only two of them are ours
+# to maintain:
+#
+#   actionlint   The established syntax + expression + shellcheck linter. Blocking.
+#                Everything it finds is a mistake.
+#   permissions  The one check neither tool does: a called workflow may never
+#                declare a permission its caller lacks. Blocking. See
+#                scripts/workflow_permissions.py for why this is not redundant —
+#                short version, it was verified against a tree that had already
+#                broken production and neither tool said a word.
+#   zizmor       The established Actions SECURITY auditor (template injection,
+#                credential persistence, unpinned actions, excessive permissions).
+#                Advisory by default, because pointing it at existing pipelines
+#                surfaces a backlog, and a lint job that is red on arrival gets
+#                ignored rather than fixed. Flip `zizmor-blocking` per repo once
+#                its backlog is triaged — same rollout the pip-audit gate used.
+#
+# Nothing here is hand-rolled that a tool already does. The permission check is
+# ~200 lines precisely because it is the only gap.
+#
+# Runner: defaults to ubuntu-latest. This job needs no cluster, no cloud, and no
+# secrets, so it should not occupy a self-hosted runner, and it is safe on a
+# public repo's fork PRs.
+
+name: Workflow lint
+
+on:
+  workflow_call:
+    inputs:
+      actionlint-version:
+        description: "actionlint release to run"
+        type: string
+        default: "1.7.12"
+      zizmor-version:
+        description: "zizmor release to run"
+        type: string
+        default: "1.28.0"
+      zizmor-blocking:
+        description: "Fail the job on zizmor findings (off until a repo's backlog is triaged)"
+        type: boolean
+        default: false
+      zizmor-persona:
+        description: "zizmor strictness (regular | pedantic | auditor)"
+        type: string
+        default: regular
+      default-permissions:
+        description: >-
+          What an undeclared workflow token carries in the calling repo, from
+          Settings -> Actions -> Workflow permissions (read | write). The
+          permission check compares against it, so a repo set to write needs to
+          say so or the check is stricter than reality.
+        type: string
+        default: read
+      runs-on:
+        description: "Runner label"
+        type: string
+        default: ubuntu-latest
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Check out the calling repo
+        uses: actions/checkout@v4
+
+      - name: Check out the shared CI scripts
+        uses: actions/checkout@v4
+        with:
+          repository: mindsdb/github-actions
+          path: .ci-shared
+
+      # Downloaded rather than run through a third-party action: one fewer
+      # mutable-tag dependency in the job that exists to police them.
+      - name: Run actionlint
+        env:
+          VERSION: ${{ inputs.actionlint-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz" \
+            | tar -xz actionlint
+          ./actionlint -color
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Check that every reusable call composes
+        env:
+          DEFAULTS: ${{ inputs.default-permissions }}
+        run: |
+          set -euo pipefail
+          uv run --with pyyaml --python 3.12 \
+            .ci-shared/scripts/workflow_permissions.py \
+            --workflow-dir .github/workflows \
+            --default-permissions "$DEFAULTS"
+
+      # Not a tool, just a rule, because the failure it prevents is permanent.
+      # A cluster Secret read by hand is unmasked until someone remembers
+      # `::add-mask::`, and `::add-mask::` only scrubs output that comes AFTER it,
+      # so the correct-looking fetch-then-mask still has a window. The k8s-secret
+      # composite action closes it by construction (fetch, fail-if-empty, mask,
+      # export, in that order). A credential printed into an Actions log is
+      # world-readable to the org and unrevocable from there — you can rotate the
+      # secret, you cannot unpublish the log.
+      #
+      # A workflow that genuinely needs the raw form, or that only quotes the
+      # command for a human to run, exempts itself with a `k8s-secret-ok: <reason>`
+      # comment anywhere in the file. Per FILE rather than per line, because the
+      # one real exemption we have is a command inside a heredoc that gets posted
+      # to a PR, and a per-line marker there would be published along with it.
+      - name: Check for hand-rolled cluster secret reads
+        run: |
+          set -uo pipefail
+          FOUND=0
+          while IFS= read -r file; do
+            grep -q 'k8s-secret-ok:' "$file" && continue
+            if grep -nE 'kubectl.*get[[:space:]]+secret' "$file"; then
+              echo "  ^ in $file"
+              FOUND=1
+            fi
+          done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \))
+          if [ "$FOUND" = "1" ]; then
+            echo "::error::Read cluster secrets through mindsdb/github-actions/k8s-secret@main, which fails on an absent key and masks BEFORE exporting. ::add-mask:: only scrubs output that comes after it, so a hand-rolled fetch-then-mask still has a window, and a credential in an Actions log cannot be unpublished."
+            echo "If a file only quotes the command for a human, add a 'k8s-secret-ok: <reason>' comment to it."
+            exit 1
+          fi
+          echo "No hand-rolled cluster secret reads."
+
+      - name: Audit workflows with zizmor
+        env:
+          VERSION: ${{ inputs.zizmor-version }}
+          PERSONA: ${{ inputs.zizmor-persona }}
+          BLOCKING: ${{ inputs.zizmor-blocking }}
+          # zizmor's online audits resolve action references against the API; the
+          # default token is enough and keeps it off the anonymous rate limit.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if [ "$BLOCKING" = "true" ]; then
+            uvx "zizmor@${VERSION}" --persona="$PERSONA" .github/workflows
+          else
+            # Advisory: report and move on. The findings land in the log and the
+            # step summary either way, so turning this into a gate later is a
+            # one-line input change rather than a discovery exercise.
+            uvx "zizmor@${VERSION}" --persona="$PERSONA" .github/workflows | tee zizmor.out || true
+            {
+              echo "### zizmor (advisory)"
+              echo
+              echo '```'
+              tail -40 zizmor.out
+              echo '```'
+              echo
+              echo "Set \`zizmor-blocking: true\` on the caller once these are triaged."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

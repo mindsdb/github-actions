@@ -1,0 +1,262 @@
+# Reusable workflow: alert the engineering channel when a pipeline on a
+# protected branch concluded WITHOUT EVER STARTING.
+#
+# Why this exists as a separate mechanism from notify-main-failure.yml, rather
+# than another mode of it.
+#
+# `notify-main-failure` is a job INSIDE the pipeline it reports on. That covers
+# every failure where the run exists: a failed step, a mid-graph failure that
+# only skips its dependents, a timeout. It cannot cover the case where GitHub
+# rejects the run at load time — `conclusion: startup_failure`, zero jobs — for
+# the plain reason that there is no job to put the alert in. The run appears in
+# the Actions tab and nowhere else.
+#
+# That case is not exotic and it is not cosmetic. Any of these produce it:
+#   - a caller job granting narrower `permissions:` than a called workflow's
+#     jobs declare (a called workflow may never exceed its caller's grant, and
+#     the cap is enforced when the FILE LOADS, not when a job runs)
+#   - a `uses: ./.github/workflows/x.yml` path that does not exist on the ref
+#   - malformed YAML, an unknown `on:` filter, a bad matrix expression
+#
+# Its consequence is the worst-shaped one available: a merge to a deploy branch
+# reports nothing, so the branch is believed deployed and is not. Two pushes to
+# auth `staging` sat undeployed for ten hours this way, and the first thing the
+# channel heard was the RECOVERY message from the run that fixed it.
+#
+# So this workflow watches from outside, on a schedule.
+#
+# What it alerts on, per branch, per workflow file: the newest conclusive run is
+# a `startup_failure` and it started inside the lookback window.
+#
+# That deliberately repeats. With the caller sweeping every 30 minutes and a
+# 90-minute window, one failing push produces about three messages and then
+# silence, and a second failing push starts the count again. The alternative was
+# to alert only on the TRANSITION into a broken state, which gives exactly one
+# message per break — and that was rejected after replaying it against the auth
+# incident, where it would have alerted once at 01:20 and then said nothing about
+# the 08:00 push into the already-broken branch, because the run before that one
+# had also failed to start. Exactly-once is the wrong target for "the branch is
+# not deployed": no state store is available to a stateless sweep, so the choice
+# is between a message that can be missed and a few that cannot, and a missed
+# alert is the entire failure being fixed here. A bounded reminder is the answer,
+# and the window is what bounds it.
+#
+# Cancelled and skipped runs are not evidence either way and are ignored, the
+# same reading notify-main-failure's recovery check uses.
+#
+# It posts through the Slack Web API directly rather than the composite action
+# the other alerts use, because the number of findings is not known until the
+# sweep runs, and because an alert path that only fires when something is
+# already broken is the last place to want a third-party action's templating
+# between us and the message.
+#
+# Requires (reach this workflow via `secrets: inherit` in the caller):
+#   - secrets.SLACK_ENG_CHANNEL_ID       (the engineering channel; org secret)
+#   - secrets.GH_ACTIONS_SLACK_BOT_TOKEN (the Slack bot token; org secret)
+# The Slack bot must be a member of the channel SLACK_ENG_CHANNEL_ID resolves to.
+#
+# The caller's job needs `actions: read` for the run + job history. A called
+# workflow can never hold more than its caller grants, so without it the sweep
+# has nothing to read; it says so in the summary and exits green rather than
+# reddening on a permissions gap.
+#
+# Scheduling note for callers: GitHub only runs `schedule` triggers from a
+# repository's DEFAULT branch. A watchdog caller merged to `staging` and no
+# further is inert. `workflow_dispatch` is there so it can be proven before it
+# reaches `main`.
+
+name: Notify pipeline startup failure
+
+on:
+  workflow_call:
+    inputs:
+      branches:
+        description: "Space-separated branches to sweep (deploy branches worth alerting on)"
+        type: string
+        default: "main staging"
+      lookback-minutes:
+        description: "Only alert on a startup failure that began this recently"
+        type: number
+        default: 90
+      runs-on:
+        description: "Runner label for the sweep job"
+        type: string
+        default: mdb-dev
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: "Space-separated branches to sweep"
+        type: string
+        default: "main staging"
+      lookback-minutes:
+        description: "Lookback window in minutes (widen it to replay a past incident)"
+        type: number
+        default: 90
+      dry-run:
+        description: "Report findings to the job summary without posting to Slack"
+        type: boolean
+        default: false
+      runs-on:
+        description: "Runner label"
+        type: string
+        default: ubuntu-latest
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  actions: read # run + job history for the sweep
+
+jobs:
+  sweep:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Find pipelines that never started
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCHES: ${{ inputs.branches }}
+          LOOKBACK: ${{ inputs.lookback-minutes }}
+        run: |
+          set -uo pipefail
+
+          CUTOFF=$(date -u -d "-${LOOKBACK} minutes" +%s 2>/dev/null) || \
+            CUTOFF=$(date -u -v-"${LOOKBACK}"M +%s)   # BSD date, for a macOS runner
+
+          echo '[]' > findings.json
+
+          for BRANCH in ${BRANCHES}; do
+            # Fail loud into the summary, quiet into the exit code: a watchdog
+            # that reddens the repo when the API is briefly unhappy gets muted,
+            # and a muted watchdog is worse than none.
+            if ! gh api "repos/${REPO}/actions/runs?branch=${BRANCH}&status=completed&per_page=100" \
+                 > "runs-${BRANCH//\//-}.json" 2>error.txt; then
+              {
+                echo "### Could not read run history for \`${BRANCH}\`"
+                echo
+                echo "Usually a missing \`actions: read\` grant on the calling job."
+                echo '```'
+                cat error.txt
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            # Newest conclusive run per workflow FILE (a `run-name:` override
+            # changes the display name, the path is stable). The previous run's
+            # conclusion rides along for the message rather than as a filter, so
+            # a failing push into an already-broken branch is still reported.
+            jq --argjson cutoff "${CUTOFF}" --arg branch "${BRANCH}" '
+              [ .workflow_runs[]
+                | select(.conclusion == "success" or .conclusion == "failure"
+                         or .conclusion == "timed_out" or .conclusion == "startup_failure")
+                | { id, path, name, conclusion, created_at, head_sha, html_url,
+                    actor: (.triggering_actor.login // "unknown"),
+                    title: (.display_title // "") } ]
+              | group_by(.path)
+              | map(sort_by(.created_at) | reverse)
+              | map(select(.[0].conclusion == "startup_failure"))
+              | map(.[0] + { branch: $branch, previous: (.[1].conclusion // "none") })
+              | map(select((.created_at | fromdateiso8601) >= $cutoff))
+            ' "runs-${BRANCH//\//-}.json" > "candidates-${BRANCH//\//-}.json"
+
+            jq -s 'add' findings.json "candidates-${BRANCH//\//-}.json" > merged.json
+            mv merged.json findings.json
+          done
+
+          # Keep only the runs where NO job ran, which is the whole point: those
+          # are the ones the pipeline's own notify job could not have reported.
+          # An unreadable job list still alerts — by this point a startup failure
+          # definitely happened, and silence is the failure mode being fixed.
+          jq -c '.[]' findings.json | while read -r ROW; do
+            ID=$(jq -r '.id' <<< "$ROW")
+            if COUNT=$(gh api "repos/${REPO}/actions/runs/${ID}/jobs" --jq '.total_count' 2>/dev/null); then
+              [ "${COUNT}" = "0" ] || continue
+            else
+              COUNT="unknown"
+            fi
+            jq -c --arg jobs "${COUNT}" '. + {jobs: $jobs}' <<< "$ROW"
+          done | jq -s '.' > reportable.json
+
+          COUNT=$(jq 'length' reportable.json)
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Startup-failure sweep"
+            echo
+            echo "Branches: \`${BRANCHES}\` · window: last ${LOOKBACK} min"
+            echo
+            if [ "${COUNT}" = "0" ]; then
+              echo "No pipeline concluded without starting. Nothing to report."
+            else
+              echo "| Workflow | Branch | Commit | Jobs | Previous run | Run |"
+              echo "| --- | --- | --- | --- | --- | --- |"
+              jq -r '.[] | "| `\(.path)` | `\(.branch)` | `\(.head_sha[0:8])` | \(.jobs) | \(.previous) | [\(.id)](\(.html_url)) |"' reportable.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post the alert
+        if: steps.find.outputs.count != '0' && !inputs.dry-run
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+          CHANNEL: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          REPO: ${{ github.repository }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          SERVER: ${{ github.server_url }}
+          SWEEP_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          # One message per sweep with a section per pipeline. Findings are
+          # almost always singular; a broken shared reusable is when they are not,
+          # and that is exactly when one grouped message beats several.
+          jq -n \
+            --slurpfile findings reportable.json \
+            --arg repo "$REPO" --arg repo_name "$REPO_NAME" \
+            --arg server "$SERVER" --arg channel "$CHANNEL" --arg sweep "$SWEEP_URL" '
+            {
+              channel: $channel,
+              text: "\($repo_name) — a pipeline concluded without ever starting",
+              attachments: [{
+                color: "#FF4444",
+                blocks: (
+                  [{
+                    type: "section",
+                    text: {
+                      type: "mrkdwn",
+                      text: ":rotating_light: *<\($server)/\($repo)|\($repo_name)>* — \($findings[0] | length) pipeline(s) *never started*, so nothing in the run could report it. The branch is not deployed."
+                    }
+                  }]
+                  + ( $findings[0] | map({
+                      type: "section",
+                      fields: [
+                        { type: "mrkdwn", text: "*Workflow*\n<\($server)/\($repo)/actions/runs/\(.id)|\(.path)>" },
+                        { type: "mrkdwn", text: "*Branch*\n<\($server)/\($repo)/tree/\(.branch)|\(.branch)>" },
+                        { type: "mrkdwn", text: "*Commit*\n<\($server)/\($repo)/commit/\(.head_sha)|\(.head_sha[0:8])>" },
+                        { type: "mrkdwn", text: "*Pushed by*\n\(.actor)" }
+                      ]
+                    }) )
+                  + [{
+                    type: "context",
+                    elements: [{
+                      type: "mrkdwn",
+                      text: "`startup_failure` with no jobs: GitHub rejected the run before scheduling anything — check the caller/callee `permissions:` relationship and the workflow YAML on that ref. <\($sweep)|Sweep run>"
+                    }]
+                  }]
+                )
+              }]
+            }' > payload.json
+
+          RESPONSE=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            --data @payload.json)
+
+          if [ "$(jq -r '.ok' <<< "$RESPONSE")" != "true" ]; then
+            echo "Slack rejected the alert: $(jq -r '.error // "unknown"' <<< "$RESPONSE")"
+            exit 1
+          fi
+          echo "Alert posted." >> "$GITHUB_STEP_SUMMARY"

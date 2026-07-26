@@ -1,0 +1,175 @@
+# Reusable workflow: post (and keep updating) one comment telling reviewers where
+# a pull request's environment is and how to sign in.
+#
+# Every repo that deploys a PR environment wants this and only one had it, so the
+# reviewer's first move on the other four was to reconstruct a hostname from a
+# namespace convention or ask someone. The mechanism belongs here.
+#
+# THE FACTS DO NOT. This repo is public and has to stay public (a public caller
+# may only consume public reusable workflows, and cowork, cowork-server, and anton
+# are public callers), so anything hard-coded here is world-readable. The account
+# you sign in as, the Secret and Secrets Manager bundle holding its password, the
+# namespace convention, and the internal host pattern are not credentials, but
+# together they are a free recon package: which username to spray, and exactly
+# what to reach for once inside a cluster.
+#
+# So every one of those arrives as an INPUT from the private caller. This file
+# renders a table and maintains one marker-keyed comment; it names nothing of ours.
+# A reusable that cannot be described without naming our infrastructure has not
+# earned promotion and stays in the repo that owns it.
+#
+# Layout is deliberate: the two things a reviewer actually wants — who to sign in
+# as, and the one command that prints the password — come FIRST, before any links
+# or caveats. The previous version led with four paragraphs of rationale and put
+# the account halfway down.
+#
+# It never posts the password itself. A PR comment is permanent, org-wide, and
+# un-redactable, and the credential is one `kubectl` away for anyone who can reach
+# the cluster; printing it here would put a live admin password in the timeline of
+# every PR forever.
+#
+# k8s-secret-ok: the `kubectl get secret` this renders is a command for a human to
+# run, assembled from caller inputs. This workflow never reads the value.
+#
+# The calling job must grant `pull-requests: write`, and no job here declares it: a
+# called workflow can never exceed its caller's grant and that cap is enforced when
+# the file LOADS, so a scope named here would reject the run of any caller that
+# does not grant it — including, in a shared pipeline, the push callers that never
+# comment on anything.
+
+name: PR environment comment
+
+on:
+  workflow_call:
+    inputs:
+      env-name:
+        description: "The environment's name, e.g. pr-auth-123. Shown as the heading."
+        type: string
+        required: true
+      links:
+        description: >-
+          JSON array of {"label","url"} objects, rendered as a table in order.
+          e.g. '[{"label":"Console","url":"https://..."}]'
+        type: string
+        default: "[]"
+      login-email:
+        description: "Account to sign in as. Omitted from the comment when empty."
+        type: string
+        default: ""
+      login-note:
+        description: "One short line about that account (realm, roles it carries)."
+        type: string
+        default: ""
+      password-namespace:
+        description: "Namespace for the rendered password command. Defaults to env-name."
+        type: string
+        default: ""
+      password-secret:
+        description: "Secret holding the password. No command is rendered when empty."
+        type: string
+        default: ""
+      password-key:
+        description: "Key within that Secret."
+        type: string
+        default: ""
+      password-source-note:
+        description: "Where the same value comes from upstream, e.g. a Secrets Manager bundle name."
+        type: string
+        default: ""
+      notes:
+        description: "Markdown appended inside a collapsed <details>, for anything non-urgent."
+        type: string
+        default: ""
+      marker:
+        description: "HTML-comment key identifying this comment, so it rolls instead of piling up."
+        type: string
+        default: "pr-env-access"
+      runs-on:
+        description: "Runner label"
+        type: string
+        default: ubuntu-latest
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  comment:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Post the environment access details
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          ENV_NAME: ${{ inputs.env-name }}
+          LINKS: ${{ inputs.links }}
+          LOGIN_EMAIL: ${{ inputs.login-email }}
+          LOGIN_NOTE: ${{ inputs.login-note }}
+          PW_NS: ${{ inputs.password-namespace || inputs.env-name }}
+          PW_SECRET: ${{ inputs.password-secret }}
+          PW_KEY: ${{ inputs.password-key }}
+          PW_SOURCE: ${{ inputs.password-source-note }}
+          NOTES: ${{ inputs.notes }}
+          MARKER_KEY: ${{ inputs.marker }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PR:-}" ]; then
+            echo "::error::No pull request in context; this workflow only makes sense on a pull_request run."
+            exit 1
+          fi
+
+          MARKER="<!-- ${MARKER_KEY} -->"
+          {
+            echo "${MARKER}"
+            echo "## PR environment is up · \`${ENV_NAME}\`"
+            echo
+
+            # The two things a reviewer came for, first.
+            if [ -n "$LOGIN_EMAIL" ]; then
+              echo -n "**Sign in as** \`${LOGIN_EMAIL}\`"
+              [ -n "$LOGIN_NOTE" ] && echo -n " — ${LOGIN_NOTE}"
+              echo
+              echo
+            fi
+            if [ -n "$PW_SECRET" ] && [ -n "$PW_KEY" ]; then
+              echo "**Password** (not in this comment on purpose, it is a live credential and a PR comment is permanent):"
+              echo
+              echo '```bash'
+              echo "kubectl -n ${PW_NS} get secret ${PW_SECRET} -o jsonpath='{.data.${PW_KEY}}' | base64 -d; echo"
+              echo '```'
+              echo
+            fi
+
+            if [ "$(jq 'length' <<< "${LINKS:-[]}")" != "0" ]; then
+              echo "| | |"
+              echo "| :--- | :--- |"
+              jq -r '.[] | "| \(.label) | \(.url) |"' <<< "$LINKS"
+              echo
+            fi
+
+            if [ -n "$NOTES" ] || [ -n "$PW_SOURCE" ]; then
+              echo "<details><summary>More</summary>"
+              echo
+              [ -n "$PW_SOURCE" ] && { echo "${PW_SOURCE}"; echo; }
+              [ -n "$NOTES" ] && { echo "${NOTES}"; echo; }
+              echo "</details>"
+              echo
+            fi
+
+            echo "<sub>Rebuilt on every push to this PR. Torn down when the PR closes or loses its \`deploy\` label.</sub>"
+          } > body.md
+
+          # One rolling comment per PR rather than a new one per push.
+          # --paginate, because the default page holds 30 comments and a busy PR
+          # would push the marker off it, making this post a duplicate on every
+          # later push. The jq emits nothing for a page with no match rather than
+          # an empty string: --paginate runs the filter per page and concatenates,
+          # so a `// ""` fallback would prepend blank lines to the id.
+          ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${ID}" -F body=@body.md >/dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -F body=@body.md >/dev/null
+          fi
