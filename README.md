@@ -149,7 +149,7 @@ which is ours:
 | Layer | Blocking | What it is |
 | --- | --- | --- |
 | `actionlint` | yes | The established syntax + expression + shellcheck linter |
-| permission check | yes | `scripts/workflow_permissions.py` — the one gap neither tool covers |
+| permission check | yes | `scripts/workflow_graph.py` — the one gap neither tool covers |
 | `zizmor` | advisory by default | The established Actions *security* auditor (template injection, credential persistence, unpinned actions) |
 
 ```yaml

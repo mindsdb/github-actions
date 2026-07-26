@@ -51,8 +51,11 @@ jobs:
 
       - name: Check that this repo's own reusables compose
         run: |
-          uv run --with pyyaml --python 3.12 scripts/workflow_permissions.py \
-            --workflow-dir .github/workflows
+          # --allow-external-reusables: everything here is called from OTHER repos,
+          # so "nothing in this repo calls it" is the normal state rather than a
+          # finding. Consumers run without the flag and do get told about orphans.
+          uv run --with pyyaml --python 3.12 scripts/workflow_graph.py \
+            --workflow-dir .github/workflows --allow-external-reusables
 
       - name: Audit workflows with zizmor (advisory)
         env:

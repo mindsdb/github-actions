@@ -1,4 +1,4 @@
-"""Unit tests for the workflow permission gate (``scripts/workflow_permissions.py``).
+"""Unit tests for the workflow permission gate (``scripts/workflow_graph.py``).
 
 The gate exists because of a real incident in ``mindsdb/auth``:
 ``config-apply.yml``'s ``detect`` and ``plan`` jobs declared a ``pull-requests``
@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-_GATE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "workflow_permissions.py"
-_spec = importlib.util.spec_from_file_location("workflow_permissions", _GATE_PATH)
+_GATE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "workflow_graph.py"
+_spec = importlib.util.spec_from_file_location("workflow_graph", _GATE_PATH)
 gate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gate)
 
@@ -360,6 +360,77 @@ class TestTheIncident:
         )
         violations, _ = run(tmp_path)
         assert violations == []
+
+
+class TestEventKeys:
+    def test_push_keys_per_branch(self):
+        assert gate.event_keys({"on": {"push": {"branches": ["main", "staging"]}}}) == [
+            "push:main",
+            "push:staging",
+        ]
+
+    def test_push_with_no_branch_filter_keys_on_the_event(self):
+        assert gate.event_keys({"on": {"push": None}}) == ["push"]
+
+    def test_schedule_and_dispatch_are_exempt(self):
+        """They have no pipeline to belong to, which is why they get their own run."""
+        assert gate.event_keys({"on": {"schedule": [{"cron": "0 5 * * *"}], "workflow_dispatch": None}}) == []
+
+    def test_workflow_call_is_not_an_event_key(self):
+        assert gate.event_keys({"on": {"workflow_call": None}}) == []
+
+    def test_pull_request_keys_on_the_event_not_the_base(self):
+        """A base-branch filter does not separate run trees the way a push branch does."""
+        assert gate.event_keys({"on": {"pull_request": {"types": ["opened"]}}}) == ["pull_request"]
+
+
+class TestRunTrees:
+    def test_two_workflows_on_one_event_is_an_error(self, tmp_path):
+        """The auto-release regression: two workflows on push:main, two run trees."""
+        write(tmp_path, "prod.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"a": {"runs-on": "x"}}})
+        write(tmp_path, "release.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"b": {"runs-on": "x"}}})
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert len(errors) == 1
+        assert "push:main" in errors[0]
+        assert "prod.yml" in errors[0] and "release.yml" in errors[0]
+
+    def test_different_branches_do_not_collide(self, tmp_path):
+        write(tmp_path, "prod.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"a": {"runs-on": "x"}}})
+        write(tmp_path, "staging.yml", {"on": {"push": {"branches": ["staging"]}}, "jobs": {"b": {"runs-on": "x"}}})
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert errors == []
+
+    def test_two_schedules_do_not_collide(self, tmp_path):
+        write(tmp_path, "nightly.yml", {"on": {"schedule": [{"cron": "0 5 * * *"}]}, "jobs": {"a": {"runs-on": "x"}}})
+        write(tmp_path, "weekly.yml", {"on": {"schedule": [{"cron": "0 5 * * 1"}]}, "jobs": {"b": {"runs-on": "x"}}})
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert errors == []
+
+    def test_a_folded_in_reusable_does_not_collide(self, tmp_path):
+        """The fix the error message asks for: one entry point, the rest called."""
+        write(
+            tmp_path,
+            "prod.yml",
+            {
+                "on": {"push": {"branches": ["main"]}},
+                "jobs": {"release": {"uses": "./.github/workflows/calver.yml"}},
+            },
+        )
+        write(tmp_path, "calver.yml", {"on": {"workflow_call": None}, "jobs": {"b": {"runs-on": "x"}}})
+        errors, notes = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert (errors, notes) == ([], [])
+
+    def test_an_uncalled_reusable_is_a_note_not_an_error(self, tmp_path):
+        write(tmp_path, "orphan.yml", {"on": {"workflow_call": None}, "jobs": {"a": {"runs-on": "x"}}})
+        errors, notes = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert errors == []
+        assert len(notes) == 1 and "nothing in this repo calls" in notes[0]
+
+    def test_a_library_repo_can_silence_the_orphan_note(self, tmp_path):
+        """This repo's reusables are called from other repos, by design."""
+        write(tmp_path, "orphan.yml", {"on": {"workflow_call": None}, "jobs": {"a": {"runs-on": "x"}}})
+        errors, notes = gate.check_run_trees(gate.load_workflows(tmp_path), allow_external_reusables=True)
+        assert (errors, notes) == ([], [])
 
 
 class TestCli:

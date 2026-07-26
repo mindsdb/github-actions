@@ -9,7 +9,7 @@
 #                Everything it finds is a mistake.
 #   permissions  The one check neither tool does: a called workflow may never
 #                declare a permission its caller lacks. Blocking. See
-#                scripts/workflow_permissions.py for why this is not redundant —
+#                scripts/workflow_graph.py for why this is not redundant —
 #                short version, it was verified against a tree that had already
 #                broken production and neither tool said a word.
 #   zizmor       The established Actions SECURITY auditor (template injection,
@@ -100,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           uv run --with pyyaml --python 3.12 \
-            .ci-shared/scripts/workflow_permissions.py \
+            .ci-shared/scripts/workflow_graph.py \
             --workflow-dir .github/workflows \
             --default-permissions "$DEFAULTS"
 

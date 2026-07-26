@@ -1,4 +1,27 @@
-"""Gate: a called workflow may never declare a permission its caller lacks.
+"""Two static checks on a repo's workflow graph that no existing tool performs.
+
+CHECK 1 — one run tree per event.
+
+A push or a pull request should produce ONE run whose tree shows everything that
+happened, not several disconnected checks a reviewer has to find and correlate.
+Two entry-point workflows on the same event means two run trees, and the second
+one is the one nobody looks at: `auto-release.yml` and `prod-build-deploy.yml`
+both fired on push to `main` for months, so every release was two runs, and the
+tag could be cut for a commit whose deploy had been cancelled.
+
+Nothing warns about this. GitHub is perfectly happy to run ten workflows on one
+push, and each looks healthy in isolation. So: workflows sharing an event key are
+an error, and the fix is to fold the side one in as a `workflow_call` job.
+
+Schedules and `workflow_dispatch` are exempt — they have no pipeline to belong to,
+which is the whole reason a nightly drift check or a manual smoke test is allowed
+its own run.
+
+It also reports reusables nothing calls, as notes rather than errors, since a
+library repo's reusables are called from other repos by design
+(`--allow-external-reusables` silences that).
+
+CHECK 2 — a called workflow may never declare a permission its caller lacks.
 
 GitHub caps a called workflow's token at the calling job's grant, and it checks
 that cap when the workflow FILE IS LOADED, not when a job runs. So a job in a
@@ -327,6 +350,70 @@ def _walk(
     return found
 
 
+def event_keys(workflow: dict) -> list[str]:
+    """The events that can start this workflow, keyed finely enough to spot a clash.
+
+    `push` is keyed per branch, because a workflow on `push: staging` and one on
+    `push: main` do not collide. Everything else keys on the event name alone.
+
+    `schedule`, `workflow_dispatch`, and `workflow_call` are deliberately absent: a
+    schedule or a manual run has no pipeline to belong to, and a `workflow_call` is
+    not an entry point at all.
+    """
+    keys: list[str] = []
+    for event, config in triggers(workflow).items():
+        if event in ("schedule", "workflow_dispatch", "workflow_call"):
+            continue
+        branches = None
+        if isinstance(config, dict):
+            branches = config.get("branches")
+        if isinstance(branches, list) and branches:
+            keys.extend(f"{event}:{branch}" for branch in branches)
+        else:
+            keys.append(str(event))
+    return keys
+
+
+def check_run_trees(
+    workflows: dict[str, dict], *, allow_external_reusables: bool = False
+) -> tuple[list[str], list[str]]:
+    """Find events that produce more than one run, and reusables nothing calls.
+
+    Returns (errors, notes).
+    """
+    errors: list[str] = []
+    notes: list[str] = []
+
+    by_event: dict[str, list[str]] = {}
+    for key, workflow in workflows.items():
+        if not is_entry_point(workflow):
+            continue
+        for event in event_keys(workflow):
+            by_event.setdefault(event, []).append(key)
+
+    for event, owners in sorted(by_event.items()):
+        if len(owners) > 1:
+            names = ", ".join(sorted(owners))
+            errors.append(
+                f"`{event}` starts {len(owners)} workflows, so it produces {len(owners)} "
+                f"disconnected run trees: {names}\n"
+                f"    Fold the side ones into the event's pipeline as `workflow_call` jobs, so one run "
+                f"shows everything that happened. A job that should not pay for itself on every run "
+                f"gates on a path check; a job behind an `environment:` approval needs an ungated plan "
+                f"job before it, since an approval blocks a job from starting."
+            )
+
+    if not allow_external_reusables:
+        called = {callee for workflow in workflows.values() for _, callee in local_calls(workflow)}
+        for key, workflow in workflows.items():
+            if is_entry_point(workflow) or key in called:
+                continue
+            if "workflow_call" in triggers(workflow):
+                notes.append(f"{key} is a reusable that nothing in this repo calls")
+
+    return errors, notes
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -342,6 +429,11 @@ def main(argv: list[str] | None = None) -> int:
         default="read",
         help="what an undeclared workflow token carries in this repo (Settings -> Actions)",
     )
+    parser.add_argument(
+        "--allow-external-reusables",
+        action="store_true",
+        help="this repo's reusables are called from other repos, so do not report them as uncalled",
+    )
     args = parser.parse_args(argv)
 
     workflows = load_workflows(args.workflow_dir)
@@ -350,17 +442,32 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     violations, unchecked = check(workflows, DEFAULT_GRANTS[args.default_permissions])
+    tree_errors, tree_notes = check_run_trees(
+        workflows, allow_external_reusables=args.allow_external_reusables
+    )
 
     for call in unchecked:
         print(f"note: {call}")
+    for note in tree_notes:
+        print(f"note: {note}")
+
+    if tree_errors:
+        print(f"\n{len(tree_errors)} event(s) produce more than one run tree:\n", file=sys.stderr)
+        for error in tree_errors:
+            print(f"  {error}\n", file=sys.stderr)
 
     if violations:
         print(f"\n{len(violations)} permission mismatch(es) would fail a run before it starts:\n", file=sys.stderr)
         for violation in violations:
             print(f"  {violation}\n", file=sys.stderr)
+
+    if tree_errors or violations:
         return 1
 
-    print(f"\nChecked {len(workflows)} workflow(s): every local reusable call composes.")
+    print(
+        f"\nChecked {len(workflows)} workflow(s): every local reusable call composes, "
+        f"and every event produces exactly one run tree."
+    )
     return 0
 
 
