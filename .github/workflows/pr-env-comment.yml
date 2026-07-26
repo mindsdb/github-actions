@@ -50,9 +50,16 @@ on:
   workflow_call:
     inputs:
       env-name:
-        description: "The environment's name. Shown as the heading."
+        description: "What this comment is about — an environment name, a build kind. Shown in the heading."
         type: string
         required: true
+      heading:
+        description: >-
+          Heading text, with the env-name appended. Defaults to the per-PR
+          environment wording; a caller posting something else (installer
+          artifacts, say) supplies its own.
+        type: string
+        default: "PR environment is up"
       links:
         description: >-
           JSON array of {"label","url"} objects, rendered as a table in order.
@@ -103,6 +110,7 @@ jobs:
           DOC_URL: ${{ inputs.access-doc-url }}
           NOTES: ${{ inputs.notes }}
           MARKER_KEY: ${{ inputs.marker }}
+          HEADING: ${{ inputs.heading }}
           IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
@@ -124,7 +132,7 @@ jobs:
           MARKER="<!-- ${MARKER_KEY} -->"
           {
             echo "${MARKER}"
-            echo "## PR environment is up · \`${ENV_NAME}\`"
+            echo "## ${HEADING} · \`${ENV_NAME}\`"
             echo
 
             if [ "$(jq 'length' <<< "${LINKS:-[]}")" != "0" ]; then
@@ -148,7 +156,7 @@ jobs:
               echo
             fi
 
-            echo "<sub>Rebuilt on every push to this PR. Torn down when the PR closes or loses its \`deploy\` label.</sub>"
+            echo "<sub>Updated on every push to this PR.</sub>"
           } > body.md
 
           # One rolling comment per PR rather than a new one per push.
