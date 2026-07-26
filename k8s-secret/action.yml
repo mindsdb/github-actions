@@ -5,10 +5,10 @@
 # Both patterns are in use across these repos. The honest comparison:
 #
 # A GitHub Environment secret is auto-masked, needs no cluster, and is invisible
-# to fork PRs. But it is a SECOND COPY of a value whose source of truth is AWS
-# Secrets Manager (see auth's scripts/secrets/create-aws-secrets.py), duplicated
-# per environment, rotated by hand in lockstep — and a reference to a secret that
-# no longer exists resolves to the EMPTY STRING rather than failing. That is a
+# to fork PRs. But it is a SECOND COPY of a value whose source of truth is a
+# secrets manager that already populates the cluster, duplicated per environment
+# and rotated by hand in lockstep — and a reference to a secret that no longer
+# exists resolves to the EMPTY STRING rather than failing. That is a
 # real failure mode, not a theoretical one: a renamed token left a config job
 # authenticating with "" and reporting a vendor 401 instead of "the secret is
 # gone".

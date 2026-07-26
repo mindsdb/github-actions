@@ -156,9 +156,9 @@ Blind spot to know about: it can only read local (`./.github/workflows/...`) cal
 ```yaml
       - uses: mindsdb/github-actions/k8s-secret@main
         with:
-          namespace: pr-auth-123
-          secret: keycloak-secrets
-          key: PRIVATE_CLIENT_SECRET
+          namespace: pr-<repo>-123
+          secret: <secret-name>
+          key: <KEY_IN_THAT_SECRET>
           env-var: PR_KEYCLOAK_CLIENT_SECRET
 ```
 
@@ -168,7 +168,7 @@ There is no blanket answer, and "prefer Kubernetes because it is the source of t
 
 | The value is | Source | Why |
 | --- | --- | --- |
-| Ephemeral and namespace-local (a per-PR environment's own credentials) | **Kubernetes**, via `k8s-secret` | No GitHub Environment can exist for `pr-auth-204`, so a copy is impossible; the namespace is the only source there is |
+| Ephemeral and namespace-local (a per-PR environment's own credentials) | **Kubernetes**, via `k8s-secret` | No GitHub Environment can exist for `pr-<repo>-204`, so a copy is impossible; the namespace is the only source there is |
 | A permanent environment's real credential (prod/staging DB, Stripe live, prod vendor tokens) | **GitHub Environment** | A job can only read it by declaring `environment: prod`, and that environment requires a reviewer. A k8s Secret has no such gate — *any* job on a runner with cluster read can fetch it, unreviewed |
 | Needed to reach the cluster, or used on a GitHub-hosted runner | **GitHub secret** | Package-install tokens, the ArgoCD token that creates the namespace, Snyk, Slack. Reading these from the cluster is circular |
 
@@ -189,7 +189,7 @@ What actually goes wrong with a GitHub secret is different and has a cheaper fix
     # `pull-requests: write`; the push callers must not have to.
     uses: mindsdb/github-actions/.github/workflows/pr-env-comment.yml@main
     with:
-      env-name: pr-auth-${{ github.event.pull_request.number }}
+      env-name: pr-<repo>-${{ github.event.pull_request.number }}
       login-email: someone@example.com
       password-secret: some-secret
       password-key: SOME_KEY
