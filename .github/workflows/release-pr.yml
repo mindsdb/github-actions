@@ -114,8 +114,10 @@ jobs:
           EOF
           )
 
-          # Dedent (the heredoc inside the run block gets indented)
-          BODY=$(echo "$BODY" | sed 's/^          //')
+          # Dedent (the heredoc inside the run block gets indented). Parameter
+          # expansion rather than sed: one process, and no pattern to escape.
+          BODY="${BODY//$'\n'          /$'\n'}"
+          BODY="${BODY#          }"
 
           PR_URL=$(gh pr create \
             --repo "${REPO}" \

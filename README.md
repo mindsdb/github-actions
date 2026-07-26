@@ -88,6 +88,117 @@ must be a member of that channel.
 message in either style, skipping the prior-run lookup so `recovered` always
 posts.
 
+### The one failure it cannot see: a run that never started
+
+`notify-main-failure` is a job *inside* the pipeline, so it covers every failure where the run exists. It cannot cover `conclusion: startup_failure` — GitHub rejecting the run at load time, with **zero jobs** — because there is no job to put the alert in. The run appears in the Actions tab and nowhere else, and the branch is not deployed.
+
+That is not a corner case. It is produced by a caller job granting narrower `permissions:` than a called workflow's jobs declare (the cap is checked when the file *loads*, not when a job runs), by a `uses: ./.github/workflows/x.yml` path that does not exist on the ref, and by malformed YAML. It has already cost auth `staging` ten hours of running the previous image across two merges, with the recovery message being the first thing the channel heard about it.
+
+`notify-startup-failure.yml` watches from outside, on a schedule. It sweeps the deploy branches and alerts when the newest conclusive run of a workflow is a `startup_failure` inside the lookback window, restricted to runs where no job ran — precisely the set the in-run notify job could not have reported:
+
+```yaml
+name: Pipeline watchdog
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  startup-failures:
+    permissions:
+      contents: read
+      actions: read                     # run + job history for the sweep
+    uses: mindsdb/github-actions/.github/workflows/notify-startup-failure.yml@main
+    with:
+      branches: "main staging"
+      lookback-minutes: 90
+    secrets: inherit
+```
+
+Alerts repeat, by design: one failing push produces about three messages at that cadence and window, and then silence. Alerting only on the *transition* into a broken state gives exactly one message per break, which was rejected after replaying it against the auth incident — it would have said nothing about the second failing push, since the run before that one had also failed to start. A stateless sweep cannot be exactly-once, so the choice is a message that can be missed or a few that cannot, and the window is what bounds the few.
+
+Two things to know when adding it. GitHub only runs `schedule` triggers from a repository's **default branch**, so a watchdog merged to `staging` and no further is inert — `workflow_dispatch` is there to prove it before it reaches `main`. And widening `lookback-minutes` on a manual dispatch replays a past incident, which is how to check it would have caught one.
+
+## Workflow lint
+
+`workflow-lint.yml` lints the CALLING repo's workflows. Three layers, only one of which is ours:
+
+| Layer | Blocking | What it is |
+| --- | --- | --- |
+| `actionlint` | yes | The established syntax + expression + shellcheck linter |
+| permission check | yes | `scripts/workflow_graph.py` — the one gap neither tool covers |
+| `zizmor` | advisory by default | The established Actions *security* auditor (template injection, credential persistence, unpinned actions) |
+
+```yaml
+  workflow-lint:
+    permissions:
+      contents: read
+    uses: mindsdb/github-actions/.github/workflows/workflow-lint.yml@main
+    with:
+      default-permissions: read     # Settings -> Actions -> Workflow permissions
+    secrets: inherit
+```
+
+`zizmor` is advisory because pointing it at existing pipelines surfaces a backlog, and a lint job that is red on arrival gets ignored rather than fixed. Flip `zizmor-blocking: true` per repo once its backlog is triaged.
+
+**The permission check is not redundant with either tool**, which was verified against a tree that had already broken a deploy branch: `actionlint` reported nothing, and `zizmor --persona=auditor` reported only its generic "no `permissions:` block" note, equally true of jobs that work fine. What it checks is that no called workflow declares a permission its caller lacks. GitHub caps a called workflow at the calling job's grant and enforces that cap when the workflow **file is loaded**, so a job in a shared reusable naming a scope one caller does not grant does not run with less — it rejects that caller's whole run as a `startup_failure` with **zero jobs**, which means the pipeline's own notify job cannot report it either. In `mindsdb/auth` that cost two silently undeployed merges to `staging` and ten hours of serving the previous image.
+
+The rule it enforces: **a job in a shared reusable declares only what all its callers grant, and inherits anything only one of them needs.** Inheriting is the only thing that composes — the PR caller grants `pull-requests: write` and the comment posts, the push callers grant `contents: read` and the same job runs without a scope it never needed. And the reason it has to be a gate rather than a convention: a pull request only exercises the PR caller, which is usually the one that *does* grant the scope, so the mistake merges green and breaks on the merge commit.
+
+It also refuses to read cluster secrets by hand — see `k8s-secret` below.
+
+Blind spot to know about: it can only read local (`./.github/workflows/...`) callees, and lists remote ones as unchecked. The cap applies to those too, so a scope added to a reusable *here* must be granted by every consumer's calling job.
+
+## Reading a Kubernetes secret
+
+`k8s-secret` fetches one key from a Secret, fails when it is absent, masks it, and only then exports it — in that order, which is the part a hand-rolled fetch gets wrong, because `::add-mask::` only scrubs output that comes *after* it.
+
+```yaml
+      - uses: mindsdb/github-actions/k8s-secret@main
+        with:
+          namespace: pr-auth-123
+          secret: keycloak-secrets
+          key: PRIVATE_CLIENT_SECRET
+          env-var: PR_KEYCLOAK_CLIENT_SECRET
+```
+
+### Which source a secret should come from
+
+There is no blanket answer, and "prefer Kubernetes because it is the source of truth" is wrong for the credentials that matter most. Pick by what the value is:
+
+| The value is | Source | Why |
+| --- | --- | --- |
+| Ephemeral and namespace-local (a per-PR environment's own credentials) | **Kubernetes**, via `k8s-secret` | No GitHub Environment can exist for `pr-auth-204`, so a copy is impossible; the namespace is the only source there is |
+| A permanent environment's real credential (prod/staging DB, Stripe live, prod vendor tokens) | **GitHub Environment** | A job can only read it by declaring `environment: prod`, and that environment requires a reviewer. A k8s Secret has no such gate — *any* job on a runner with cluster read can fetch it, unreviewed |
+| Needed to reach the cluster, or used on a GitHub-hosted runner | **GitHub secret** | Package-install tokens, the ArgoCD token that creates the namespace, Snyk, Slack. Reading these from the cluster is circular |
+
+The middle row is the one worth being explicit about, because the intuition points the wrong way. Moving prod credentials out of a GitHub Environment and into a cluster read would *remove* the required-reviewer gate standing in front of them today, and it would force the jobs that use them onto `mdb-prod` (nothing else can reach newprod), which means granting *more* jobs prod cluster access. Both are the wrong direction.
+
+What actually goes wrong with a GitHub secret is different and has a cheaper fix: a reference to a secret that does not exist resolves to the **empty string** rather than failing, so a rename reaches the vendor as no credential and comes back as an unexplained 401. The fix for that is to assert the value is non-empty and name it in the error, not to migrate its storage.
+
+`k8s-secret` is also not a containment boundary. The ability to read Secrets belongs to the self-hosted runner, which holds cluster credentials because it deploys. What bounds *that* is who can trigger a run on such a runner — hence a `pull_request`-triggered job on a public repo needs `if: github.event.pull_request.head.repo.full_name == github.repository` — and the runner ServiceAccount's RBAC.
+
+## PR environment comments
+
+`pr-env-comment.yml` posts and keeps updating one comment saying where a PR's environment is and how to sign in. The account, Secret name, namespace, and hosts arrive as **inputs** — this repo is public, and while none of those is a credential, together they are a free recon package. The mechanism is shared; the facts stay in the private caller. A reusable that cannot be described without naming our infrastructure has not earned promotion here.
+
+```yaml
+  pr-env-comment:
+    needs: [deploy-pr-env]
+    # No `permissions:` here — see the permission rule above. The dev caller grants
+    # `pull-requests: write`; the push callers must not have to.
+    uses: mindsdb/github-actions/.github/workflows/pr-env-comment.yml@main
+    with:
+      env-name: pr-auth-${{ github.event.pull_request.number }}
+      login-email: someone@example.com
+      password-secret: some-secret
+      password-key: SOME_KEY
+      links: '[{"label":"Console","url":"https://..."}]'
+    secrets: inherit
+```
+
+Layout is fixed and deliberate: who to sign in as and the one command that prints the password come first, links next, everything else in a collapsed `<details>`. It never posts the password itself — a PR comment is permanent, org-wide, and un-redactable.
+
 ## CalVer releases
 
 `calver-release.yml` cuts the `v<major>.<yy>.<m>.<d>.<seq>` tag and its GitHub

@@ -1,0 +1,94 @@
+# Read one key out of a Kubernetes Secret into the job environment, masked.
+#
+# WHY THIS EXISTS, given the obvious alternative of a GitHub Environment secret.
+#
+# Both patterns are in use across these repos. The honest comparison:
+#
+# A GitHub Environment secret is auto-masked, needs no cluster, and is invisible
+# to fork PRs. But it is a SECOND COPY of a value whose source of truth is AWS
+# Secrets Manager (see auth's scripts/secrets/create-aws-secrets.py), duplicated
+# per environment, rotated by hand in lockstep — and a reference to a secret that
+# no longer exists resolves to the EMPTY STRING rather than failing. That is a
+# real failure mode, not a theoretical one: a renamed token left a config job
+# authenticating with "" and reporting a vendor 401 instead of "the secret is
+# gone".
+#
+# Reading the cluster keeps one source of truth and fails loudly when the key is
+# absent, which is why it is the right pattern for values that already live in a
+# namespace. What it does NOT get for free is masking: GitHub only scrubs values
+# it was told about, so a hand-rolled fetch is one careless `echo` away from
+# printing a live credential into a permanent log. And `::add-mask::` only
+# affects output AFTER it runs, so even a correct-looking fetch-then-mask has an
+# ordering hazard baked in.
+#
+# This action removes the hazard by construction: fetch, fail if empty, mask, and
+# only then export. There is no ordering for a caller to get wrong, and no
+# unmasked variant to copy-paste.
+#
+# WHAT IT IS NOT. It is not a containment boundary. Every job that reaches a
+# cluster Secret runs on a self-hosted runner that holds cluster credentials
+# because it has to deploy, so the ability to read Secrets is a property of the
+# RUNNER, not of this action — anyone who can land a workflow change on a branch
+# that runs there could read the same values with or without it. The controls that
+# actually bound that are (1) who can trigger a run on a cluster-credentialed
+# runner, which is why a `pull_request`-triggered job on a public repo must carry
+# a fork guard, and (2) the runner ServiceAccount's RBAC, which should be scoped
+# to the namespaces it deploys. This action is about not leaking what a trusted
+# job legitimately read.
+
+name: Read a Kubernetes secret
+description: Export one key from a k8s Secret as a masked environment variable.
+
+inputs:
+  namespace:
+    description: "Namespace holding the Secret."
+    required: true
+  secret:
+    description: "Secret name."
+    required: true
+  key:
+    description: "Key within the Secret's data."
+    required: true
+  env-var:
+    description: "Environment variable to export it as, for later steps in the job."
+    required: true
+  mask:
+    description: >-
+      Register the value with the log scrubber. Leave this alone. Set false only
+      for a value that is genuinely not a credential (an id, a hostname), and say
+      why at the call site, because an unmasked value is unmaskable afterwards.
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Read ${{ inputs.secret }}/${{ inputs.key }}
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        SECRET: ${{ inputs.secret }}
+        KEY: ${{ inputs.key }}
+        ENV_VAR: ${{ inputs.env-var }}
+        MASK: ${{ inputs.mask }}
+      run: |
+        set -euo pipefail
+
+        # Assigned before export: `export X="$(cmd)"` takes its status from
+        # `export`, which always succeeds, so a failed lookup would sail past
+        # `set -e` and surface much later as an unexplained auth error.
+        VALUE="$(kubectl -n "$NAMESPACE" get secret "$SECRET" -o "jsonpath={.data.${KEY}}" | base64 -d)"
+
+        if [ -z "$VALUE" ]; then
+          echo "::error::${SECRET}/${KEY} is empty or absent in namespace ${NAMESPACE}"
+          exit 1
+        fi
+
+        # Mask BEFORE the value can reach any log, including the environment-file
+        # diagnostics below. Ordering is the whole point of this action.
+        if [ "$MASK" = "true" ]; then
+          echo "::add-mask::${VALUE}"
+        fi
+
+        echo "${ENV_VAR}=${VALUE}" >> "$GITHUB_ENV"
+        echo "Loaded ${SECRET}/${KEY} from ${NAMESPACE} into ${ENV_VAR}."
