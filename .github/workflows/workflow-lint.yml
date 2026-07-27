@@ -151,13 +151,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
+          # The shared policy travels with the scripts, so every repo audits under
+          # the same rules and a decision recorded once is not re-litigated per
+          # repo. A repo with its own .github/zizmor.yml still wins, since zizmor
+          # prefers a repo-local config over --config.
+          CFG=(--config .ci-shared/zizmor.yml)
+          [ -f .github/zizmor.yml ] && CFG=()
+
           if [ "$BLOCKING" = "true" ]; then
-            uvx "zizmor@${VERSION}" --persona="$PERSONA" .github/workflows
+            uvx "zizmor@${VERSION}" "${CFG[@]}" --persona="$PERSONA" .github/workflows
           else
             # Advisory: report and move on. The findings land in the log and the
             # step summary either way, so turning this into a gate later is a
             # one-line input change rather than a discovery exercise.
-            uvx "zizmor@${VERSION}" --persona="$PERSONA" .github/workflows | tee zizmor.out || true
+            uvx "zizmor@${VERSION}" "${CFG[@]}" --persona="$PERSONA" .github/workflows | tee zizmor.out || true
             {
               echo "### zizmor (advisory)"
               echo
