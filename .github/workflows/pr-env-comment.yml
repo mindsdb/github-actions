@@ -76,10 +76,34 @@ on:
         description: "Label that creates the environment, named in the absent message."
         type: string
         default: deploy
+      standard-links:
+        description: >-
+          Render the per-PR environment's full service table, derived from
+          `env-name`.
+
+          A PR environment is ONE namespace holding the whole stack — hub, auth,
+          Keycloak, inference, cowork-server — whichever repo anchored it. So the
+          table is a property of the environment, not of the repo, and every
+          caller composing its own produced five near-identical tables that each
+          listed only that repo's own service. Set false for a comment that is not
+          about an environment (build artifacts, say).
+        type: boolean
+        default: true
+      env-host-suffix:
+        description: "Domain the per-PR hosts sit under."
+        type: string
+        default: dev.mindshub.ai
+      default-tag:
+        description: >-
+          Image tag the services this PR does not build are running. Named in the
+          comment so nobody assumes the whole namespace is their branch.
+        type: string
+        default: staging
       links:
         description: >-
-          JSON array of {"label","url"} objects, rendered as a table in order.
-          e.g. '[{"label":"Console","url":"https://..."}]'
+          EXTRA links, appended after the standard table. JSON array of
+          {"label","url"} objects. For genuinely repo-specific things — a Swagger
+          path, a health endpoint — not for the service hosts, which are derived.
         type: string
         default: "[]"
       access-doc-url:
@@ -123,6 +147,9 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           ENV_NAME: ${{ inputs.env-name }}
           LINKS: ${{ inputs.links }}
+          STANDARD: ${{ inputs.standard-links }}
+          HOST_SUFFIX: ${{ inputs.env-host-suffix }}
+          DEFAULT_TAG: ${{ inputs.default-tag }}
           DOC_URL: ${{ inputs.access-doc-url }}
           NOTES: ${{ inputs.notes }}
           MARKER_KEY: ${{ inputs.marker }}
@@ -171,10 +198,30 @@ jobs:
             echo "## ${HEADING} · \`${ENV_NAME}\`"
             echo
 
-            if [ "$(jq 'length' <<< "${LINKS:-[]}")" != "0" ]; then
+            # The whole stack lives in this one namespace, so list the whole
+            # stack. Derived from the env name rather than passed in, because it
+            # is identical for every anchor repo.
+            ALL="${LINKS:-[]}"
+            if [ "$STANDARD" = "true" ]; then
+              ALL="$(jq -cn --arg e "$ENV_NAME" --arg d "$HOST_SUFFIX" --argjson extra "${LINKS:-[]}" '
+                [ {label: "Hub (console)",   url: "https://\($e).\($d)"},
+                  {label: "Auth API",        url: "https://auth-\($e).\($d)"},
+                  {label: "Keycloak admin",  url: "https://auth-\($e).\($d)/auth/admin/"},
+                  {label: "Inference API",   url: "https://api-\($e).\($d)/v1"},
+                  {label: "cowork-server",   url: "https://cowork-\($e).\($d)/api"} ]
+                + $extra
+                + [ {label: "Namespace", url: "`\($e)`"} ]')"
+            fi
+
+            if [ "$(jq 'length' <<< "$ALL")" != "0" ]; then
               echo "| | |"
               echo "| :--- | :--- |"
-              jq -r '.[] | "| \(.label) | \(.url) |"' <<< "$LINKS"
+              jq -r '.[] | "| \(.label) | \(.url) |"' <<< "$ALL"
+              echo
+            fi
+
+            if [ "$STANDARD" = "true" ]; then
+              echo "Every service is in this namespace. The ones this PR does not build run the \`${DEFAULT_TAG}\` image unless you link them with \`Deploys:\` in the PR body."
               echo
             fi
 
