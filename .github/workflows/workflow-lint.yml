@@ -160,18 +160,43 @@ jobs:
 
           if [ "$BLOCKING" = "true" ]; then
             uvx "zizmor@${VERSION}" "${CFG[@]}" --persona="$PERSONA" .github/workflows
-          else
-            # Advisory: report and move on. The findings land in the log and the
-            # step summary either way, so turning this into a gate later is a
-            # one-line input change rather than a discovery exercise.
-            uvx "zizmor@${VERSION}" "${CFG[@]}" --persona="$PERSONA" .github/workflows | tee zizmor.out || true
-            {
-              echo "### zizmor (advisory)"
-              echo
-              echo '```'
-              tail -40 zizmor.out
-              echo '```'
-              echo
-              echo "Set \`zizmor-blocking: true\` on the caller once these are triaged."
-            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+
+          # Advisory: report and move on. Turning this into a gate later is a
+          # one-line input change on the caller rather than a discovery exercise.
+          uvx "zizmor@${VERSION}" "${CFG[@]}" --persona="$PERSONA" .github/workflows | tee zizmor.out || true
+          uvx "zizmor@${VERSION}" "${CFG[@]}" --persona="$PERSONA" --format json .github/workflows > zizmor.json 2>/dev/null || true
+
+          # A count per rule, not a `tail -40`. An advisory backlog is a hundred
+          # findings from a handful of rules, and the arbitrary last-40-lines
+          # window showed neither how big it was nor what it consisted of — just
+          # whichever three findings happened to sort last. What a reader needs
+          # first is which rules are firing and how much each one owes, and only
+          # then the raw output, which is why that goes in a <details>.
+          {
+            echo "### zizmor (advisory)"
+            echo
+            if [ -s zizmor.json ] && jq -e 'type == "array"' zizmor.json > /dev/null 2>&1; then
+              echo "| rule | severity | count |"
+              echo "|---|---|---:|"
+              jq -r 'group_by(.ident + .determinations.severity)
+                     | map({rule: .[0].ident, sev: .[0].determinations.severity, n: length})
+                     | sort_by(-.n)[]
+                     | "| [\(.rule)](https://docs.zizmor.sh/audits/#\(.rule)) | \(.sev) | \(.n) |"' zizmor.json
+              echo
+              echo "**$(jq 'length' zizmor.json) reported.**"
+            else
+              echo "_(no machine-readable output; see the log)_"
+            fi
+            echo
+            echo "<details><summary>Full zizmor output</summary>"
+            echo
+            echo '```'
+            cat zizmor.out
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "Set \`zizmor-blocking: true\` on the caller once these are triaged."
+          } >> "$GITHUB_STEP_SUMMARY"
