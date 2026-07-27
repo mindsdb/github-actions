@@ -72,10 +72,10 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     steps:
       - name: Check out the calling repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Check out the shared CI scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mindsdb/github-actions
           path: .ci-shared
@@ -92,7 +92,7 @@ jobs:
           ./actionlint -color
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Check that every reusable call composes
         env:
