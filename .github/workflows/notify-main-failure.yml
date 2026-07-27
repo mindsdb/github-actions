@@ -37,10 +37,8 @@
 #       secrets: inherit
 #
 # A failure-only caller (the freeze/unfreeze wrappers) keeps `if: failure()`,
-# takes the default `status: failed`, and needs no `permissions:` block at all:
-# the prior-run lookup only runs in recovered mode, and this workflow declares no
-# scopes of its own (see the note above `jobs:`), so there is no floor to clear.
-# Granting only `contents: read` is correct there and stays valid.
+# takes the default `status: failed`, and needs no `permissions:` block: the
+# prior-run lookup only runs in recovered mode.
 #
 # Requires (reach this workflow via `secrets: inherit` in the caller):
 #   - secrets.SLACK_ENG_CHANNEL_ID       (the engineering channel; org secret)
@@ -90,28 +88,10 @@ on:
         type: string
         default: ubuntu-latest
 
-# DELIBERATELY NO `permissions:` BLOCK. This job inherits whatever the caller
-# granted, which is the only shape that works for a reusable with two kinds of
-# caller.
-#
-# A block here would be a floor every caller has to clear, not a ceiling. GitHub
-# validates a called workflow's requested scopes when the CALLER is parsed,
-# against the caller's grant, with no knowledge of which steps will run — so
-# declaring `actions: read` (which only the recovery lookup needs, and only in
-# recovered mode) rejected every failure-only caller outright:
-#
-#   The workflow is requesting 'actions: read', but is only allowed 'actions: none'
-#
-# That is a load failure, not a degraded run: the workflow does not fail its
-# notify job, it fails to exist. Fourteen freeze/unfreeze workflows across seven
-# repos were invalid from the moment their notify job landed, unnoticed because
-# freeze runs weekly.
-#
-# Inheriting instead gives each caller what it actually needs: a recovery-mode
-# caller grants `contents: read` + `actions: read` and the lookup works; a
-# failure-only caller grants `contents: read`, never reaches the lookup, and
-# stays valid. If a caller ever asks for recovery without the grant, the lookup
-# already fails quiet and stays silent rather than reddening a green run.
+permissions:
+  contents: read
+  actions: read  # read the previous run's conclusion for recovery detection
+
 jobs:
   notify:
     runs-on: ${{ inputs.runs-on }}
