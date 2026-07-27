@@ -86,15 +86,28 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Only the sync-back checkout carries credentials — it is the one step that
-      # pushes. Skipped on manual dispatch (no PR merged, nothing to sync).
+      # pushes.
+      #
+      # Runs on a manual dispatch too, which it did not used to. The old guard was
+      # `github.event_name == 'pull_request'`, reasoned as "no PR merged, nothing
+      # to sync", and that reasoning is wrong in the one case that matters: a
+      # dispatch is what you reach for when the PR-triggered run could not run.
+      # On 2026-07-27 auth's PR-triggered unfreeze died as a `startup_failure`
+      # (an invalid caller, so zero jobs), the operator recovered with a dispatch,
+      # and it unfroze staging while silently skipping the sync — leaving main
+      # squash-merged into a `main` that `staging` did not contain, which had to be
+      # merged by hand an hour later. The escape hatch was strictly less capable
+      # than the path it exists to replace.
+      #
+      # Nothing needs the event to decide this: the sync step below already exits
+      # 0 when `staging` is an ancestor of `main`, so a dispatch with genuinely
+      # nothing to sync is a logged no-op rather than a wasted push.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        if: github.event_name == 'pull_request'
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Sync main back into staging
-        if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
