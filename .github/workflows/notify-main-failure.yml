@@ -181,12 +181,19 @@ jobs:
       - name: Notify Slack
         # Failure mode always posts; on a real pipeline, recovery posts only after
         # a failing run; a manual dispatch always posts (smoke test).
+        #
+        # The payload carries a top-level `text` as well as the blocks. Slack
+        # renders the blocks, but `text` is what a push notification, a screen
+        # reader, and a notification-list preview show, so without it the alert
+        # arrives on a phone as an empty message — which is the one context where
+        # a pipeline failure most needs to be readable.
         if: inputs.status != 'recovered' || github.event_name == 'workflow_dispatch' || steps.prev.outputs.should_post == 'true'
         uses: slackapi/slack-github-action@v1.26.0
         with:
           channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
           payload: |
             {
+              "text": "${{ inputs.status == 'recovered' && 'Recovered' || 'FAILED' }}: ${{ github.event.repository.name }} ${{ inputs.env-name }} pipeline on ${{ github.ref_name }}",
               "attachments": [
                 {
                   "color": "${{ inputs.status == 'recovered' && '#00C851' || '#FF4444' }}",
