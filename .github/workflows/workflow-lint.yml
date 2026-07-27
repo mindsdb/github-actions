@@ -124,7 +124,12 @@ jobs:
           FOUND=0
           while IFS= read -r file; do
             grep -q 'k8s-secret-ok:' "$file" && continue
-            if grep -nE 'kubectl.*get[[:space:]]+secret' "$file"; then
+            # Comment lines are skipped: this rule is about a read that EXECUTES,
+            # and a workflow explaining the rule should not trip it. (It did, on
+            # the first repo that documented why its comment carries no secrets.)
+            # A commented-out read cannot leak anything until someone uncomments
+            # it, at which point this fires.
+            if grep -nE '^[[:space:]]*[^#[:space:]].*kubectl.*get[[:space:]]+secret' "$file"; then
               echo "  ^ in $file"
               FOUND=1
             fi
