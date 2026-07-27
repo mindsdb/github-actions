@@ -1,41 +1,48 @@
 # Reusable workflow: post (and keep updating) one comment telling reviewers where
-# a pull request's environment is and how to sign in.
+# a pull request's environment is.
 #
 # Every repo that deploys a PR environment wants this and only one had it, so the
 # reviewer's first move on the other four was to reconstruct a hostname from a
 # namespace convention or ask someone. The mechanism belongs here.
 #
-# THE FACTS DO NOT. This repo is public and has to stay public (a public caller
-# may only consume public reusable workflows, and cowork, cowork-server, and anton
-# are public callers), so anything hard-coded here is world-readable. The account
-# you sign in as, the Secret and Secrets Manager bundle holding its password, the
-# namespace convention, and the internal host pattern are not credentials, but
-# together they are a free recon package: which username to spray, and exactly
-# what to reach for once inside a cluster.
+# IT CARRIES NO CREDENTIAL DETAIL. Not the password (obviously), but also not the
+# account name, not the Secret and key holding the password, and not the command
+# that reads it. That is a deliberate narrowing, and the reasoning is worth keeping
+# because the convenience argument is seductive:
 #
-# So every one of those arrives as an INPUT from the private caller. This file
-# renders a table and maintains one marker-keyed comment; it names nothing of ours.
-# A reusable that cannot be described without naming our infrastructure has not
-# earned promotion and stays in the repo that owns it.
+#   A `kubectl get secret` line grants nobody any capability. Anyone who can run it
+#   can already read every Secret in that namespace. So it helps only the people who
+#   least need help, and it pays for that by publishing the account name, the Secret
+#   name, and the key into a permanent, org-wide, searchable surface — a free map of
+#   what to grab, for whoever eventually gets cluster read.
 #
-# Layout is deliberate: the two things a reviewer actually wants — who to sign in
-# as, and the one command that prints the password — come FIRST, before any links
-# or caveats. The previous version led with four paragraphs of rationale and put
-# the account halfway down.
+# Credentials live in the access-controlled runbook, which is one place to update and
+# one place to audit. This comment links it. `access-doc-url` is that link.
 #
-# It never posts the password itself. A PR comment is permanent, org-wide, and
-# un-redactable, and the credential is one `kubectl` away for anyone who can reach
-# the cluster; printing it here would put a live admin password in the timeline of
-# every PR forever.
+# THE FACTS STAY WITH THE CALLER. This repo is public and has to stay public (a
+# public caller may only consume public reusable workflows, and cowork,
+# cowork-server, and anton are public callers), so anything hard-coded here is
+# world-readable. Hosts, namespace conventions, and the runbook link all arrive as
+# INPUTS. A reusable that cannot be described without naming our infrastructure has
+# not earned promotion and stays in the repo that owns it.
 #
-# k8s-secret-ok: the `kubectl get secret` this renders is a command for a human to
-# run, assembled from caller inputs. This workflow never reads the value.
+# On a PUBLIC repo, `access-doc-url` and `notes` are dropped: both describe internals
+# by nature. `links` are NOT dropped, because only the caller knows what a link points
+# at — an internal dev hostname is worth suppressing, a build artifact on a run that
+# is already public in the Actions tab is not. Composing the links is the caller's
+# job, so judging them is too.
 #
-# The calling job must grant `pull-requests: write`, and no job here declares it: a
-# called workflow can never exceed its caller's grant and that cap is enforced when
-# the file LOADS, so a scope named here would reject the run of any caller that
-# does not grant it — including, in a shared pipeline, the push callers that never
-# comment on anything.
+# ON PERMISSIONS. The `comment` job DECLARES `pull-requests: write` rather than
+# inheriting it, and that is deliberate after getting it wrong once: a job that
+# declares nothing is invisible to the permission gate, so a caller that forgets the
+# grant fails at RUN time with an opaque `HTTP 403` on the first `gh api` call
+# instead of failing the lint. Declaring it means every caller must grant it, which
+# is exactly the relationship the gate verifies.
+#
+# The consequence is that this workflow must be called from the pull-request pipeline
+# DIRECTLY, not from a shared build-and-deploy reusable that push pipelines also
+# call — otherwise those callers would have to grant a PR scope they never use, on
+# the release path.
 
 name: PR environment comment
 
@@ -43,37 +50,31 @@ on:
   workflow_call:
     inputs:
       env-name:
-        description: "The environment's name, e.g. pr-auth-123. Shown as the heading."
+        description: "What this comment is about — an environment name, a build kind. Shown in the heading."
         type: string
         required: true
+      heading:
+        description: >-
+          Heading text, with the env-name appended. Defaults to the per-PR
+          environment wording; a caller posting something else (installer
+          artifacts, say) supplies its own.
+        type: string
+        default: "PR environment is up"
       links:
         description: >-
           JSON array of {"label","url"} objects, rendered as a table in order.
           e.g. '[{"label":"Console","url":"https://..."}]'
         type: string
         default: "[]"
-      login-email:
-        description: "Account to sign in as. Omitted from the comment when empty."
-        type: string
-        default: ""
-      login-note:
-        description: "One short line about that account (realm, roles it carries)."
-        type: string
-        default: ""
-      password-namespace:
-        description: "Namespace for the rendered password command. Defaults to env-name."
-        type: string
-        default: ""
-      password-secret:
-        description: "Secret holding the password. No command is rendered when empty."
-        type: string
-        default: ""
-      password-key:
-        description: "Key within that Secret."
-        type: string
-        default: ""
-      password-source-note:
-        description: "Where the same value comes from upstream, e.g. a Secrets Manager bundle name."
+      access-doc-url:
+        description: >-
+          Link to the runbook covering how to sign in: which account, and how to
+          obtain its password.
+
+          A LINK, and never the method. Anything that lets a reader obtain a
+          credential is the credential, and a PR comment is a permanent, searchable,
+          un-redactable place to put one. Keep the method behind whatever already
+          guards it.
         type: string
         default: ""
       notes:
@@ -96,21 +97,21 @@ defaults:
 jobs:
   comment:
     runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      pull-requests: write # the rolling comment
     steps:
-      - name: Post the environment access details
+      - name: Post the environment details
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           ENV_NAME: ${{ inputs.env-name }}
           LINKS: ${{ inputs.links }}
-          LOGIN_EMAIL: ${{ inputs.login-email }}
-          LOGIN_NOTE: ${{ inputs.login-note }}
-          PW_NS: ${{ inputs.password-namespace || inputs.env-name }}
-          PW_SECRET: ${{ inputs.password-secret }}
-          PW_KEY: ${{ inputs.password-key }}
-          PW_SOURCE: ${{ inputs.password-source-note }}
+          DOC_URL: ${{ inputs.access-doc-url }}
           NOTES: ${{ inputs.notes }}
           MARKER_KEY: ${{ inputs.marker }}
+          HEADING: ${{ inputs.heading }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
 
@@ -119,27 +120,20 @@ jobs:
             exit 1
           fi
 
+          # Fail closed: `private` is present on a pull_request payload, and if it
+          # ever is not, the safe reading is "assume public".
+          if [ "${IS_PRIVATE:-false}" != "true" ]; then
+            LINKS="[]"
+            DOC_URL=""
+            NOTES=""
+            echo "Public repository: posting the environment name only."
+          fi
+
           MARKER="<!-- ${MARKER_KEY} -->"
           {
             echo "${MARKER}"
-            echo "## PR environment is up · \`${ENV_NAME}\`"
+            echo "## ${HEADING} · \`${ENV_NAME}\`"
             echo
-
-            # The two things a reviewer came for, first.
-            if [ -n "$LOGIN_EMAIL" ]; then
-              echo -n "**Sign in as** \`${LOGIN_EMAIL}\`"
-              [ -n "$LOGIN_NOTE" ] && echo -n " — ${LOGIN_NOTE}"
-              echo
-              echo
-            fi
-            if [ -n "$PW_SECRET" ] && [ -n "$PW_KEY" ]; then
-              echo "**Password** (not in this comment on purpose, it is a live credential and a PR comment is permanent):"
-              echo
-              echo '```bash'
-              echo "kubectl -n ${PW_NS} get secret ${PW_SECRET} -o jsonpath='{.data.${PW_KEY}}' | base64 -d; echo"
-              echo '```'
-              echo
-            fi
 
             if [ "$(jq 'length' <<< "${LINKS:-[]}")" != "0" ]; then
               echo "| | |"
@@ -148,16 +142,21 @@ jobs:
               echo
             fi
 
-            if [ -n "$NOTES" ] || [ -n "$PW_SOURCE" ]; then
+            if [ -n "$DOC_URL" ]; then
+              echo "**Signing in:** [how to get an account and its password](${DOC_URL}). Deliberately not in this comment — a PR comment is permanent and world-visible to the org."
+              echo
+            fi
+
+            if [ -n "$NOTES" ]; then
               echo "<details><summary>More</summary>"
               echo
-              [ -n "$PW_SOURCE" ] && { echo "${PW_SOURCE}"; echo; }
-              [ -n "$NOTES" ] && { echo "${NOTES}"; echo; }
+              echo "${NOTES}"
+              echo
               echo "</details>"
               echo
             fi
 
-            echo "<sub>Rebuilt on every push to this PR. Torn down when the PR closes or loses its \`deploy\` label.</sub>"
+            echo "<sub>Updated on every push to this PR.</sub>"
           } > body.md
 
           # One rolling comment per PR rather than a new one per push.

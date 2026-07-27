@@ -19,9 +19,10 @@
 #   - malformed YAML, an unknown `on:` filter, a bad matrix expression
 #
 # Its consequence is the worst-shaped one available: a merge to a deploy branch
-# reports nothing, so the branch is believed deployed and is not. Two pushes to
-# auth `staging` sat undeployed for ten hours this way, and the first thing the
-# channel heard was the RECOVERY message from the run that fixed it.
+# reports nothing, so the branch is believed deployed and is not. It has already
+# happened to a consuming repo, whose deploy branch sat undeployed for hours across
+# two merges, and where the first thing the engineering channel heard about it was
+# the RECOVERY message from the run that fixed it.
 #
 # So this workflow watches from outside, on a schedule.
 #

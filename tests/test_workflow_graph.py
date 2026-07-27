@@ -1,11 +1,10 @@
 """Unit tests for the workflow permission gate (``scripts/workflow_graph.py``).
 
-The gate exists because of a real incident in ``mindsdb/auth``:
-``config-apply.yml``'s ``detect`` and ``plan`` jobs declared a ``pull-requests``
-scope that the staging and prod push callers did not grant, GitHub rejected those
-runs at file load with ``startup_failure`` and zero jobs, and two merges to
-``staging`` sat undeployed for ten hours with nothing said — the terminal notify
-job cannot fire in a run that never started.
+The gate exists because of a real failure in a consuming repo: a shared reusable's
+jobs declared a ``pull-requests`` scope that the push callers did not grant, GitHub
+rejected those runs at file load with ``startup_failure`` and zero jobs, and merges
+to a deploy branch went undeployed with nothing said — the terminal notify job
+cannot fire in a run that never started.
 
 These tests pin the rule and, at the bottom, replay that exact shape, so the class
 cannot come back the next time someone adds a scope to a shared reusable, in any
@@ -342,7 +341,8 @@ class TestTheIncident:
         message = str(violations[0])
         assert "startup_failure" in message
         assert "no job to report it" in message
-        assert "inherits the caller's ceiling" in message
+        assert "if EVERY caller should hold it" in message
+        assert "Do not just delete" in message, "the wrong fix has to be named as wrong"
 
     def test_inheriting_in_the_callee_is_what_resolves_it(self, tmp_path):
         """The fix that composes: the callee stops naming the scope only one caller grants."""
@@ -425,6 +425,30 @@ class TestRunTrees:
         errors, notes = gate.check_run_trees(gate.load_workflows(tmp_path))
         assert errors == []
         assert len(notes) == 1 and "nothing in this repo calls" in notes[0]
+
+    def test_a_workflow_can_be_exempted_with_a_written_reason(self, tmp_path):
+        """Some duplication is deliberate: a vendor OIDC claim bound to a filename, or a
+        release-train hook that fires on another pipeline's event. The exemption is a
+        comment in the file, so the reason lives next to the thing it excuses."""
+        write(tmp_path, "prod.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"a": {"runs-on": "x"}}})
+        (tmp_path / "hook.yml").write_text(
+            "# run-tree-ok: fires on the release PR merging, not on this pipeline's behalf\n"
+            "name: Hook\non:\n  push:\n    branches: [main]\njobs:\n  b:\n    runs-on: x\n",
+            encoding="utf-8",
+        )
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert errors == []
+
+    def test_an_unexcused_duplicate_is_still_an_error_alongside_an_exempt_one(self, tmp_path):
+        write(tmp_path, "prod.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"a": {"runs-on": "x"}}})
+        write(tmp_path, "other.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"c": {"runs-on": "x"}}})
+        (tmp_path / "hook.yml").write_text(
+            "# run-tree-ok: deliberate\nname: Hook\non:\n  push:\n    branches: [main]\njobs:\n  b:\n    runs-on: x\n",
+            encoding="utf-8",
+        )
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert len(errors) == 1
+        assert "hook.yml" not in errors[0]
 
     def test_a_library_repo_can_silence_the_orphan_note(self, tmp_path):
         """This repo's reusables are called from other repos, by design."""

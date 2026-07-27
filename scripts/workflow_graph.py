@@ -31,9 +31,9 @@ quietly run with less: it rejects that caller's entire run as a
 
 That failure mode is uniquely bad. The run has zero jobs, so the pipeline's own
 terminal notify job cannot fire, and nothing anywhere says the push did not
-deploy. It cost this repo two undeployed merges to ``staging`` and ten hours of
-serving the previous image, and the first thing the engineering channel heard
-about it was the *recovery* message from the run that fixed it.
+deploy. It has already cost a consuming repo two undeployed merges to its deploy
+branch, where the first thing the engineering channel heard about it was the
+*recovery* message from the run that fixed it.
 
 No existing tool catches it, which is the only reason this file exists. Verified
 against the failing tree: ``actionlint`` reports nothing (it does not resolve the
@@ -52,10 +52,18 @@ The rule this enforces, for every ``uses: ./.github/workflows/*.yml`` call:
     within the calling job's effective grant
 
 which in practice means a job in a shared reusable declares only what ALL its
-callers grant and INHERITS anything only one of them needs. Inheriting is not a
-loss of precision, it is the only thing that composes: the PR caller grants
-``pull-requests: write`` and the comment posts, the push callers grant
-``contents: read`` and the same job runs without the scope it never needed.
+callers grant. Anything only ONE caller needs does not belong in a shared reusable
+at all: move that job into the caller that has the grant.
+
+Do not reach for "just inherit it" — that was tried and it is a trap. A job with no
+``permissions:`` block declares nothing for this check to compare, so it is
+invisible here, and a caller that forgot the grant fails at RUN time with an opaque
+``HTTP 403`` on its first API call rather than failing the lint. Declaring the scope
+is what makes the relationship checkable at all.
+
+The blind spot that remains: this check can see what a job DECLARES, never what a
+job NEEDS. A job that quietly requires a scope nobody granted is not detectable
+statically, which is the second reason to declare rather than inherit.
 
 Remote callees (``uses: org/repo/.github/workflows/x.yml@ref``) cannot be read
 from here and are reported as unchecked rather than assumed fine.
@@ -97,7 +105,7 @@ SCOPES: frozenset[str] = frozenset(
 
 # What the workflow token carries when nothing declares anything. This is the
 # repo's "Read repository contents and packages permissions" setting; confirm with
-#   gh api repos/mindsdb/auth/actions/permissions/workflow
+#   gh api repos/<owner>/<repo>/actions/permissions/workflow
 DEFAULT_GRANTS: dict[str, dict[str, str]] = {
     "read": {"contents": "read", "packages": "read"},
     "write": {scope: "write" for scope in SCOPES},
@@ -138,8 +146,10 @@ class Violation:
             f"but {where} declares {self.scope}: {self.declared}\n"
             f"    call chain: {chain}\n"
             f"    every run of {self.caller} would be rejected as a startup_failure, with no job to report it.\n"
-            f"    fix: drop the `permissions:` block in the callee so it inherits the caller's ceiling, "
-            f"or grant {self.scope}: {self.declared} on `{self.caller_job}` if every caller should hold it."
+            f"    fix: grant {self.scope}: {self.declared} on `{self.caller_job}` if EVERY caller should hold it, "
+            f"or move that callee job into the one caller that needs it. Do not just delete the callee's "
+            f"`permissions:` block: it silences this check without giving the job the scope, and the failure "
+            f"comes back at run time as an opaque 403."
         )
 
 
@@ -207,14 +217,26 @@ def level_of(grants: dict[str, str], scope: str) -> str:
     return grants.get(scope, "none")
 
 
+# A workflow that must keep its own run tree says so, with a reason, the same way
+# the secret-hygiene rule is opted out of. Written into the file rather than a
+# central list, because the reason belongs next to the thing it excuses.
+RUN_TREE_EXEMPT = "run-tree-ok:"
+
+EXEMPT: set[str] = set()
+
+
 def load_workflows(workflow_dir: Path) -> dict[str, dict]:
     """Parse every workflow, keyed by the `./.github/workflows/x.yml` form callers use."""
     workflows: dict[str, dict] = {}
+    EXEMPT.clear()
     for path in sorted(workflow_dir.glob("*.y*ml")):
-        with path.open(encoding="utf-8") as handle:
-            parsed = yaml.safe_load(handle)
+        raw = path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw)
         if isinstance(parsed, dict):
-            workflows[f"{LOCAL_PREFIX}{path.name}"] = parsed
+            key = f"{LOCAL_PREFIX}{path.name}"
+            workflows[key] = parsed
+            if RUN_TREE_EXEMPT in raw:
+                EXEMPT.add(key)
     return workflows
 
 
@@ -386,7 +408,7 @@ def check_run_trees(
 
     by_event: dict[str, list[str]] = {}
     for key, workflow in workflows.items():
-        if not is_entry_point(workflow):
+        if not is_entry_point(workflow) or key in EXEMPT:
             continue
         for event in event_keys(workflow):
             by_event.setdefault(event, []).append(key)
@@ -400,7 +422,10 @@ def check_run_trees(
                 f"    Fold the side ones into the event's pipeline as `workflow_call` jobs, so one run "
                 f"shows everything that happened. A job that should not pay for itself on every run "
                 f"gates on a path check; a job behind an `environment:` approval needs an ungated plan "
-                f"job before it, since an approval blocks a job from starting."
+                f"job before it, since an approval blocks a job from starting.\n"
+                f"    If a workflow genuinely has to keep its own run tree (a vendor OIDC claim bound to its "
+                f"filename, a release-train hook on someone else's event), add a `run-tree-ok: <reason>` "
+                f"comment to it."
             )
 
     if not allow_external_reusables:
