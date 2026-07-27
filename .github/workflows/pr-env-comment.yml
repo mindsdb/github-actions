@@ -57,13 +57,53 @@ on:
         description: >-
           Heading text, with the env-name appended. Defaults to the per-PR
           environment wording; a caller posting something else (installer
-          artifacts, say) supplies its own.
+          artifacts, say) supplies its own. Ignored when `status: absent`.
         type: string
         default: "PR environment is up"
+      status:
+        description: >-
+          `up` when the environment exists, `absent` when it does not.
+
+          Absent is a real state worth saying out loud rather than staying quiet.
+          The namespace convention is documented, so someone WILL construct the URL
+          for a PR that never got the label and land on a dead host; and because
+          this comment rolls rather than reposting, one left behind after a teardown
+          points at something that used to work. Saying "there is no environment,
+          here is how to get one" answers both.
+        type: string
+        default: up
+      deploy-label:
+        description: "Label that creates the environment, named in the absent message."
+        type: string
+        default: deploy
+      standard-links:
+        description: >-
+          Render the per-PR environment's full service table, derived from
+          `env-name`.
+
+          A PR environment is ONE namespace holding the whole stack — hub, auth,
+          Keycloak, inference, cowork-server — whichever repo anchored it. So the
+          table is a property of the environment, not of the repo, and every
+          caller composing its own produced five near-identical tables that each
+          listed only that repo's own service. Set false for a comment that is not
+          about an environment (build artifacts, say).
+        type: boolean
+        default: true
+      env-host-suffix:
+        description: "Domain the per-PR hosts sit under."
+        type: string
+        default: dev.mindshub.ai
+      default-tag:
+        description: >-
+          Image tag the services this PR does not build are running. Named in the
+          comment so nobody assumes the whole namespace is their branch.
+        type: string
+        default: staging
       links:
         description: >-
-          JSON array of {"label","url"} objects, rendered as a table in order.
-          e.g. '[{"label":"Console","url":"https://..."}]'
+          EXTRA links, appended after the standard table. JSON array of
+          {"label","url"} objects. For genuinely repo-specific things — a Swagger
+          path, a health endpoint — not for the service hosts, which are derived.
         type: string
         default: "[]"
       access-doc-url:
@@ -107,10 +147,15 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           ENV_NAME: ${{ inputs.env-name }}
           LINKS: ${{ inputs.links }}
+          STANDARD: ${{ inputs.standard-links }}
+          HOST_SUFFIX: ${{ inputs.env-host-suffix }}
+          DEFAULT_TAG: ${{ inputs.default-tag }}
           DOC_URL: ${{ inputs.access-doc-url }}
           NOTES: ${{ inputs.notes }}
           MARKER_KEY: ${{ inputs.marker }}
           HEADING: ${{ inputs.heading }}
+          STATUS: ${{ inputs.status }}
+          DEPLOY_LABEL: ${{ inputs.deploy-label }}
           IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
@@ -120,25 +165,63 @@ jobs:
             exit 1
           fi
 
-          # Fail closed: `private` is present on a pull_request payload, and if it
-          # ever is not, the safe reading is "assume public".
+          # On a public repo, drop what describes internals by nature: the runbook
+          # link and the free-text notes. NOT the links — an environment's own URL
+          # is already published on this PR by the deployment entry in the sidebar,
+          # so withholding it here hides it from the reviewer and from nobody else,
+          # and it is the one thing the comment exists to say. Whether a link is
+          # safe to publish is the caller's call, since only the caller knows what
+          # it points at.
+          #
+          # Fail closed on an absent value: `private` is present on a pull_request
+          # payload, and if it ever is not, the safe reading is "assume public".
           if [ "${IS_PRIVATE:-false}" != "true" ]; then
-            LINKS="[]"
             DOC_URL=""
             NOTES=""
-            echo "Public repository: posting the environment name only."
+            echo "Public repository: omitting the runbook link and the notes."
           fi
 
           MARKER="<!-- ${MARKER_KEY} -->"
           {
             echo "${MARKER}"
+
+            if [ "$STATUS" = "absent" ]; then
+              # No `exit` here: this block is a redirect group, not a subshell, so
+              # exiting would end the whole step and never post what it just wrote.
+              echo "## No PR environment for this pull request"
+              echo
+              echo "Add the \`${DEPLOY_LABEL}\` label and push to create one. It is torn down when the label is removed or the PR closes, so any URL you saw here earlier is gone."
+              echo
+              echo "<sub>Updated on every push to this PR.</sub>"
+            else
+
             echo "## ${HEADING} · \`${ENV_NAME}\`"
             echo
 
-            if [ "$(jq 'length' <<< "${LINKS:-[]}")" != "0" ]; then
+            # The whole stack lives in this one namespace, so list the whole
+            # stack. Derived from the env name rather than passed in, because it
+            # is identical for every anchor repo.
+            ALL="${LINKS:-[]}"
+            if [ "$STANDARD" = "true" ]; then
+              ALL="$(jq -cn --arg e "$ENV_NAME" --arg d "$HOST_SUFFIX" --argjson extra "${LINKS:-[]}" '
+                [ {label: "Hub (console)",   url: "https://\($e).\($d)"},
+                  {label: "Auth API",        url: "https://auth-\($e).\($d)"},
+                  {label: "Keycloak admin",  url: "https://auth-\($e).\($d)/auth/admin/"},
+                  {label: "Inference API",   url: "https://api-\($e).\($d)/v1"},
+                  {label: "cowork-server",   url: "https://cowork-\($e).\($d)/api"} ]
+                + $extra
+                + [ {label: "Namespace", url: "`\($e)`"} ]')"
+            fi
+
+            if [ "$(jq 'length' <<< "$ALL")" != "0" ]; then
               echo "| | |"
               echo "| :--- | :--- |"
-              jq -r '.[] | "| \(.label) | \(.url) |"' <<< "$LINKS"
+              jq -r '.[] | "| \(.label) | \(.url) |"' <<< "$ALL"
+              echo
+            fi
+
+            if [ "$STANDARD" = "true" ]; then
+              echo "Every service is in this namespace. The ones this PR does not build run the \`${DEFAULT_TAG}\` image unless you link them with \`Deploys:\` in the PR body."
               echo
             fi
 
@@ -157,6 +240,7 @@ jobs:
             fi
 
             echo "<sub>Updated on every push to this PR.</sub>"
+            fi
           } > body.md
 
           # One rolling comment per PR rather than a new one per push.
