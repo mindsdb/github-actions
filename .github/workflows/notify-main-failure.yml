@@ -114,8 +114,35 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           BRANCH: ${{ github.ref_name }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -uo pipefail
+
+          # A RE-RUN is the most common way a failure gets fixed, and it was the
+          # one case this could never report. Attempts share a run id, so the
+          # failing attempt is the very run the history lookup below excludes as
+          # "the current one" — it would then find some older, green run and
+          # conclude nothing had broken. Check the previous attempt first.
+          if [ "${RUN_ATTEMPT:-1}" -gt 1 ]; then
+            PREV_ATTEMPT=$((RUN_ATTEMPT - 1))
+            if LAST=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${PREV_ATTEMPT}" \
+                        --jq '.conclusion // ""' 2>&1); then
+              case "${LAST}" in
+                failure|timed_out|startup_failure)
+                  echo "should_post=true" >> "$GITHUB_OUTPUT"
+                  echo "prev_conclusion=${LAST}" >> "$GITHUB_OUTPUT"
+                  echo "Attempt ${PREV_ATTEMPT} concluded '${LAST}', this attempt recovered it."
+                  exit 0
+                  ;;
+                *)
+                  echo "should_post=false" >> "$GITHUB_OUTPUT"
+                  echo "Attempt ${PREV_ATTEMPT} concluded '${LAST:-unknown}', not a recovery."
+                  exit 0
+                  ;;
+              esac
+            fi
+            echo "Could not read attempt ${PREV_ATTEMPT}, falling back to run history: ${LAST}"
+          fi
 
           # Match the workflow FILE rather than its display name, which a
           # `run-name:` override changes; fall back to the name if the ref does

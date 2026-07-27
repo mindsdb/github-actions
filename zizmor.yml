@@ -1,0 +1,31 @@
+# Shared zizmor policy for every repo that calls workflow-lint.yml.
+#
+# One file rather than seven, for the same reason the pipelines were unified: a
+# per-repo copy drifts, and the drift is invisible until the signal is wrong.
+#
+# ONE audit is turned down here, and only partly, because it flags a DECISION
+# rather than a defect. Everything else stays on: if a finding survives this file
+# it is worth reading, which is the only way the report keeps meaning anything.
+#
+# Deliberately NOT suppressed, though it is the largest remaining group:
+# `secrets-inherit`. `secrets: inherit` is our standard everywhere, so it will
+# report on nearly every caller — but narrowing those to explicit secret lists is
+# a legitimate hardening step nobody has decided against yet, and silencing it
+# here would quietly make that decision. Suppress it when someone chooses to.
+
+rules:
+  # In-org references float on `@main` deliberately (decision 11.BH). 101
+  # composite-action call sites already do, and keeping 150+ SHA pins bumped as
+  # the reusables evolve costs more than it buys — so the control moved to the
+  # source instead, where it is one gate rather than 150: `main` in
+  # mindsdb/github-actions requires a code-owner review, dismisses stale
+  # approvals, and admits no bypass actors.
+  #
+  # THIRD-PARTY actions get no such exemption. A tag there is mutable and an
+  # upstream account compromise reaches our pipelines with the caller's secrets in
+  # scope, which is a real finding and tracked as ENG-1053 hardening item 1.
+  unpinned-uses:
+    config:
+      policies:
+        mindsdb/*: ref-pin
+        "*": hash-pin
