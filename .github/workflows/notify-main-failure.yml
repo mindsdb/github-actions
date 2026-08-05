@@ -16,6 +16,16 @@
 #     every merge. This is derived from the GitHub API rather than cross-run
 #     state, so it is self-healing (no cache to go stale).
 #
+# `freeze-scoped: true` adds a third outcome for STAGING callers. A staging
+# failure is only release-blocking once the freeze window is open; mid-week it is
+# an ordinary integration-branch red, and paging the channel for it is what
+# teaches people to ignore the channel. So a freeze-scoped failure posts the red
+# alert while the `staging-freeze` ruleset is active, and outside the freeze
+# posts a muted grey notice instead (`outside-freeze: silent` drops it entirely,
+# at the cost of a broken staging branch being able to sit red unnoticed until
+# the next freeze opens). Prod and freeze/unfreeze callers leave this alone — a
+# failure there is always worth interrupting for.
+#
 # It posts its own message rather than the deploy-notification composite, whose
 # copy is deploy-specific ("has failed deploying to ...") and reads wrong for
 # non-deploy pipelines (freeze, CI, docs). It uses the same Slack bot token.
@@ -64,6 +74,14 @@ on:
         description: "'failed' (red alert) or 'recovered' (green, only if the prior run was failing)"
         type: string
         default: failed
+      freeze-scoped:
+        description: "Scale a 'failed' alert by release-freeze state (see `outside-freeze`). For staging pipelines, where a failure is only release-blocking once the freeze window is open."
+        type: boolean
+        default: false
+      outside-freeze:
+        description: "What a freeze-scoped failure does while staging is NOT frozen: 'notice' (muted, no panic styling) or 'silent' (post nothing)."
+        type: string
+        default: notice
       runs-on:
         description: "Runner label for the notify job"
         type: string
@@ -178,6 +196,100 @@ jobs:
               ;;
           esac
 
+      # A staging pipeline failure means different things depending on where the
+      # release train is. Once the freeze window is open staging IS the release
+      # candidate, so a red pipeline blocks the release and is worth interrupting
+      # the channel for. Mid-week it is the integration branch and the same red
+      # is routine — panic styling there just teaches people to scroll past it.
+      #
+      # The freeze signal is the `staging-freeze` repository ruleset that the
+      # freeze/unfreeze workflows toggle between `active` and `disabled`, not an
+      # inference from workflow-run history: a freeze that skipped itself because
+      # staging had nothing unreleased still concludes `success`, and history
+      # cannot tell that apart from a real freeze.
+      #
+      # Reading rulesets needs admin, which the default workflow token does not
+      # carry, so this reuses the App that owns the toggle. Every failure path
+      # below falls through to `frozen=true`: a notify job that cannot establish
+      # the freeze state must escalate rather than silently downgrade a real
+      # release-blocking failure.
+      - name: Mint release-train App token
+        id: freeze-token
+        if: inputs.freeze-scoped && inputs.status != 'recovered'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Check release-freeze state
+        id: freeze
+        if: inputs.freeze-scoped && inputs.status != 'recovered'
+        env:
+          GH_TOKEN: ${{ steps.freeze-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          RULESET_NAME: staging-freeze
+          OUTSIDE_FREEZE: ${{ inputs.outside-freeze }}
+        run: |
+          set -uo pipefail
+
+          escalate() {
+            echo "::warning::$1 Treating staging as frozen so this failure still escalates."
+            echo "frozen=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          [ -n "${GH_TOKEN:-}" ] || escalate "Could not mint the release-train App token."
+
+          ENFORCEMENT=$(gh api "repos/${REPO}/rulesets" \
+            --jq ".[] | select(.name == \"${RULESET_NAME}\") | .enforcement" 2>&1) \
+            || escalate "Could not read rulesets: ${ENFORCEMENT}."
+          [ -n "${ENFORCEMENT}" ] || escalate "Ruleset '${RULESET_NAME}' not found."
+
+          if [ "${ENFORCEMENT}" = "active" ]; then
+            echo "frozen=true" >> "$GITHUB_OUTPUT"
+            echo "Ruleset '${RULESET_NAME}' is active — staging is frozen, escalating."
+          else
+            echo "frozen=false" >> "$GITHUB_OUTPUT"
+            echo "Ruleset '${RULESET_NAME}' is '${ENFORCEMENT}' — staging is not frozen, downgrading to '${OUTSIDE_FREEZE}'."
+          fi
+
+      # Collapse the three outcomes (recovered / failed / failed-outside-freeze)
+      # into flat strings. Deciding this in shell keeps the Slack payload from
+      # growing a second and third nested ternary per field, which is where this
+      # kind of template stops being reviewable.
+      - name: Compose message
+        id: msg
+        env:
+          STATUS: ${{ inputs.status }}
+          FREEZE_SCOPED: ${{ inputs.freeze-scoped }}
+          FROZEN: ${{ steps.freeze.outputs.frozen }}
+          OUTSIDE_FREEZE: ${{ inputs.outside-freeze }}
+        run: |
+          set -euo pipefail
+          POST=true
+          if [ "${STATUS}" = "recovered" ]; then
+            LEVEL=recovered; COLOR='#00C851'; ICON=':white_check_mark:'; VERB=recovered
+            PREFIX=Recovered; NOTE=''
+          elif [ "${FREEZE_SCOPED}" = "true" ] && [ "${FROZEN}" = "false" ]; then
+            LEVEL=notice; COLOR='#B0B4BA'; ICON=':warning:'; VERB=failed
+            PREFIX=Failed; NOTE=' (outside the release freeze, not release-blocking)'
+            if [ "${OUTSIDE_FREEZE}" = "silent" ]; then POST=false; fi
+          else
+            LEVEL=alert; COLOR='#FF4444'; ICON=':rotating_light:'; VERB=failed
+            PREFIX=FAILED; NOTE=''
+          fi
+          {
+            echo "post=${POST}"
+            echo "level=${LEVEL}"
+            echo "color=${COLOR}"
+            echo "icon=${ICON}"
+            echo "verb=${VERB}"
+            echo "prefix=${PREFIX}"
+            echo "note=${NOTE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "level=${LEVEL} post=${POST}"
+
       - name: Notify Slack
         # Failure mode always posts; on a real pipeline, recovery posts only after
         # a failing run; a manual dispatch always posts (smoke test).
@@ -187,22 +299,24 @@ jobs:
         # reader, and a notification-list preview show, so without it the alert
         # arrives on a phone as an empty message — which is the one context where
         # a pipeline failure most needs to be readable.
-        if: inputs.status != 'recovered' || github.event_name == 'workflow_dispatch' || steps.prev.outputs.should_post == 'true'
+        # `steps.msg.outputs.post` carries the one extra veto: a freeze-scoped
+        # failure outside the freeze window when the caller asked for silence.
+        if: steps.msg.outputs.post == 'true' && (inputs.status != 'recovered' || github.event_name == 'workflow_dispatch' || steps.prev.outputs.should_post == 'true')
         uses: slackapi/slack-github-action@v1.26.0
         with:
           channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
           payload: |
             {
-              "text": "${{ inputs.status == 'recovered' && 'Recovered' || 'FAILED' }}: ${{ github.event.repository.name }} ${{ inputs.env-name }} pipeline on ${{ github.ref_name }}",
+              "text": "${{ steps.msg.outputs.prefix }}: ${{ github.event.repository.name }} ${{ inputs.env-name }} pipeline on ${{ github.ref_name }}${{ steps.msg.outputs.note }}",
               "attachments": [
                 {
-                  "color": "${{ inputs.status == 'recovered' && '#00C851' || '#FF4444' }}",
+                  "color": "${{ steps.msg.outputs.color }}",
                   "blocks": [
                     {
                       "type": "section",
                       "text": {
                         "type": "mrkdwn",
-                        "text": "${{ inputs.status == 'recovered' && ':white_check_mark:' || ':rotating_light:' }} *<${{ github.server_url }}/${{ github.repository }}|${{ github.event.repository.name }}>* — *${{ inputs.env-name }}* pipeline ${{ inputs.status == 'recovered' && 'recovered' || 'failed' }} on `${{ github.ref_name }}`"
+                        "text": "${{ steps.msg.outputs.icon }} *<${{ github.server_url }}/${{ github.repository }}|${{ github.event.repository.name }}>* — *${{ inputs.env-name }}* pipeline ${{ steps.msg.outputs.verb }} on `${{ github.ref_name }}`${{ steps.msg.outputs.note }}"
                       },
                       "fields": [
                         {
