@@ -1,0 +1,118 @@
+# Reusable workflow: merge `main` back into `staging` after ANY push to main.
+#
+# `release-unfreeze.yml` already syncs main into staging when the weekly release
+# PR merges. That covers the release path and nothing else. A commit that reaches
+# main any other way — a hotfix PR, a revert, a direct merge — fires no unfreeze
+# (the wrapper's guard requires the merged PR's head to be `staging`), so it sits
+# on main until the NEXT weekly release drags it across, up to a week later.
+#
+# That gap is not cosmetic on squash-merge repos. While main is ahead, the next
+# release PR's diff is computed against a main that staging does not contain, so
+# the release either reverts the missing commit or has to be reconciled by hand.
+# This workflow closes the window: main flows into staging within a minute of
+# landing, whatever route it took.
+#
+# Idempotent by construction: it exits 0 when staging already contains main, so
+# it is safe to run on every push, and safe to run alongside the unfreeze sync.
+#
+# Ordering against release-unfreeze: merging the release PR fires BOTH this
+# (push to main) and the unfreeze (pull_request closed). Both push staging with
+# the same App, so the CALLER must put both workflows in one `concurrency` group
+# to serialise them; the loser then finds staging already current and no-ops.
+# The push also retries once on a non-fast-forward, which covers a staging that
+# moved between fetch and push for any other reason.
+#
+# The push uses the `mindsdb-release-train` App token. The App is the ruleset
+# bypass actor on staging, so it lands even while staging is frozen — which is
+# what you want: a hotfix on main belongs in the release candidate too.
+#
+# Called by a per-repo wrapper, e.g.
+#   auth/.github/workflows/sync-main-to-staging.yml
+#
+# Requires: vars.RELEASE_APP_CLIENT_ID + secrets.RELEASE_APP_PRIVATE_KEY
+# (org-provisioned; secret reaches here via `secrets: inherit`).
+
+name: Sync main to staging
+
+on:
+  workflow_call:
+    inputs:
+      staging-branch:
+        description: "Branch to sync into"
+        type: string
+        default: staging
+      base-branch:
+        description: "Production branch to sync from"
+        type: string
+        default: main
+      runs-on:
+        description: "Runner label"
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Mint release-train App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Sync base branch into staging
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          STAGING: ${{ inputs.staging-branch }}
+          BASE: ${{ inputs.base-branch }}
+        run: |
+          set -euo pipefail
+
+          # Attribute the merge commit to the App's bot identity. The username is
+          # URL-encoded ('[' -> %5B, ']' -> %5D) for the users API lookup.
+          APP_USER_ID=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq '.id')
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          # One attempt, then one retry: the retry exists for the case where
+          # staging moved after the fetch (a concurrent sync, or an ordinary push
+          # landing while staging is unfrozen), which shows up as a rejected
+          # non-fast-forward rather than an error worth failing the run over.
+          for attempt in 1 2; do
+            git fetch origin "${BASE}" "${STAGING}"
+            git checkout -B "${STAGING}" "origin/${STAGING}"
+
+            if git merge-base --is-ancestor "origin/${BASE}" HEAD; then
+              echo "${STAGING} already contains ${BASE} — nothing to sync."
+              exit 0
+            fi
+
+            git merge --no-ff "origin/${BASE}" \
+              -m "Sync ${BASE} into ${STAGING}"
+
+            if git push origin "HEAD:${STAGING}"; then
+              echo "Pushed ${BASE} -> ${STAGING} on attempt ${attempt}."
+              {
+                echo "## Synced \`${BASE}\` into \`${STAGING}\`"
+                echo ""
+                echo "\`${STAGING}\` now contains every commit on \`${BASE}\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            echo "Push rejected on attempt ${attempt} — ${STAGING} moved underneath us."
+            git merge --abort 2>/dev/null || true
+          done
+
+          echo "::error::Could not fast-forward ${STAGING} after 2 attempts. ${STAGING} is moving faster than this workflow can merge, or the App lost its bypass on ${STAGING}."
+          exit 1

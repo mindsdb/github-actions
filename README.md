@@ -15,7 +15,7 @@ Use an action from this repo in your workflow like this:
 
 ## Release-train reusable workflows
 
-Three reusable workflows automate the weekly `staging → main` release cycle.
+Four reusable workflows automate the weekly `staging → main` release cycle.
 They live in `.github/workflows/` and are called from ~25-line per-repo wrappers
 (same pattern as `stale-deploy-label.yml`):
 
@@ -24,6 +24,19 @@ They live in `.github/workflows/` and are called from ~25-line per-repo wrappers
 | `release-freeze.yml` | `Staging Freeze` | Activates the `staging-freeze` ruleset to lock staging (skips if staging == main) |
 | `release-pr.yml` | `Create staging to main release PR` | Opens the `staging → main` PR (idempotent) |
 | `release-unfreeze.yml` | `Staging Unfreeze` | Disables the ruleset when the release PR merges, then syncs `main` back into `staging` |
+| `sync-main-to-staging.yml` | `Sync main to staging` | Merges `main` into `staging` after **any** push to main, not just the release merge |
+
+`release-unfreeze.yml` syncs main back only on the release path, because its wrapper's guard requires the merged PR's head branch to be `staging`. A commit that reaches main any other way (a hotfix PR, a revert, a direct merge) fires nothing, and on a squash-merge repo that leaves the next release PR diffed against a `main` that `staging` does not contain. `sync-main-to-staging.yml` closes that window on `push: main`.
+
+Both push `staging` as the release-train App, and merging the release PR fires both, so a caller that installs both **must put them in the same `concurrency` group**:
+
+```yaml
+concurrency:
+  group: sync-main-to-staging
+  cancel-in-progress: false
+```
+
+The sync is idempotent (it exits 0 when `staging` already contains `main`), so whichever run loses the race no-ops.
 
 The chain is event-driven: `Staging Freeze` finishing fires the release-PR
 workflow via `workflow_run`; merging that PR fires `Staging Unfreeze`. The
@@ -70,6 +83,25 @@ on this job, because the default workflow token carries contents + packages read
 only and a called workflow can never hold more than its caller grants. Without
 it the lookup is refused and the job stays silent (it never fails the run), so a
 missing recovery message is the symptom to look for.
+
+### Scoping staging alerts to the freeze window
+
+A staging failure is not the same event all week. Once the freeze window is open, `staging` is the release candidate and a red pipeline blocks the release. Before it, `staging` is the integration branch and the same red is routine, so paging the channel for it is what teaches people to scroll past the channel.
+
+`freeze-scoped: true` on a **staging** caller keeps the red `:rotating_light:` alert while the `staging-freeze` ruleset is `active`, and drops it to a muted grey `:warning:` notice outside the window:
+
+```yaml
+    with:
+      env-name: "staging build+deploy"
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+      freeze-scoped: true
+```
+
+Add `outside-freeze: silent` to post nothing at all outside the window instead. That trades the noise for a blind spot: a staging pipeline can then sit red unnoticed until the next freeze opens on a branch that no longer builds, so `notice` is the default.
+
+Freeze state is read from the `staging-freeze` ruleset itself, not inferred from workflow history — a freeze that skipped itself because staging had nothing unreleased still concludes `success`, and history cannot tell that apart from a real freeze. Reading rulesets needs admin, so this reuses the same App that toggles them (`vars.RELEASE_APP_CLIENT_ID` + `secrets.RELEASE_APP_PRIVATE_KEY`); no extra `permissions:` on the caller. If the App token or the ruleset lookup fails, it escalates to the red alert rather than downgrading, so a lookup problem can never silence a real release-blocking failure.
+
+Leave `freeze-scoped` off for prod and freeze/unfreeze callers: a failure there is always worth interrupting for.
 
 For a freeze/unfreeze wrapper, keep it failure-only: `needs:` its single job,
 `if: failure()`, the default `status: failed`, no `permissions:` block (the
