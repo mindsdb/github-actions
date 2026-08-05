@@ -33,8 +33,10 @@
 # Issues a single `argocd app set` against the parent Application
 # (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
 # resolved repo, kicks the auto-sync via `argocd app sync --async`, and then
-# blocks on `argocd app wait` (up to 30m) so the GH job stays open until
-# the env is actually up.
+# blocks on `argocd app wait` (`wait-timeout`, 30m default) so the GH job
+# stays open until the env is actually up. On timeout it prints every app's
+# sync/health plus any Application conditions, because the CLI's own timeout
+# message names neither the stuck app nor the reason.
 #
 # Rollout state surfaces in the PR via the caller workflow's `environment:`
 # block (native GH Deployment). The PR sidebar pill is `in_progress` while
@@ -66,6 +68,13 @@ inputs:
     description: ArgoCD CLI version installed when missing from the runner.
     required: false
     default: v2.13.1
+  wait-timeout:
+    description: >-
+      Seconds to wait for the env to reach Synced+Healthy before failing.
+      Covers a cold env's image pulls and migrations, so lower it only if you
+      know this repo's envs come up faster.
+    required: false
+    default: "1800"
 
 runs:
   using: composite
@@ -76,6 +85,7 @@ runs:
         ARGOCD_AUTH_TOKEN: ${{ inputs.argocd-token }}
         ARGOCD_VERSION: ${{ inputs.argocd-version }}
         GH_TOKEN: ${{ inputs.gh-token }}
+        WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
       run: |
         set -euo pipefail
 
@@ -406,5 +416,22 @@ runs:
         # written by the AppSet template onto the parent and by `prenv.labels`
         # onto every child, so this one selector covers both.
         WAIT_SELECTOR="pr-env.mindsdb.com/anchor-repo=${OWN_SLUG},pr-env.mindsdb.com/pr-number=${PR_NUMBER}"
-        echo "argocd app wait -l ${WAIT_SELECTOR} --sync --health --operation --timeout 1800"
-        "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" --grpc-web --sync --health --operation --timeout 1800
+        echo "argocd app wait -l ${WAIT_SELECTOR} --sync --health --operation --timeout ${WAIT_TIMEOUT}"
+        if "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" --grpc-web --sync --health --operation --timeout "$WAIT_TIMEOUT"; then
+          exit 0
+        fi
+
+        # On timeout the CLI cancels its own watch stream and all it prints is
+        # `rpc error: code = Canceled desc = context canceled`, which names
+        # neither the stuck app nor the reason. Every Application already
+        # carries both in its status, so dump that instead. An app stuck
+        # Healthy-but-never-Synced is a spec ArgoCD cannot converge rather than
+        # a slow or crash-looping rollout; two apps rendering one Secret shows
+        # up here as SharedResourceWarning. Never let the diagnostics
+        # themselves fail the step ahead of the explicit exit below.
+        echo "::error::PR env did not converge within ${WAIT_TIMEOUT}s. State at timeout:"
+        "$ARGOCD_BIN" app list -l "$WAIT_SELECTOR" --grpc-web -o json 2>/dev/null | jq -r '
+          .[] | "  \(.metadata.name)  sync=\(.status.sync.status)  health=\(.status.health.status)",
+                (.status.conditions[]? | "      \(.type): \(.message)")
+        ' >&2 || true
+        exit 1
