@@ -16,15 +16,24 @@
 #     every merge. This is derived from the GitHub API rather than cross-run
 #     state, so it is self-healing (no cache to go stale).
 #
-# `freeze-scoped: true` adds a third outcome for STAGING callers. A staging
-# failure is only release-blocking once the freeze window is open; mid-week it is
-# an ordinary integration-branch red, and paging the channel for it is what
-# teaches people to ignore the channel. So a freeze-scoped failure posts the red
-# alert while the `staging-freeze` ruleset is active, and outside the freeze
-# posts a muted grey notice instead (`outside-freeze: silent` drops it entirely,
-# at the cost of a broken staging branch being able to sit red unnoticed until
-# the next freeze opens). Prod and freeze/unfreeze callers leave this alone — a
-# failure there is always worth interrupting for.
+# `freeze-scoped: true` scopes a STAGING caller to the release window. The policy
+# this implements:
+#
+#   failure on main                      -> alert
+#   failure on staging, freeze OPEN      -> alert  (staging is the release candidate)
+#   failure on staging, freeze NOT open  -> nothing (ordinary integration-branch red)
+#
+# Mid-week staging is the integration branch, and paging the channel for it is
+# what teaches people to ignore the channel. `outside-freeze: notice` posts a
+# muted grey message instead of nothing, for a caller that wants the trail; the
+# default is silence. Either way the run is still red in the Actions tab, and
+# pipeline-watchdog.yml still covers a staging branch that stops building at all.
+#
+# Prod and freeze/unfreeze callers leave this alone: a failure there is always
+# worth interrupting for. A workflow triggered on BOTH main and staging from one
+# notify job cannot hardcode this — pass an expression instead, or a main failure
+# gets silenced too:
+#   freeze-scoped: ${{ github.ref_name == 'staging' }}
 #
 # It posts its own message rather than the deploy-notification composite, whose
 # copy is deploy-specific ("has failed deploying to ...") and reads wrong for
@@ -79,9 +88,9 @@ on:
         type: boolean
         default: false
       outside-freeze:
-        description: "What a freeze-scoped failure does while staging is NOT frozen: 'notice' (muted, no panic styling) or 'silent' (post nothing)."
+        description: "What a freeze-scoped failure does while staging is NOT frozen: 'silent' (post nothing) or 'notice' (muted, no panic styling)."
         type: string
-        default: notice
+        default: silent
       runs-on:
         description: "Runner label for the notify job"
         type: string
