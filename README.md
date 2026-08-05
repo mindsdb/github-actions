@@ -88,7 +88,13 @@ missing recovery message is the symptom to look for.
 
 A staging failure is not the same event all week. Once the freeze window is open, `staging` is the release candidate and a red pipeline blocks the release. Before it, `staging` is the integration branch and the same red is routine, so paging the channel for it is what teaches people to scroll past the channel.
 
-`freeze-scoped: true` on a **staging** caller keeps the red `:rotating_light:` alert while the `staging-freeze` ruleset is `active`, and drops it to a muted grey `:warning:` notice outside the window:
+`freeze-scoped: true` on a **staging** caller implements that policy:
+
+| Where it failed | Freeze window | Result |
+|---|---|---|
+| `main` | n/a | red alert |
+| `staging` | open | red alert |
+| `staging` | not open | nothing posted |
 
 ```yaml
     with:
@@ -97,7 +103,13 @@ A staging failure is not the same event all week. Once the freeze window is open
       freeze-scoped: true
 ```
 
-Add `outside-freeze: silent` to post nothing at all outside the window instead. That trades the noise for a blind spot: a staging pipeline can then sit red unnoticed until the next freeze opens on a branch that no longer builds, so `notice` is the default.
+Add `outside-freeze: notice` to post a muted grey `:warning:` message instead of nothing, for a caller that wants the trail. Silence is the default; the run is still red in the Actions tab either way, and `pipeline-watchdog.yml` still covers a staging branch that stops building at all.
+
+A workflow triggered on **both** main and staging from one notify job must not hardcode `true`, or main failures get silenced too. Pass an expression:
+
+```yaml
+      freeze-scoped: ${{ github.ref_name == 'staging' }}
+```
 
 Freeze state is read from the `staging-freeze` ruleset itself, not inferred from workflow history — a freeze that skipped itself because staging had nothing unreleased still concludes `success`, and history cannot tell that apart from a real freeze. Reading rulesets needs admin, so this reuses the same App that toggles them (`vars.RELEASE_APP_CLIENT_ID` + `secrets.RELEASE_APP_PRIVATE_KEY`); no extra `permissions:` on the caller. If the App token or the ruleset lookup fails, it escalates to the red alert rather than downgrading, so a lookup problem can never silence a real release-blocking failure.
 
