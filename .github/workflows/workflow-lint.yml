@@ -99,7 +99,12 @@ jobs:
           DEFAULTS: ${{ inputs.default-permissions }}
         run: |
           set -euo pipefail
-          uv run --with pyyaml --python 3.12 \
+          # --no-project because this runs inside the CALLING repo. Without it
+          # `uv run` discovers that repo's pyproject.toml, builds a .venv and
+          # installs its entire dependency tree before running a script that only
+          # needs pyyaml. That is slow, and it fails outright when a caller depends
+          # on a private git repo, since this job holds no credentials for one.
+          uv run --no-project --with pyyaml --python 3.12 \
             .ci-shared/scripts/workflow_graph.py \
             --workflow-dir .github/workflows \
             --default-permissions "$DEFAULTS"
