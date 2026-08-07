@@ -9,6 +9,16 @@
 #   - `Deploys: repo#staging` — no API lookup; pins that repo to the
 #     `staging` ECR image tag + `staging` git branch. Useful for testing
 #     the anchor PR against non-PR-branch versions of a sibling service.
+#   - `Deploys: argocd-envs#N` is special-cased. argocd-envs holds the PR
+#     env's own parent chart, so it has no image and no child Application.
+#     The link moves the PARENT Application's source.targetRevision onto
+#     that PR's head BRANCH (not its head SHA, so later pushes to the
+#     branch re-propagate on ArgoCD's own poll without re-running this
+#     anchor's pipeline). At most one such link, and the branch must live
+#     in mindsdb/argocd-envs itself, since that is the only repo ArgoCD
+#     fetches the parent chart from. `--revision` is passed on every
+#     deploy, defaulting to `main`, so dropping the line resets the parent
+#     (the AppSet's ignoreApplicationDifferences no longer reverts it).
 #
 # Linked-PR image tags resolve in order:
 #   1. `development-head-<head sha>` — pushed by build-push-ecr's PR
@@ -217,8 +227,17 @@ runs:
         # only kills that subshell, so the existence checks and the abort
         # must live out here where exit actually terminates the step (and
         # where the guard's warn-once cache persists across iterations).
+        # Parent chart revision. Always emitted into set_args below, default
+        # `main`: the AppSet's ignoreApplicationDifferences now covers
+        # spec/source/targetRevision, so nothing else will ever reset it.
+        # Removing a `Deploys: argocd-envs#N` line therefore has to actively
+        # reset the parent, or the env stays pinned to a branch that may since
+        # have been merged and deleted.
+        ENVS_REVISION=main
+        ENVS_LINK=""
+
         unresolved_links=()
-        while IFS=: read -r kind link repo merge_sha head_sha; do
+        while IFS=: read -r kind link repo merge_sha head_sha branch; do
           case "$kind" in
             unresolved)
               # Linked PR could not be resolved (missing/closed/unmergeable;
@@ -231,6 +250,24 @@ runs:
                 --helm-set "tags.${repo}=staging"
                 --helm-set "revisions.${repo}=staging"
               )
+              ;;
+            envs)
+              # The parent chart itself. One source, so one branch: a second
+              # link is a contradiction rather than something to merge.
+              if [ -n "$ENVS_LINK" ]; then
+                echo "::error::Refusing to deploy: two 'Deploys: argocd-envs#N' links (${ENVS_LINK} and ${link}). The PR env renders from a single parent chart source, so only one argocd-envs branch can be deployed."
+                exit 1
+              fi
+              ENVS_LINK="$link"
+              ENVS_REVISION="$branch"
+              ;;
+            envs-fork)
+              echo "::error::Refusing to deploy: ${link} is opened from a fork. ArgoCD fetches the parent chart from ${link%%#*} only and cannot reach a fork's branch, so push the branch to ${link%%#*} and re-open the PR from there."
+              exit 1
+              ;;
+            envs-missing)
+              echo "::error::Refusing to deploy: could not resolve a head branch for ${link}. Check the PR exists and is open, then re-run this job."
+              exit 1
               ;;
             pr)
               # Prefer the head-SHA tag: PR head SHAs are immutable, so the
@@ -273,6 +310,29 @@ runs:
                   *)   full="${OWN_REPO%%/*}/$full" ;;
                 esac
                 [ "$full" = "$OWN_REPO" ] && continue
+                # argocd-envs is the env's own parent chart, not a workload:
+                # no image to tag and no child Application to revision. Emit
+                # the head BRANCH so phase 2 can move the parent Application's
+                # source.targetRevision onto it. Branch, not head SHA, so a
+                # later push to the chart branch re-propagates on ArgoCD's own
+                # repo poll instead of needing this anchor's pipeline re-run.
+                # Fork branches are unreachable: ArgoCD only ever fetches the
+                # chart from this repoURL.
+                if [ "${full##*/}" = "argocd-envs" ]; then
+                  head_ref=""; head_repo=""
+                  read -r head_ref head_repo < <(
+                    gh_api "/repos/$full/pulls/$num" \
+                      | jq -r '[.head.ref // "", .head.repo.full_name // ""] | @tsv'
+                  ) || true
+                  if [ -z "${head_ref:-}" ] || [ -z "${head_repo:-}" ]; then
+                    echo "envs-missing:${full}#${num}:${full##*/}::"
+                  elif [ "$head_repo" != "$full" ]; then
+                    echo "envs-fork:${full}#${num}:${full##*/}:::${head_ref}"
+                  else
+                    echo "envs:${full}#${num}:${full##*/}:::${head_ref}"
+                  fi
+                  continue
+                fi
                 # `#staging` — reuse the linked repo's staging pipeline
                 # outputs: `staging` ECR image tag + `staging` git branch.
                 if [ "$num" = "staging" ]; then
@@ -308,6 +368,14 @@ runs:
             || echo "::warning::could not post the blocking comment to ${OWN_REPO}#${PR_NUMBER} (does the gh-token allow writing issue comments?)" >&2
           echo "::error::Refusing to deploy: unresolvable Deploys link(s): ${links}"
           exit 1
+        fi
+
+        # Pin the parent chart's own source revision. Unconditional: see the
+        # ENVS_REVISION declaration for why the default has to be written out
+        # rather than left alone.
+        set_args+=(--revision "$ENVS_REVISION")
+        if [ -n "$ENVS_LINK" ]; then
+          echo "Parent chart (argocd-envs) pinned to branch ${ENVS_REVISION} via ${ENVS_LINK}."
         fi
 
         # Install argocd CLI to a writable location if missing. /usr/local/bin
