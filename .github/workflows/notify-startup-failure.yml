@@ -146,6 +146,10 @@ on:
         description: "How long a failure must have stood before the red-branch sweep repeats it, so the sweep is a backstop rather than an echo of the alert the pipeline already sent"
         type: number
         default: 30
+      workflows:
+        description: "Space-separated workflow paths the red-branch sweep may report on. Empty means every workflow with a run on these branches, which is wider than the set that opted into an in-run alert: the sweep reads run history, not notify wiring, so a red scheduled job or a red one-off check on a deploy branch counts too. Narrow it here if that is not wanted."
+        type: string
+        default: ""
       staging-branch:
         description: "Which of `branches` is the release candidate, and so is only reported while the freeze window is open"
         type: string
@@ -176,6 +180,10 @@ on:
         description: "Age floor for the red-branch sweep (set 0 to report a failure that just happened)"
         type: number
         default: 30
+      workflows:
+        description: "Workflow paths to report on (space separated); empty means all"
+        type: string
+        default: ""
       staging-branch:
         description: "Which branch is the release candidate"
         type: string
@@ -412,8 +420,19 @@ jobs:
           LOOKBACK: ${{ inputs.lookback-minutes }}
           MIN_AGE: ${{ inputs.min-age-minutes }}
           FROZEN: ${{ steps.freeze.outputs.frozen }}
+          WORKFLOWS: ${{ inputs.workflows }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           set -uo pipefail
+
+          # The sweep's own workflow, so it never reports itself. Derived rather
+          # than asked of every caller: `github.workflow_ref` is the CALLER's
+          # top-level workflow, which is exactly the watchdog. A watchdog run that
+          # went red would otherwise be the newest red run of a workflow on `main`
+          # and get alerted on at the next tick, reading as a pipeline failure.
+          SELF_PATH="${WORKFLOW_REF%%@*}"
+          SELF_PATH="${SELF_PATH#"${REPO}/"}"
+
           python3 .ci-shared/scripts/branch_health.py \
             --repo "${REPO}" \
             --branches "${BRANCHES}" \
@@ -421,15 +440,42 @@ jobs:
             --lookback-minutes "${LOOKBACK}" \
             --min-age-minutes "${MIN_AGE}" \
             --frozen "${FROZEN}" \
+            --workflows "${WORKFLOWS}" \
+            --self-path "${SELF_PATH}" \
             --out red-branches.json
 
-          COUNT=$(jq 'length' red-branches.json)
+      # A separate step because it reads `find`'s outputs, and a step cannot read
+      # its own. `always()` so a failed lookup still explains itself.
+      - name: Summarise the sweep
+        if: always() && steps.find.conclusion != 'skipped'
+        env:
+          BRANCHES: ${{ inputs.branches }}
+          LOOKBACK: ${{ inputs.lookback-minutes }}
+          MIN_AGE: ${{ inputs.min-age-minutes }}
+          FROZEN: ${{ steps.freeze.outputs.frozen }}
+          WORKFLOWS: ${{ inputs.workflows }}
+          COUNT: ${{ steps.find.outputs.count }}
+          UNREADABLE: ${{ steps.find.outputs.unreadable }}
+        run: |
+          set -uo pipefail
           {
             echo "### Red-branch sweep"
             echo
             echo "Branches: \`${BRANCHES}\` · window: last ${LOOKBACK} min · age floor: ${MIN_AGE} min · staging frozen: ${FROZEN:-unknown}"
+            echo "Scope: \`${WORKFLOWS:-every workflow on the branch}\`"
             echo
-            if [ "${COUNT}" = "0" ]; then
+            if [ -n "${UNREADABLE}" ]; then
+              # Never an all-clear for a branch this could not read. The
+              # "nothing to report" line below used to print regardless, so a 403
+              # read as "everything is fine".
+              echo "**Could not read run history for: \`${UNREADABLE}\`.** Those branches were not checked,"
+              echo "so this is not an all-clear for them. Usually a missing \`actions: read\` grant on the"
+              echo "calling job."
+              echo
+            fi
+            if [ ! -s red-branches.json ]; then
+              echo "The sweep did not finish, so nothing was checked."
+            elif [ "${COUNT:-0}" = "0" ]; then
               echo "No deploy branch is sitting red. Nothing to report."
             else
               echo "| Workflow | Branch | Commit | Conclusion | Why now | Run |"
@@ -458,11 +504,15 @@ jobs:
             --slurpfile findings red-branches.json \
             --arg repo "$REPO" --arg repo_name "$REPO_NAME" \
             --arg server "$SERVER" --arg channel "$CHANNEL" --arg sweep "$SWEEP_URL" '
-            ($findings[0] | any(.reason == "freeze-opened")) as $froze |
+            # Keyed on the finding that actually carries the reason, not on any()
+            # across every branch. `reason` is per-branch, so an any() over a
+            # mixed set announced a red `main` as "the release freeze has opened
+            # and staging is red".
+            ([$findings[0][] | select(.reason == "freeze-opened")] | first) as $froze |
             {
               channel: $channel,
               text: (if $froze
-                     then "\($repo_name) — the release freeze opened on a red branch"
+                     then "\($repo_name) — the release freeze opened on a red \($froze.branch)"
                      else "\($repo_name) — a deploy branch is still red" end),
               attachments: [{
                 color: "#FF4444",
@@ -472,7 +522,7 @@ jobs:
                     text: {
                       type: "mrkdwn",
                       text: (if $froze
-                             then ":snowflake: *<\($server)/\($repo)|\($repo_name)>* — the release freeze has opened and `staging` is *red*. It is the release candidate now, so this blocks the release until it is fixed."
+                             then ":snowflake: *<\($server)/\($repo)|\($repo_name)>* — the release freeze has opened and `\($froze.branch)` is *red*. It is the release candidate now, so this blocks the release until it is fixed."
                              else ":rotating_light: *<\($server)/\($repo)|\($repo_name)>* — \($findings[0] | length) pipeline(s) *still failing*. The newest run is red and nobody has fixed it." end)
                     }
                   }]

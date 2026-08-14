@@ -89,9 +89,23 @@ class TestNewestConclusivePerWorkflow:
         ]
         assert [r["id"] for r in health.newest_conclusive_per_workflow(runs)] == [1]
 
-    def test_ignores_startup_failure(self):
-        """That case is the other sweep's, and two alerts per finding is worse."""
-        assert health.newest_conclusive_per_workflow([run(conclusion="startup_failure")]) == []
+    def test_startup_failure_counts_as_the_newest_run(self):
+        """It is CONCLUSIVE so it can supersede, but not RED so it is never reported.
+
+        Dropping it from the ordering entirely made the sweep reach past it to an
+        older `failure` and report that as "the newest run is red", which is two
+        alerts for one broken branch: this sweep's and the startup sweep's.
+        """
+        assert [r["id"] for r in health.newest_conclusive_per_workflow(
+            [run(conclusion="startup_failure")]
+        )] == [1]
+
+    def test_a_startup_failure_supersedes_an_older_failure(self):
+        runs = [
+            run(run_id=1, conclusion="failure", minutes_ago=60),
+            run(run_id=2, conclusion="startup_failure", minutes_ago=40),
+        ]
+        assert select(runs, frozen=True) == [], "the other sweep owns this one"
 
     def test_keyed_on_path_so_a_run_name_override_does_not_split_it(self):
         runs = [
@@ -201,6 +215,98 @@ class TestFetchFreezeRuns:
     def test_no_freeze_workflow_returns_empty_rather_than_raising(self):
         runner = lambda argv: completed(json.dumps({"workflows": [{"id": 3, "name": "Tests"}]}))
         assert health.fetch_freeze_runs("o/r", runner=runner) == []
+
+
+class TestAgeIsMeasuredFromTheAttempt:
+    """`created_at` stays pinned to attempt 1, so a re-run must not be judged by it.
+
+    Measured against live runs: a cowork-server attempt 2 carried `created_at`
+    22:26:37 and `run_started_at` 23:47:11. Eighty minutes apart, so a 90-minute
+    lookback had already almost expired before the attempt began, and the re-run
+    this sweep exists to catch was filtered out as too old.
+    """
+
+    def test_a_rerun_is_judged_by_when_the_attempt_started(self):
+        stale = run(conclusion="failure", minutes_ago=60 * 40)
+        stale["run_started_at"] = (NOW - timedelta(minutes=45)).isoformat().replace("+00:00", "Z")
+        findings = select([stale], branch="main", frozen=False)
+        assert [f["id"] for f in findings] == [1], "the attempt began inside the window"
+
+    def test_created_at_alone_would_have_dropped_it(self):
+        """Same run, proving the old bound is what excluded it."""
+        stale = run(conclusion="failure", minutes_ago=60 * 40)
+        assert health.parse_time(stale["created_at"]) < CUTOFF
+        assert select([stale], branch="main", frozen=False) == []
+
+    def test_falls_back_to_created_at_when_the_attempt_start_is_absent(self):
+        """The freeze-run listing is trimmed to the fields it needs."""
+        assert len(select([run(conclusion="failure", minutes_ago=45)], branch="main", frozen=False)) == 1
+
+    def test_newest_is_decided_by_attempt_start_too(self):
+        old_rerun = run(run_id=1, conclusion="failure", minutes_ago=90)
+        old_rerun["run_started_at"] = (NOW - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        fresh = run(run_id=2, conclusion="success", minutes_ago=40)
+        assert [r["id"] for r in health.newest_conclusive_per_workflow([old_rerun, fresh])] == [1]
+
+
+class TestScope:
+    def test_reports_every_workflow_by_default(self):
+        runs = [run(path="a.yml", run_id=1), run(path="b.yml", run_id=2)]
+        assert len(select(runs, branch="main", frozen=False)) == 2
+
+    def test_an_allowlist_narrows_it(self):
+        runs = [run(path="a.yml", run_id=1), run(path="b.yml", run_id=2)]
+        findings = health.select_red(
+            runs, branch="main", cutoff=CUTOFF, settled=SETTLED, frozen=False,
+            staging_branch="staging", only=["a.yml"],
+        )
+        assert [f["path"] for f in findings] == ["a.yml"]
+
+    def test_the_sweep_never_reports_itself(self):
+        """A watchdog whose own run went red would otherwise alert on itself."""
+        runs = [run(path=".github/workflows/pipeline-watchdog.yml", run_id=1)]
+        findings = health.select_red(
+            runs, branch="main", cutoff=CUTOFF, settled=SETTLED, frozen=False,
+            staging_branch="staging", exclude=[".github/workflows/pipeline-watchdog.yml"],
+        )
+        assert findings == []
+
+    def test_exclusion_wins_over_an_allowlist(self):
+        path = ".github/workflows/pipeline-watchdog.yml"
+        findings = health.select_red(
+            [run(path=path)], branch="main", cutoff=CUTOFF, settled=SETTLED, frozen=False,
+            staging_branch="staging", only=[path], exclude=[path],
+        )
+        assert findings == []
+
+
+class TestUnreadableBranchIsNotAnAllClear:
+    def test_a_branch_whose_history_fails_is_reported_as_unreadable(self, tmp_path, monkeypatch):
+        """The summary used to print "No deploy branch is sitting red" here."""
+        out = tmp_path / "gh-output"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+        runner = lambda argv: completed(stderr="HTTP 403", returncode=1)
+        code = health.main(
+            ["--repo", "o/r", "--branches", "main", "--out", str(tmp_path / "red.json")],
+            runner=runner,
+            now=NOW,
+        )
+        assert code == 0, "a watchdog must not redden the repo over a transient API error"
+        written = dict(line.split("=", 1) for line in out.read_text().strip().splitlines())
+        assert written["count"] == "0"
+        assert written["unreadable"] == "main"
+
+    def test_a_readable_branch_reports_no_unreadable(self, tmp_path, monkeypatch):
+        out = tmp_path / "gh-output"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+        runner = lambda argv: completed(json.dumps({"workflow_runs": []}))
+        health.main(
+            ["--repo", "o/r", "--branches", "main", "--out", str(tmp_path / "red.json")],
+            runner=runner,
+            now=NOW,
+        )
+        written = dict(line.split("=", 1) for line in out.read_text().strip().splitlines())
+        assert written["unreadable"] == ""
 
 
 class TestFindingShape:

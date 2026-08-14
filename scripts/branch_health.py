@@ -70,8 +70,14 @@ from typing import Callable, Iterable, Sequence
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 # Conclusions that say something about the branch. `cancelled` and `skipped` are
-# evidence of nothing, and `startup_failure` belongs to the other sweep.
-CONCLUSIVE = ("success", "failure", "timed_out")
+# evidence of nothing, so they may not hide a failure behind them.
+#
+# `startup_failure` is CONCLUSIVE but not RED, and the asymmetry is deliberate.
+# It belongs to the other sweep, so this one never reports it — but it is still the
+# newest thing that happened, so it has to be able to supersede an older failure.
+# Leaving it out of CONCLUSIVE entirely made the sweep reach past it and report a
+# failure that a later run had already replaced, giving two alerts for one branch.
+CONCLUSIVE = ("success", "failure", "timed_out", "startup_failure")
 RED = ("failure", "timed_out")
 
 # The freeze workflow's per-repo wrapper keeps this name verbatim, because the
@@ -89,6 +95,23 @@ def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def started_at(run: dict) -> datetime:
+    """When the run's CURRENT attempt began.
+
+    Not ``created_at``, which stays pinned to attempt 1 forever. A re-run hours
+    later keeps the original ``created_at``, so an age window measured from it
+    filters out the attempt that just failed — measured against live runs, a
+    cowork-server attempt 2 had ``created_at`` 22:26:37 and ``run_started_at``
+    23:47:11, already 80 minutes outside a 90-minute lookback before it started.
+    Since a re-run is the most common way a failure gets fixed (and re-broken),
+    that was the case this sweep most needed to see.
+
+    ``created_at`` is the fallback because the freeze-run listing this module also
+    parses is trimmed to the fields it needs.
+    """
+    return parse_time(run.get("run_started_at") or run["created_at"])
+
+
 def newest_conclusive_per_workflow(runs: Iterable[dict]) -> list[dict]:
     """One run per workflow file: the most recent that concluded either way.
 
@@ -101,7 +124,7 @@ def newest_conclusive_per_workflow(runs: Iterable[dict]) -> list[dict]:
             continue
         path = run.get("path") or run.get("name") or ""
         current = newest.get(path)
-        if current is None or parse_time(run["created_at"]) > parse_time(current["created_at"]):
+        if current is None or started_at(run) > started_at(current):
             newest[path] = run
     return sorted(newest.values(), key=lambda run: run["path"])
 
@@ -121,6 +144,24 @@ def freeze_opened_within(freeze_runs: Iterable[dict], *, cutoff: datetime) -> bo
     return False
 
 
+def in_scope(path: str, *, only: Sequence[str], exclude: Sequence[str]) -> bool:
+    """Whether this workflow file is one the sweep speaks about.
+
+    ``only`` empty means every workflow on the branch, which is the default and is
+    the widest this gets. It is worth knowing how wide that is: the sweep reads run
+    history, not the notify wiring, so it reports any red workflow on a deploy
+    branch and not only the pipelines that opted into an in-run alert. A repo that
+    wants it narrowed passes `workflows:` with the paths that matter.
+
+    ``exclude`` always carries the sweep's own workflow. A watchdog whose own run
+    went red would otherwise report itself on the next tick, which reads as a
+    pipeline failure and is really just the watchdog.
+    """
+    if path in exclude:
+        return False
+    return not only or path in only
+
+
 def select_red(
     runs: list[dict],
     *,
@@ -130,6 +171,8 @@ def select_red(
     frozen: bool,
     staging_branch: str,
     freeze_runs: Iterable[dict] = (),
+    only: Sequence[str] = (),
+    exclude: Sequence[str] = (),
 ) -> list[dict]:
     """The red pipelines on this branch that are worth a message right now.
 
@@ -146,8 +189,10 @@ def select_red(
     for run in newest_conclusive_per_workflow(runs):
         if run["conclusion"] not in RED:
             continue
-        created = parse_time(run["created_at"])
-        if not just_froze and not (cutoff <= created <= settled):
+        if not in_scope(run["path"], only=only, exclude=exclude):
+            continue
+        began = started_at(run)
+        if not just_froze and not (cutoff <= began <= settled):
             continue
         findings.append(
             {
@@ -213,6 +258,16 @@ def main(argv: list[str] | None = None, *, runner: Runner = _run, now: datetime 
     parser.add_argument(
         "--frozen", default="false", help="freeze state of the staging branch, from freeze_state.py"
     )
+    parser.add_argument(
+        "--workflows",
+        default="",
+        help="space-separated workflow paths to report on; empty means every workflow on the branch",
+    )
+    parser.add_argument(
+        "--self-path",
+        default="",
+        help="this sweep's own workflow path, never reported (a watchdog that went red reports itself otherwise)",
+    )
     parser.add_argument("--out", default="red-branches.json")
     args = parser.parse_args(argv)
 
@@ -222,6 +277,8 @@ def main(argv: list[str] | None = None, *, runner: Runner = _run, now: datetime 
     frozen = args.frozen == "true"
 
     branches = args.branches.split()
+    only = args.workflows.split()
+    exclude = [args.self_path] if args.self_path else []
     freeze_runs: list[dict] = []
     if frozen and args.staging_branch in branches:
         try:
@@ -230,6 +287,7 @@ def main(argv: list[str] | None = None, *, runner: Runner = _run, now: datetime 
             print(f"::warning::Could not read freeze workflow history: {exc}")
 
     findings: list[dict] = []
+    unreadable: list[str] = []
     for branch in branches:
         try:
             runs = fetch_runs(args.repo, branch, runner=runner)
@@ -237,7 +295,12 @@ def main(argv: list[str] | None = None, *, runner: Runner = _run, now: datetime 
             # Loud in the summary, quiet in the exit code. A watchdog that
             # reddens the repo when the API is briefly unhappy gets muted, and a
             # muted watchdog is worse than no watchdog.
+            #
+            # Recorded rather than only logged, because the step summary used to
+            # print "No deploy branch is sitting red" on this path — an affirmative
+            # all-clear for a branch the sweep knows nothing about.
             print(f"::warning::Could not read run history for {branch}: {exc}")
+            unreadable.append(branch)
             continue
         findings.extend(
             select_red(
@@ -248,6 +311,8 @@ def main(argv: list[str] | None = None, *, runner: Runner = _run, now: datetime 
                 frozen=frozen,
                 staging_branch=args.staging_branch,
                 freeze_runs=freeze_runs,
+                only=only,
+                exclude=exclude,
             )
         )
 
@@ -258,7 +323,8 @@ def main(argv: list[str] | None = None, *, runner: Runner = _run, now: datetime 
     if output:
         with open(output, "a", encoding="utf-8") as handle:
             handle.write(f"count={len(findings)}\n")
-    print(f"count={len(findings)}", file=sys.stderr)
+            handle.write(f"unreadable={' '.join(unreadable)}\n")
+    print(f"count={len(findings)} unreadable={' '.join(unreadable) or 'none'}", file=sys.stderr)
     return 0
 
 
