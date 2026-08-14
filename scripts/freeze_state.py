@@ -107,9 +107,21 @@ def set_enforcement(
     # PUTting that summary back would drop them.
     detail = runner(["gh", "api", f"repos/{repo}/rulesets/{ruleset_id}"])
     if detail.returncode != 0:
-        raise LookupError_(f"Could not read ruleset {ruleset_id}: {detail.stderr.strip()}")
+        # Both streams, because `gh` reports an API error body on stdout while
+        # writing its own diagnostics to stderr, and a release-train-stopping
+        # error with no cause in it is the worst kind to be paged about.
+        raise LookupError_(
+            f"Could not read ruleset {ruleset_id}: "
+            f"{detail.stderr.strip() or detail.stdout.strip()}"
+        )
 
-    full = json.loads(detail.stdout)
+    try:
+        full = json.loads(detail.stdout)
+    except json.JSONDecodeError as exc:
+        # Guarded for the same reason the listing above is: an unparseable body
+        # has to arrive as the "provisioning has drifted" annotation `main()`
+        # prints, not as a traceback the operator has to read past.
+        raise LookupError_(f"Ruleset {ruleset_id} was not JSON: {exc}") from exc
     payload = {
         "name": full["name"],
         "target": full["target"],
@@ -125,7 +137,10 @@ def set_enforcement(
         ["gh", "api", "--method", "PUT", f"repos/{repo}/rulesets/{ruleset_id}", "--input", body_path]
     )
     if put.returncode != 0:
-        raise LookupError_(f"Could not update ruleset {ruleset_id}: {put.stderr.strip()}")
+        raise LookupError_(
+            f"Could not update ruleset {ruleset_id}: "
+            f"{put.stderr.strip() or put.stdout.strip()}"
+        )
     return ruleset_id
 
 
@@ -162,7 +177,11 @@ def main(argv: list[str] | None = None, *, runner: Runner = _run) -> int:
             frozen = is_frozen(args.repo, args.ruleset_name, runner=runner)
         except LookupError_ as exc:
             if args.on_error == "fail":
-                print(f"::error::{exc}", file=sys.stderr)
+                # No ::error:: annotation: every caller of this mode catches the
+                # non-zero exit and degrades deliberately (release-pr.yml leaves
+                # the PR a draft), so annotating would mark a run red that the
+                # workflow treats as handled. The caller emits its own ::warning::.
+                print(f"Could not establish the freeze state: {exc}", file=sys.stderr)
                 return 1
             # Escalating is the safe direction: treating an unknown state as
             # frozen costs one unnecessary alert, treating it as thawed costs

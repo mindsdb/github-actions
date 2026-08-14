@@ -149,6 +149,31 @@ class TestSetMode:
                 "o/r", "staging-freeze", "active", body_path=str(tmp_path / "b.json"), runner=runner
             )
 
+    def test_a_non_json_detail_body_is_a_lookup_error_not_a_traceback(self, tmp_path):
+        """The one unguarded parse in the module. An operator paged by a stopped
+        release train reads `main()`'s "provisioning has drifted" annotation, not a
+        JSONDecodeError stack."""
+        runner = fake_runner([completed(RULESET_LIST), completed("<html>502</html>")])
+        with pytest.raises(freeze_state.LookupError_, match="was not JSON"):
+            freeze_state.set_enforcement(
+                "o/r", "staging-freeze", "active", body_path=str(tmp_path / "b.json"), runner=runner
+            )
+
+    def test_an_error_body_on_stdout_still_reaches_the_message(self, tmp_path):
+        """`gh` puts the API's error body on stdout and its own noise on stderr, so
+        taking stderr alone can print an error with no cause in it."""
+        runner = fake_runner(
+            [
+                completed(RULESET_LIST),
+                completed(RULESET_DETAIL),
+                completed(stdout='{"message":"Resource not accessible by integration"}', returncode=1),
+            ]
+        )
+        with pytest.raises(freeze_state.LookupError_, match="not accessible by integration"):
+            freeze_state.set_enforcement(
+                "o/r", "staging-freeze", "active", body_path=str(tmp_path / "b.json"), runner=runner
+            )
+
     def test_missing_ruleset_fails_the_job(self, tmp_path):
         """Never escalate here: a freeze that did not apply must stop the train."""
         code = freeze_state.main(
