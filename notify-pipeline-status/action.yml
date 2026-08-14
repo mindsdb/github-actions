@@ -28,6 +28,16 @@
 # read `secrets`. The App token is minted by the caller rather than here, because
 # `continue-on-error` is not available to composite steps and a failure to mint
 # must degrade to "assume frozen" rather than fail the job.
+#
+# WHETHER it posts and HOW it reads live in `scripts/notify_decision.py`, not in
+# this file's `if:` expressions. Five inputs and three outcomes is more than a
+# YAML condition can carry readably, and none of it was reachable by a test while
+# it lived here — which is how the `workflow_dispatch` defect below survived
+# review. `force-post` is now an explicit input rather than something inferred
+# from `github.event_name`: a called workflow inherits the CALLER's context, so
+# an event check here cannot tell "the notify workflow was dispatched as a smoke
+# test" from "somebody manually ran a release-train wrapper", and all four of
+# those wrappers declare `workflow_dispatch`.
 
 name: Notify pipeline status
 description: Post a pipeline failure or recovery to the engineering Slack channel, scoped to the release-freeze window.
@@ -56,6 +66,14 @@ inputs:
     description: "Token for the prior-run lookup behind the recovery message. Needs actions:read."
     required: false
     default: ""
+  force-post:
+    description: "'true' to post a recovery with no prior failure to recover from. The smoke test, and nothing else: a release-train wrapper must leave this alone or every manual run reports a recovery that did not happen."
+    required: false
+    default: "false"
+  branch:
+    description: "Branch to name in the message. Defaults to the running ref, which is wrong for a `workflow_run` caller, where GITHUB_REF is the default branch rather than the branch whose pipeline finished."
+    required: false
+    default: ${{ github.ref_name }}
   shared-path:
     description: "Where mindsdb/github-actions is checked out, for scripts/freeze_state.py"
     required: false
@@ -105,20 +123,23 @@ runs:
         python3 "${SHARED}/scripts/freeze_state.py" read \
           --repo "${REPO}" --ruleset-name "${RULESET_NAME}" --on-error escalate
 
-    # For the recovery message, only continue if the PREVIOUS conclusive run of
-    # this same workflow on this same branch failed. A manual dispatch skips the
-    # check and always posts, which is the smoke test.
+    # For the recovery message, find out how the PREVIOUS conclusive run of this
+    # same workflow on this same branch ended. This step only gathers evidence;
+    # `notify_decision.py` below decides what it means.
     #
-    # The discriminator is the dispatch event, not `workflow_call`: a called
-    # workflow inherits the CALLER's `github` context, so `event_name` here is the
-    # caller's trigger (`push`, `workflow_run`, ...) and never `workflow_call`.
+    # Skipped when nothing it could find would change the outcome: a failure posts
+    # regardless, `force-post` posts regardless, and a freeze-scoped caller outside
+    # the window posts nothing either way. `steps.freeze.outputs.frozen` is empty
+    # when the freeze step did not run, which is not 'false', so an unscoped caller
+    # still reaches this.
     #
-    # Skipped outright when the freeze veto already decided nothing posts:
-    # `steps.freeze.outputs.frozen` is empty when the step did not run, which is
-    # not 'false', so an unscoped caller still reaches this.
-    - name: Check whether the previous run was failing
+    # BRANCH is deliberately the running ref rather than `inputs.branch`. For a
+    # `workflow_run` caller those differ: the run is attributed to the default
+    # branch, so that is where its own history lives, while the message wants the
+    # branch whose pipeline finished.
+    - name: Check how the previous run ended
       id: prev
-      if: inputs.status == 'recovered' && github.event_name != 'workflow_dispatch' && steps.freeze.outputs.frozen != 'false'
+      if: inputs.status == 'recovered' && inputs.force-post != 'true' && steps.freeze.outputs.frozen != 'false'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -140,18 +161,9 @@ runs:
           PREV_ATTEMPT=$((RUN_ATTEMPT - 1))
           if LAST=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${PREV_ATTEMPT}" \
                       --jq '.conclusion // ""' 2>&1); then
-            case "${LAST}" in
-              failure|timed_out|startup_failure)
-                echo "should_post=true" >> "$GITHUB_OUTPUT"
-                echo "Attempt ${PREV_ATTEMPT} concluded '${LAST}', this attempt recovered it."
-                exit 0
-                ;;
-              *)
-                echo "should_post=false" >> "$GITHUB_OUTPUT"
-                echo "Attempt ${PREV_ATTEMPT} concluded '${LAST:-unknown}', not a recovery."
-                exit 0
-                ;;
-            esac
+            echo "prev_conclusion=${LAST}" >> "$GITHUB_OUTPUT"
+            echo "Attempt ${PREV_ATTEMPT} concluded '${LAST:-unknown}'."
+            exit 0
           fi
           echo "Could not read attempt ${PREV_ATTEMPT}, falling back to run history: ${LAST}"
         fi
@@ -171,75 +183,50 @@ runs:
                   | select(.conclusion == "success" or .conclusion == "failure"
                            or .conclusion == "timed_out" or .conclusion == "startup_failure")
                 ][0].conclusion // ""' 2>&1); then
-          # Almost always a missing `actions: read` grant on the caller job. Stay
-          # quiet rather than fail: a notify step must never redden a green run.
-          echo "Could not read run history, staying quiet: ${PREV}"
-          echo "should_post=false" >> "$GITHUB_OUTPUT"
+          # Almost always a missing `actions: read` grant on the caller job. Report
+          # no evidence rather than failing: an unreadable history has to read as
+          # "not a recovery", because a notify step must never redden a green run.
+          echo "Could not read run history, so there is no evidence either way: ${PREV}"
           exit 0
         fi
 
-        case "${PREV}" in
-          success|"")
-            echo "should_post=false" >> "$GITHUB_OUTPUT"
-            echo "Previous run concluded '${PREV:-none}', not a recovery, staying quiet."
-            ;;
-          *)
-            echo "should_post=true" >> "$GITHUB_OUTPUT"
-            echo "Previous run concluded '${PREV}', posting recovery."
-            ;;
-        esac
+        echo "prev_conclusion=${PREV}" >> "$GITHUB_OUTPUT"
+        echo "Previous conclusive run on ${BRANCH} concluded '${PREV:-none}'."
 
-    # Collapse the outcomes into flat strings. Deciding this in shell keeps the
-    # Slack payload from growing a nested ternary per field, which is where this
-    # kind of template stops being reviewable.
-    - name: Compose message
+    # One decision, one place, with tests. See scripts/notify_decision.py for the
+    # three outcomes and why `force-post` is an input rather than an event check.
+    - name: Decide whether to post, and how it reads
       id: msg
       shell: bash
       env:
+        SHARED: ${{ inputs.shared-path }}
         STATUS: ${{ inputs.status }}
         FREEZE_SCOPED: ${{ inputs.freeze-scoped }}
         FROZEN: ${{ steps.freeze.outputs.frozen }}
+        FORCE_POST: ${{ inputs.force-post }}
+        PREV_CONCLUSION: ${{ steps.prev.outputs.prev_conclusion }}
       run: |
         set -euo pipefail
-        POST=true
-        if [ "${FREEZE_SCOPED}" = "true" ] && [ "${FROZEN}" = "false" ]; then
-          # Outside the window: no red, no green, no grey. Both halves of the
-          # story are irrelevant to the release, and half a story is noise.
-          POST=false
-          LEVEL=silenced; COLOR=''; ICON=''; VERB=''; PREFIX=''
-        elif [ "${STATUS}" = "recovered" ]; then
-          LEVEL=recovered; COLOR='#00C851'; ICON=':white_check_mark:'; VERB=recovered
-          PREFIX=Recovered
-        else
-          LEVEL=alert; COLOR='#FF4444'; ICON=':rotating_light:'; VERB=failed
-          PREFIX=FAILED
-        fi
-        {
-          echo "post=${POST}"
-          echo "level=${LEVEL}"
-          echo "color=${COLOR}"
-          echo "icon=${ICON}"
-          echo "verb=${VERB}"
-          echo "prefix=${PREFIX}"
-        } >> "$GITHUB_OUTPUT"
-        echo "level=${LEVEL} post=${POST}"
+        python3 "${SHARED}/scripts/notify_decision.py" \
+          --status "${STATUS}" \
+          --freeze-scoped "${FREEZE_SCOPED}" \
+          --frozen "${FROZEN}" \
+          --force-post "${FORCE_POST}" \
+          --prev-conclusion "${PREV_CONCLUSION}"
 
     - name: Notify Slack
-      # Failure mode always posts; on a real pipeline, recovery posts only after a
-      # failing run; a manual dispatch always posts (smoke test).
-      #
-      # The payload carries a top-level `text` as well as the blocks. Slack
-      # renders the blocks, but `text` is what a push notification, a screen
-      # reader, and a notification-list preview show, so without it the alert
-      # arrives on a phone as an empty message — the one context where a pipeline
-      # failure most needs to be readable.
-      if: steps.msg.outputs.post == 'true' && (inputs.status != 'recovered' || github.event_name == 'workflow_dispatch' || steps.prev.outputs.should_post == 'true')
+      # The payload carries a top-level `text` as well as the blocks. Slack renders
+      # the blocks, but `text` is what a push notification, a screen reader, and a
+      # notification-list preview show, so without it the alert arrives on a phone
+      # as an empty message — the one context where a pipeline failure most needs
+      # to be readable.
+      if: steps.msg.outputs.post == 'true'
       uses: slackapi/slack-github-action@v1.26.0
       with:
         channel-id: ${{ inputs.slack-channel-id }}
         payload: |
           {
-            "text": "${{ steps.msg.outputs.prefix }}: ${{ github.event.repository.name }} ${{ inputs.env-name }} pipeline on ${{ github.ref_name }}",
+            "text": "${{ steps.msg.outputs.prefix }}: ${{ github.event.repository.name }} ${{ inputs.env-name }} pipeline on ${{ inputs.branch }}",
             "attachments": [
               {
                 "color": "${{ steps.msg.outputs.color }}",
@@ -248,7 +235,7 @@ runs:
                     "type": "section",
                     "text": {
                       "type": "mrkdwn",
-                      "text": "${{ steps.msg.outputs.icon }} *<${{ github.server_url }}/${{ github.repository }}|${{ github.event.repository.name }}>* — *${{ inputs.env-name }}* pipeline ${{ steps.msg.outputs.verb }} on `${{ github.ref_name }}`"
+                      "text": "${{ steps.msg.outputs.icon }} *<${{ github.server_url }}/${{ github.repository }}|${{ github.event.repository.name }}>* — *${{ inputs.env-name }}* pipeline ${{ steps.msg.outputs.verb }} on `${{ inputs.branch }}`"
                     },
                     "fields": [
                       {
@@ -265,7 +252,7 @@ runs:
                       },
                       {
                         "type": "mrkdwn",
-                        "text": "*Branch*\n<${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}|${{ github.ref_name }}>"
+                        "text": "*Branch*\n<${{ github.server_url }}/${{ github.repository }}/tree/${{ inputs.branch }}|${{ inputs.branch }}>"
                       }
                     ]
                   }
