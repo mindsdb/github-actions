@@ -28,6 +28,11 @@
 #
 # Called by a per-repo wrapper, e.g.
 #   auth/.github/workflows/sync-main-to-staging.yml
+# The wrapper carries NO notify job: this workflow ends with one. The wrappers
+# used to own it, written `if: failure()`, which meant a sync could report that
+# it broke and never that it was fixed. On 2026-08-14 cowork's sync failed and
+# alerted, the re-run succeeded, and the notify job was SKIPPED, leaving the
+# channel holding a red alert for a sync that had already recovered.
 #
 # Requires: vars.RELEASE_APP_CLIENT_ID + secrets.RELEASE_APP_PRIVATE_KEY
 # (org-provisioned; secret reaches here via `secrets: inherit`).
@@ -52,6 +57,12 @@ on:
 
 permissions:
   contents: read
+  # NOT `actions: read`, deliberately, even though the notify step's recovery
+  # lookup wants it. Declaring it here would make every caller that has not yet
+  # granted it fail to LOAD rather than merely degrade, and these wrappers reach
+  # a repo's default branch only at the next weekly release, so the two can never
+  # be merged in step. Without the grant the lookup is refused, logs why, and
+  # stays quiet; a caller that adds `actions: read` turns recovery messages on.
 
 jobs:
   sync:
@@ -68,6 +79,16 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
+
+      # After the checkout above, which would otherwise clean this back out of
+      # the workspace.
+      - name: Check out the shared alert implementation
+        uses: actions/checkout@v5
+        with:
+          repository: mindsdb/github-actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-shared
+          persist-credentials: false
 
       - name: Sync base branch into staging
         env:
@@ -116,3 +137,13 @@ jobs:
 
           echo "::error::Could not fast-forward ${STAGING} after 2 attempts. ${STAGING} is moving faster than this workflow can merge, or the App lost its bypass on ${STAGING}."
           exit 1
+
+      - name: Notify the engineering channel
+        if: ${{ always() && job.status != 'cancelled' }}
+        uses: ./.ci-shared/notify-pipeline-status
+        with:
+          env-name: "main -> staging sync"
+          status: ${{ job.status == 'failure' && 'failed' || 'recovered' }}
+          github-token: ${{ github.token }}
+          slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

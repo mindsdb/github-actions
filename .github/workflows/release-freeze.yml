@@ -40,6 +40,12 @@ on:
 
 permissions:
   contents: read
+  # NOT `actions: read`, deliberately, even though the notify step's recovery
+  # lookup wants it. Declaring it here would make every caller that has not yet
+  # granted it fail to LOAD rather than merely degrade, and these wrappers reach
+  # a repo's default branch only at the next weekly release, so the two can never
+  # be merged in step. Without the grant the lookup is refused, logs why, and
+  # stays quiet; a caller that adds `actions: read` turns recovery messages on.
 
 jobs:
   freeze-staging:
@@ -61,6 +67,18 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      # The ruleset read-modify-write lives in `scripts/freeze_state.py`, which is
+      # also what the alerting workflows use to READ the freeze state. One file
+      # owns the contract, so a repo that renames its ruleset cannot end up frozen
+      # by one name and alerted on another.
+      - name: Check out the shared release-freeze contract
+        uses: actions/checkout@v5
+        with:
+          repository: mindsdb/github-actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-shared
           persist-credentials: false
 
       - name: Check for unreleased changes
@@ -98,23 +116,31 @@ jobs:
           ENFORCEMENT: active
         run: |
           set -euo pipefail
-          RID=$(gh api "repos/${REPO}/rulesets" \
-            --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id")
-          if [ -z "$RID" ]; then
-            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO} — provisioning has drifted."
-            exit 1
-          fi
-          # GET the full ruleset, flip only `enforcement`, PUT the whole body back.
-          # A partial PUT is not guaranteed to preserve omitted fields. The body is
-          # written to a temp file (never echoed) so ruleset internals don't leak
-          # into logs — three of these repos are public.
-          BODY="${RUNNER_TEMP}/ruleset-${RID}.json"
-          gh api "repos/${REPO}/rulesets/${RID}" \
-            --jq "{name, target, enforcement: \"${ENFORCEMENT}\", bypass_actors, conditions, rules}" > "$BODY"
-          gh api --method PUT "repos/${REPO}/rulesets/${RID}" --input "$BODY" > /dev/null
-          echo "Ruleset '${RULESET_NAME}' (#${RID}) enforcement set to ${ENFORCEMENT} — ${STAGING} is FROZEN."
+          # Fails loudly on purpose, unlike the alerting path's read: a freeze
+          # that could not be applied has to stop the release train rather than
+          # let the window appear to open.
+          python3 .ci-shared/scripts/freeze_state.py set \
+            --repo "${REPO}" \
+            --ruleset-name "${RULESET_NAME}" \
+            --enforcement "${ENFORCEMENT}" \
+            --body-path "${RUNNER_TEMP}/ruleset.json"
+          echo "${STAGING} is FROZEN."
           {
             echo "## Staging branch FROZEN"
             echo ""
             echo "The \`${STAGING}\` branch is **frozen** via ruleset \`${RULESET_NAME}\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The alert lives here rather than in each repo's wrapper, which is what
+      # made every wrapper `if: failure()` and therefore incapable of ever saying
+      # a failure had been FIXED. Ending the job with this step covers both
+      # directions in one place for all seven consumers.
+      - name: Notify the engineering channel
+        if: ${{ always() && job.status != 'cancelled' }}
+        uses: ./.ci-shared/notify-pipeline-status
+        with:
+          env-name: "staging freeze"
+          status: ${{ job.status == 'failure' && 'failed' || 'recovered' }}
+          github-token: ${{ github.token }}
+          slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

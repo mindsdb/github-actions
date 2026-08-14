@@ -6,3 +6,14 @@ self-hosted-runner:
   labels:
     - mdb-dev
     - mdb-prod
+
+# actionlint's model of the `github` context predates `job_workflow_sha`, which
+# is real and documented: "for jobs using a reusable workflow, the commit SHA for
+# the reusable workflow file". The reusables here use it to check their own
+# scripts out at their own commit, which is what makes a consumer's `@<sha>` pin
+# mean anything — pinning the workflow while its scripts float on `main` is not a
+# pin. The ignore is scoped to that one property name so nothing else is muted.
+paths:
+  .github/workflows/**.yml:
+    ignore:
+      - 'property "job_workflow_sha" is not defined'

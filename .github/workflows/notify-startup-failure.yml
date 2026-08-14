@@ -1,5 +1,23 @@
-# Reusable workflow: alert the engineering channel when a pipeline on a
-# protected branch concluded WITHOUT EVER STARTING.
+# Reusable workflow: watch the deploy branches from OUTSIDE their pipelines.
+#
+# Two sweeps, both on the caller's schedule, both reporting things the pipeline's
+# own terminal notify job structurally cannot:
+#
+#   startup-failures  a run concluded without ever starting, so there was no job
+#                     to put an alert in.
+#   red-branches      the newest run of a pipeline is red and nobody is being
+#                     told: because the alert was deliberately silenced, because
+#                     it was sent once and missed, or because the re-run did not
+#                     re-notify.
+#
+# They are separate jobs with separate messages because they are separate
+# findings with separate fixes, and one incident producing two alerts is how an
+# alert channel gets muted. `startup_failure` is reported only by the first, and
+# excluded from the second.
+#
+# ---
+#
+# SWEEP 1 — a pipeline that concluded WITHOUT EVER STARTING.
 #
 # Why this exists as a separate mechanism from notify-main-failure.yml, rather
 # than another mode of it.
@@ -65,8 +83,49 @@
 # repository's DEFAULT branch. A watchdog caller merged to `staging` and no
 # further is inert. `workflow_dispatch` is there so it can be proven before it
 # reaches `main`.
+#
+# ---
+#
+# SWEEP 2 — a deploy branch that is STILL red.
+#
+# The in-run notify job reports a failure once, at the moment it happens. Three
+# cases that leaves uncovered, all of which have happened:
+#
+#   1. Nobody was going to be told. A staging failure outside the release-freeze
+#      window is deliberately silent (see notify-main-failure.yml). The branch is
+#      still red when Friday's freeze turns it into the release candidate, and at
+#      that moment nothing says so.
+#   2. It was reported once and stayed broken. One message is easy to miss and
+#      there is no second one.
+#   3. The re-run did not re-notify. "Re-run failed jobs" re-runs the failed job
+#      and everything downstream, so the terminal notify job fires again. The
+#      per-job "Re-run this job" button re-runs that job alone, so a run can go
+#      red to green with notify never running twice. No hook fixes that from
+#      inside the run.
+#
+# It is a BACKSTOP, not an echo. A finding must be at least `min-age-minutes`
+# old, which turns the message from "this failed" (which the pipeline already
+# said) into "this is still failing and nobody has touched it". The exception is
+# the freeze window opening, where the finding is old by definition and the news
+# is the window.
+#
+# On `staging` it only speaks while the freeze is on, and the window OPENING is
+# itself a trigger, so a branch that broke on Tuesday is reported on Friday. That
+# is keyed on a successful run of the "Staging Freeze" workflow rather than on a
+# clock, so moving the freeze moves the alerting with it and neither has to know
+# about the other. The freeze runs are read through the workflow's own runs
+# endpoint, because a `schedule` trigger is attributed to the DEFAULT branch and
+# they are not in a `staging` listing at all.
+#
+# Selection logic lives in `scripts/branch_health.py` with unit tests, because it
+# is date arithmetic plus a two-way trigger and that is not something to hold in
+# a jq expression.
 
-name: Notify pipeline startup failure
+# The FILE NAME stays `notify-startup-failure.yml` even though it now carries
+# both sweeps: every caller references it by path, so renaming it would break
+# seven repos at once for a cosmetic gain.
+
+name: Notify deploy-branch health
 
 on:
   workflow_call:
@@ -76,19 +135,55 @@ on:
         type: string
         default: "main staging"
       lookback-minutes:
-        description: "Only alert on a startup failure that began this recently"
+        description: "Only alert on a finding that began this recently"
         type: number
         default: 90
-      runs-on:
-        description: "Runner label for the sweep job"
+      red-branch-sweep:
+        description: "Also report a deploy branch whose newest pipeline run is still red"
+        type: boolean
+        default: true
+      min-age-minutes:
+        description: "How long a failure must have stood before the red-branch sweep repeats it, so the sweep is a backstop rather than an echo of the alert the pipeline already sent"
+        type: number
+        default: 30
+      staging-branch:
+        description: "Which of `branches` is the release candidate, and so is only reported while the freeze window is open"
         type: string
-        default: mdb-dev
+        default: staging
+      ruleset-name:
+        description: "The freeze ruleset to read. Must match what the repo's release-freeze caller sets."
+        type: string
+        default: staging-freeze
+      runs-on:
+        description: "Runner label for the sweep jobs"
+        type: string
+        # GitHub-hosted on purpose. These sweeps read the API and post to Slack;
+        # they need no cluster, no cloud and no self-hosted anything, and a
+        # watchdog that runs on the self-hosted fleet cannot report that the
+        # self-hosted fleet is down.
+        default: ubuntu-latest
   workflow_dispatch:
     inputs:
       branches:
         description: "Space-separated branches to sweep"
         type: string
         default: "main staging"
+      red-branch-sweep:
+        description: "Also report a deploy branch whose newest pipeline run is still red"
+        type: boolean
+        default: true
+      min-age-minutes:
+        description: "Age floor for the red-branch sweep (set 0 to report a failure that just happened)"
+        type: number
+        default: 30
+      staging-branch:
+        description: "Which branch is the release candidate"
+        type: string
+        default: staging
+      ruleset-name:
+        description: "The freeze ruleset to read"
+        type: string
+        default: staging-freeze
       lookback-minutes:
         description: "Lookback window in minutes (widen it to replay a past incident)"
         type: number
@@ -245,6 +340,156 @@ jobs:
                     elements: [{
                       type: "mrkdwn",
                       text: "`startup_failure` with no jobs: GitHub rejected the run before scheduling anything — check the caller/callee `permissions:` relationship and the workflow YAML on that ref. <\($sweep)|Sweep run>"
+                    }]
+                  }]
+                )
+              }]
+            }' > payload.json
+
+          RESPONSE=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            --data @payload.json)
+
+          if [ "$(jq -r '.ok' <<< "$RESPONSE")" != "true" ]; then
+            echo "Slack rejected the alert: $(jq -r '.error // "unknown"' <<< "$RESPONSE")"
+            exit 1
+          fi
+          echo "Alert posted." >> "$GITHUB_STEP_SUMMARY"
+
+  # SWEEP 2 (see the header): deploy branches whose newest pipeline run is still
+  # red. Independent of the sweep above rather than a stage of it — one sweep
+  # failing must not hide the other's findings, and they report different things.
+  red-branches:
+    if: inputs.red-branch-sweep
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Check out the shared sweep and freeze contract
+        uses: actions/checkout@v5
+        with:
+          repository: mindsdb/github-actions
+          # The commit of THIS reusable, so a branch under review runs its own
+          # version rather than silently testing main's.
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-shared
+          persist-credentials: false
+
+      # Reading rulesets needs admin, which the default workflow token does not
+      # carry, so this reuses the App that owns the freeze toggle. A repo that is
+      # not on the release train has no App and no ruleset; the read escalates to
+      # frozen, which for this sweep means staging is swept like any other branch.
+      - name: Mint release-train App token
+        id: freeze-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Check release-freeze state
+        id: freeze
+        env:
+          GH_TOKEN: ${{ steps.freeze-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          RULESET_NAME: ${{ inputs.ruleset-name }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::Could not mint the release-train App token. Treating the branch as frozen so a red staging still surfaces."
+            echo "frozen=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 .ci-shared/scripts/freeze_state.py read \
+            --repo "${REPO}" --ruleset-name "${RULESET_NAME}" --on-error escalate
+
+      - name: Find deploy branches that are still red
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCHES: ${{ inputs.branches }}
+          STAGING: ${{ inputs.staging-branch }}
+          LOOKBACK: ${{ inputs.lookback-minutes }}
+          MIN_AGE: ${{ inputs.min-age-minutes }}
+          FROZEN: ${{ steps.freeze.outputs.frozen }}
+        run: |
+          set -uo pipefail
+          python3 .ci-shared/scripts/branch_health.py \
+            --repo "${REPO}" \
+            --branches "${BRANCHES}" \
+            --staging-branch "${STAGING}" \
+            --lookback-minutes "${LOOKBACK}" \
+            --min-age-minutes "${MIN_AGE}" \
+            --frozen "${FROZEN}" \
+            --out red-branches.json
+
+          COUNT=$(jq 'length' red-branches.json)
+          {
+            echo "### Red-branch sweep"
+            echo
+            echo "Branches: \`${BRANCHES}\` · window: last ${LOOKBACK} min · age floor: ${MIN_AGE} min · staging frozen: ${FROZEN:-unknown}"
+            echo
+            if [ "${COUNT}" = "0" ]; then
+              echo "No deploy branch is sitting red. Nothing to report."
+            else
+              echo "| Workflow | Branch | Commit | Conclusion | Why now | Run |"
+              echo "| --- | --- | --- | --- | --- | --- |"
+              jq -r '.[] | "| `\(.path)` | `\(.branch)` | `\(.head_sha[0:8])` | \(.conclusion) | \(.reason) | [\(.id)](\(.html_url)) |"' red-branches.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post the alert
+        if: steps.find.outputs.count != '0' && !inputs.dry-run
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+          CHANNEL: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          REPO: ${{ github.repository }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          SERVER: ${{ github.server_url }}
+          SWEEP_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          # The lead line names WHY this arrived, because the two reasons want
+          # different reactions: "still red" means the alert you already saw was
+          # not acted on, and "freeze-opened" means a branch you were right to
+          # ignore mid-week just became the release candidate.
+          jq -n \
+            --slurpfile findings red-branches.json \
+            --arg repo "$REPO" --arg repo_name "$REPO_NAME" \
+            --arg server "$SERVER" --arg channel "$CHANNEL" --arg sweep "$SWEEP_URL" '
+            ($findings[0] | any(.reason == "freeze-opened")) as $froze |
+            {
+              channel: $channel,
+              text: (if $froze
+                     then "\($repo_name) — the release freeze opened on a red branch"
+                     else "\($repo_name) — a deploy branch is still red" end),
+              attachments: [{
+                color: "#FF4444",
+                blocks: (
+                  [{
+                    type: "section",
+                    text: {
+                      type: "mrkdwn",
+                      text: (if $froze
+                             then ":snowflake: *<\($server)/\($repo)|\($repo_name)>* — the release freeze has opened and `staging` is *red*. It is the release candidate now, so this blocks the release until it is fixed."
+                             else ":rotating_light: *<\($server)/\($repo)|\($repo_name)>* — \($findings[0] | length) pipeline(s) *still failing*. The newest run is red and nobody has fixed it." end)
+                    }
+                  }]
+                  + ( $findings[0] | map({
+                      type: "section",
+                      fields: [
+                        { type: "mrkdwn", text: "*Workflow*\n<\($server)/\($repo)/actions/runs/\(.id)|\(.path)>" },
+                        { type: "mrkdwn", text: "*Branch*\n<\($server)/\($repo)/tree/\(.branch)|\(.branch)>" },
+                        { type: "mrkdwn", text: "*Commit*\n<\($server)/\($repo)/commit/\(.head_sha)|\(.head_sha[0:8])>" },
+                        { type: "mrkdwn", text: "*Last touched by*\n\(.actor)" }
+                      ]
+                    }) )
+                  + [{
+                    type: "context",
+                    elements: [{
+                      type: "mrkdwn",
+                      text: "Re-run the failed jobs, or fix forward. Note that re-running a SINGLE job does not re-fire the pipeline notify job, which is one of the reasons this sweep exists. <\($sweep)|Sweep run>"
                     }]
                   }]
                 )

@@ -3,7 +3,9 @@
 #
 # Unfreezing flips the pre-provisioned `staging-freeze` ruleset back to
 # `disabled`, reopening staging for normal development the moment the release
-# ships — no fixed Monday-morning wait.
+# ships — no fixed Monday-morning wait. It is also what turns staging's alerting
+# back off: the alert path reads the same ruleset, so an unfrozen staging stops
+# paging the channel without anything else being told.
 #
 # Order is load-bearing: unlock first, then push. If the sync-back push fails,
 # staging is left unlocked, which is the acceptable failure mode.
@@ -18,7 +20,8 @@
 #   cowork-server/.github/workflows/staging-unfreeze.yml
 # The wrapper carries the merged-release-PR guard (head.ref == staging AND
 # head.repo.full_name == the repo, to reject fork PRs). Keep the name
-# "Staging Unfreeze".
+# "Staging Unfreeze". The wrapper carries NO notify job: this workflow ends with
+# one, so a re-run that fixes a failed unfreeze reports itself.
 #
 # Requires: vars.RELEASE_APP_CLIENT_ID + secrets.RELEASE_APP_PRIVATE_KEY
 # (org-provisioned; secret reaches here via `secrets: inherit`).
@@ -43,6 +46,12 @@ on:
 
 permissions:
   contents: read
+  # NOT `actions: read`, deliberately, even though the notify step's recovery
+  # lookup wants it. Declaring it here would make every caller that has not yet
+  # granted it fail to LOAD rather than merely degrade, and these wrappers reach
+  # a repo's default branch only at the next weekly release, so the two can never
+  # be merged in step. Without the grant the lookup is refused, logs why, and
+  # stays quiet; a caller that adds `actions: read` turns recovery messages on.
 
 jobs:
   unfreeze-staging:
@@ -55,6 +64,42 @@ jobs:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
+      # This is the checkout that pushes, and it is first only so that it cannot
+      # clean the shared checkout below out of the workspace. Checking out pushes
+      # nothing, so "unlock before push" is still honoured by the step order
+      # further down.
+      #
+      # The sync step runs on a manual dispatch too, which it did not used to. The
+      # old guard was `github.event_name == 'pull_request'`, reasoned as "no PR
+      # merged, nothing to sync", and that reasoning is wrong in the one case that
+      # matters: a dispatch is what you reach for when the PR-triggered run could
+      # not run. On 2026-07-27 auth's PR-triggered unfreeze died as a
+      # `startup_failure` (an invalid caller, so zero jobs), the operator recovered
+      # with a dispatch, and it unfroze staging while silently skipping the sync —
+      # leaving main squash-merged into a `main` that `staging` did not contain,
+      # which had to be merged by hand an hour later. The escape hatch was strictly
+      # less capable than the path it exists to replace.
+      #
+      # Nothing needs the event to decide this: the sync step below already exits 0
+      # when `staging` is an ancestor of `main`, so a dispatch with genuinely
+      # nothing to sync is a logged no-op rather than a wasted push.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # The ruleset read-modify-write lives in `scripts/freeze_state.py`, which is
+      # also what the alerting workflows use to READ the freeze state. One file
+      # owns the contract, so unfreezing and "staging alerts are off again" can
+      # never disagree about which ruleset they mean.
+      - name: Check out the shared release-freeze contract
+        uses: actions/checkout@v5
+        with:
+          repository: mindsdb/github-actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .ci-shared
+          persist-credentials: false
+
       - name: Unfreeze staging (disable ruleset)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -64,48 +109,18 @@ jobs:
           ENFORCEMENT: disabled
         run: |
           set -euo pipefail
-          RID=$(gh api "repos/${REPO}/rulesets" \
-            --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id")
-          if [ -z "$RID" ]; then
-            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO} — provisioning has drifted."
-            exit 1
-          fi
-          # GET the full ruleset, flip only `enforcement`, PUT the whole body back
-          # (partial PUT is not guaranteed to preserve omitted fields). Body goes to
-          # a temp file, never echoed, so ruleset internals stay out of public logs.
-          BODY="${RUNNER_TEMP}/ruleset-${RID}.json"
-          gh api "repos/${REPO}/rulesets/${RID}" \
-            --jq "{name, target, enforcement: \"${ENFORCEMENT}\", bypass_actors, conditions, rules}" > "$BODY"
-          gh api --method PUT "repos/${REPO}/rulesets/${RID}" --input "$BODY" > /dev/null
+          python3 .ci-shared/scripts/freeze_state.py set \
+            --repo "${REPO}" \
+            --ruleset-name "${RULESET_NAME}" \
+            --enforcement "${ENFORCEMENT}" \
+            --body-path "${RUNNER_TEMP}/ruleset.json"
           PR_NUMBER='${{ github.event.pull_request.number }}'
-          echo "Ruleset '${RULESET_NAME}' (#${RID}) enforcement set to ${ENFORCEMENT} — ${STAGING} is UNFROZEN."
+          echo "${STAGING} is UNFROZEN."
           {
             echo "## Staging branch UNFROZEN"
             echo ""
             echo "The \`${STAGING}\` branch is **unfrozen** via ruleset \`${RULESET_NAME}\` (triggered by PR #${PR_NUMBER:-manual})."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # Only the sync-back checkout carries credentials — it is the one step that
-      # pushes.
-      #
-      # Runs on a manual dispatch too, which it did not used to. The old guard was
-      # `github.event_name == 'pull_request'`, reasoned as "no PR merged, nothing
-      # to sync", and that reasoning is wrong in the one case that matters: a
-      # dispatch is what you reach for when the PR-triggered run could not run.
-      # On 2026-07-27 auth's PR-triggered unfreeze died as a `startup_failure`
-      # (an invalid caller, so zero jobs), the operator recovered with a dispatch,
-      # and it unfroze staging while silently skipping the sync — leaving main
-      # squash-merged into a `main` that `staging` did not contain, which had to be
-      # merged by hand an hour later. The escape hatch was strictly less capable
-      # than the path it exists to replace.
-      #
-      # Nothing needs the event to decide this: the sync step below already exits
-      # 0 when `staging` is an ancestor of `main`, so a dispatch with genuinely
-      # nothing to sync is a logged no-op rather than a wasted push.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
 
       - name: Sync main back into staging
         env:
@@ -129,3 +144,17 @@ jobs:
           fi
           git merge --no-ff "origin/${BASE}" -m "Sync ${BASE} back into ${STAGING} after release"
           git push origin "HEAD:${STAGING}"
+
+      # The alert lives here rather than in each repo's wrapper, which is what
+      # made every wrapper `if: failure()` and therefore incapable of ever saying
+      # a failure had been FIXED. Ending the job with this step covers both
+      # directions in one place for all seven consumers.
+      - name: Notify the engineering channel
+        if: ${{ always() && job.status != 'cancelled' }}
+        uses: ./.ci-shared/notify-pipeline-status
+        with:
+          env-name: "staging unfreeze"
+          status: ${{ job.status == 'failure' && 'failed' || 'recovered' }}
+          github-token: ${{ github.token }}
+          slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
