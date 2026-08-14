@@ -1,47 +1,52 @@
 # Reusable workflow: post a Slack alert to the engineering channel when a
-# workflow that runs on push to main/staging (or the release-train
-# freeze/unfreeze cycle) FAILS, and a follow-up when it RECOVERS.
+# workflow that runs on push to main/staging FAILS, and a follow-up when it
+# RECOVERS.
+#
+# This is the shape a PIPELINE needs: a terminal JOB that `needs:` every other
+# job in the workflow, so the alert fires on a failure anywhere in the graph,
+# including a mid-graph failure that only skips its dependents rather than
+# failing them. The release-train workflows (freeze, unfreeze, sync, release-pr)
+# do not need a job, because they own a single job and can end with a step, so
+# they call the `notify-pipeline-status` composite directly. Both run the same
+# code — this file is a thin wrapper around that composite, and the alert's copy,
+# its freeze scoping and its recovery detection all live there.
 #
 # A failed merge pipeline is a silent prod-risk event: main-triggered workflows
-# cut releases and bake + deploy prod images. Callers add terminal jobs that
-# `needs:` EVERY job in the workflow, so the alert fires on a failure in any job
-# — including a mid-graph failure that only skips its dependents rather than
-# failing them.
+# cut releases and bake + deploy prod images.
 #
 # Two modes, selected by `status`:
-#   - failed:    always posts a red alert.
+#   - failed:    posts a red alert.
 #   - recovered: posts a green "recovered" message ONLY when the previous
 #     conclusive run of this workflow on this branch failed. On a normal green
-#     run (prior run already green) it no-ops, so the channel is not spammed on
-#     every merge. This is derived from the GitHub API rather than cross-run
-#     state, so it is self-healing (no cache to go stale).
+#     run it no-ops, so the channel is not spammed on every merge. Derived from
+#     the GitHub API rather than cross-run state, so it is self-healing.
 #
-# `freeze-scoped: true` scopes a STAGING caller to the release window. The policy
-# this implements:
+# `freeze-scoped: true` scopes a STAGING caller to the release window:
 #
-#   failure on main                      -> alert
-#   failure on staging, freeze OPEN      -> alert  (staging is the release candidate)
-#   failure on staging, freeze NOT open  -> nothing (ordinary integration-branch red)
+#   anything on main                      -> alert
+#   staging, freeze window OPEN           -> alert
+#   staging, freeze window NOT open       -> NOTHING, in either mode
 #
-# Mid-week staging is the integration branch, and paging the channel for it is
-# what teaches people to ignore the channel. `outside-freeze: notice` posts a
-# muted grey message instead of nothing, for a caller that wants the trail; the
-# default is silence. Either way the run is still red in the Actions tab, and
-# pipeline-watchdog.yml still covers a staging branch that stops building at all.
+# That last row means exactly what it says, and it is the fix for what this
+# workflow used to do. On 2026-08-13 cowork-server's staging publish failed on
+# the commit that FIXED a broken release candidate; the failure was correctly
+# silent, and the re-run three and a half hours later posted a green "Recovered".
+# The only thing the channel ever heard about a stalled rc stream was the good
+# news. Posting only the green half is worse than posting neither.
 #
-# Prod and freeze/unfreeze callers leave this alone: a failure there is always
-# worth interrupting for. A workflow triggered on BOTH main and staging from one
-# notify job cannot hardcode this — pass an expression instead, or a main failure
-# gets silenced too:
+# The run is still red in the Actions tab either way, and `pipeline-watchdog.yml`
+# covers both a staging branch that stops building at all and one that STAYS red
+# into the freeze window.
+#
+# Prod callers leave `freeze-scoped` alone: a failure there is always worth
+# interrupting for. A workflow triggered on BOTH main and staging from one notify
+# job cannot hardcode this — pass an expression instead, or a main failure gets
+# silenced too:
 #   freeze-scoped: ${{ github.ref_name == 'staging' }}
 #
-# It posts its own message rather than the deploy-notification composite, whose
-# copy is deploy-specific ("has failed deploying to ...") and reads wrong for
-# non-deploy pipelines (freeze, CI, docs). It uses the same Slack bot token.
-#
-# ONE caller job covers both modes: a `uses:` job cannot branch on status, so
-# the caller derives the aggregate outcome from `needs.*.result` and passes it
-# in. Cancelled runs stay silent.
+# ONE caller job covers both modes: a `uses:` job cannot branch on status, so the
+# caller derives the aggregate outcome from `needs.*.result` and passes it in.
+# Cancelled runs stay silent.
 #   auth/.github/workflows/prod-build-deploy.yml
 #     notify:
 #       needs: [linter, run-unit-tests, build-auth, scan-auth, migrate, deploy, integration-tests]
@@ -55,20 +60,16 @@
 #         status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
 #       secrets: inherit
 #
-# A failure-only caller (the freeze/unfreeze wrappers) keeps `if: failure()`,
-# takes the default `status: failed`, and needs no `permissions:` block: the
-# prior-run lookup only runs in recovered mode.
-#
 # Requires (reach this workflow via `secrets: inherit` in the caller):
 #   - secrets.SLACK_ENG_CHANNEL_ID       (the engineering channel; org secret)
 #   - secrets.GH_ACTIONS_SLACK_BOT_TOKEN (the Slack bot token; org secret)
 # The Slack bot must be a member of the channel SLACK_ENG_CHANNEL_ID resolves to.
 #
-# Recovery mode also needs `actions: read` on the CALLER's notify job. The
-# default workflow token carries contents + packages read only, and a called
-# workflow can never hold more than its caller grants, so without that block the
-# prior-run lookup is refused. It degrades to silence rather than failing, so a
-# missing grant never turns a green pipeline red.
+# Recovery mode also needs `actions: read` on the CALLER's notify job. The default
+# workflow token carries contents + packages read only, and a called workflow can
+# never hold more than its caller grants, so without that block the prior-run
+# lookup is refused. It degrades to silence rather than failing, so a missing
+# grant never turns a green pipeline red.
 
 name: Notify main-branch failure
 
@@ -84,21 +85,37 @@ on:
         type: string
         default: failed
       freeze-scoped:
-        description: "Scale a 'failed' alert by release-freeze state (see `outside-freeze`). For staging pipelines, where a failure is only release-blocking once the freeze window is open."
+        description: "Silence this caller entirely while the staging freeze window is closed. For staging pipelines, where neither a failure nor its recovery is release-relevant mid-week."
         type: boolean
         default: false
-      outside-freeze:
-        description: "What a freeze-scoped failure does while staging is NOT frozen: 'silent' (post nothing) or 'notice' (muted, no panic styling)."
+      ruleset-name:
+        description: "The freeze ruleset to read. Must match what the repo's release-freeze caller sets, or this reads a name that does not exist and escalates every staging failure forever."
         type: string
-        default: silent
+        default: staging-freeze
+      force-post:
+        description: "Post a 'recovered' message with no prior failure to recover from. Only the smoke-test dispatch sets this; a real pipeline leaves it off, or every green run reports a recovery."
+        type: boolean
+        default: false
       runs-on:
         description: "Runner label for the notify job"
         type: string
-        default: mdb-dev
+        # GitHub-hosted on purpose. This job posts a Slack message and needs no
+        # cluster, no cloud and no self-hosted anything, and an alert that runs on
+        # the self-hosted fleet cannot report that the self-hosted fleet is down —
+        # the one outage where every pipeline goes red at once is the one where
+        # this would have nothing to run on.
+        default: ubuntu-latest
   # Manual smoke test: run this workflow from the Actions tab to post a sample
-  # message to the eng channel. `status: recovered` always posts here (the
-  # prior-run check is skipped on a manual dispatch), so both styles are
-  # testable on demand.
+  # message to the eng channel. `force-post` defaults ON here, so `status:
+  # recovered` posts without a prior failure and both styles are testable on
+  # demand.
+  #
+  # This used to be inferred from `github.event_name == 'workflow_dispatch'`, which
+  # was wrong: a called workflow inherits the CALLER's context, so that condition
+  # was also true when somebody manually ran a release-train wrapper, and every one
+  # of those declares `workflow_dispatch`. A successful manual "Staging Freeze"
+  # therefore posted a green Recovered for a failure that never happened. An input
+  # can tell the two apart; an event name cannot.
   workflow_dispatch:
     inputs:
       env-name:
@@ -110,6 +127,10 @@ on:
         type: choice
         options: [failed, recovered]
         default: failed
+      force-post:
+        description: "Post even without a prior failure. On by default: this is the smoke test."
+        type: boolean
+        default: true
       runs-on:
         description: "Runner label"
         type: string
@@ -123,232 +144,38 @@ jobs:
   notify:
     runs-on: ${{ inputs.runs-on }}
     steps:
-      # For the recovery message on a real pipeline run, only continue if the
-      # PREVIOUS conclusive run of this same workflow on this same branch failed.
-      # A manual dispatch skips the check and always posts (smoke test).
-      #
-      # The discriminator is the dispatch event, not `workflow_call`: a called
-      # workflow inherits the CALLER's `github` context, so `event_name` here is
-      # the caller's trigger (`push`, `workflow_run`, ...) and never
-      # `workflow_call`.
-      - name: Check whether the previous run was failing
-        id: prev
-        if: inputs.status == 'recovered' && github.event_name != 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          WORKFLOW: ${{ github.workflow }}
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          BRANCH: ${{ github.ref_name }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          set -uo pipefail
+      - name: Check out the shared alert implementation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: mindsdb/github-actions
+          # The commit of THIS reusable, not of main. A consumer that pins this
+          # workflow to a sha gets that sha's composite and scripts too, which is
+          # what makes the pin mean anything.
+          ref: ${{ job.workflow_sha }}
+          path: .ci-shared
+          persist-credentials: false
 
-          # A RE-RUN is the most common way a failure gets fixed, and it was the
-          # one case this could never report. Attempts share a run id, so the
-          # failing attempt is the very run the history lookup below excludes as
-          # "the current one" — it would then find some older, green run and
-          # conclude nothing had broken. Check the previous attempt first.
-          if [ "${RUN_ATTEMPT:-1}" -gt 1 ]; then
-            PREV_ATTEMPT=$((RUN_ATTEMPT - 1))
-            if LAST=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${PREV_ATTEMPT}" \
-                        --jq '.conclusion // ""' 2>&1); then
-              case "${LAST}" in
-                failure|timed_out|startup_failure)
-                  echo "should_post=true" >> "$GITHUB_OUTPUT"
-                  echo "prev_conclusion=${LAST}" >> "$GITHUB_OUTPUT"
-                  echo "Attempt ${PREV_ATTEMPT} concluded '${LAST}', this attempt recovered it."
-                  exit 0
-                  ;;
-                *)
-                  echo "should_post=false" >> "$GITHUB_OUTPUT"
-                  echo "Attempt ${PREV_ATTEMPT} concluded '${LAST:-unknown}', not a recovery."
-                  exit 0
-                  ;;
-              esac
-            fi
-            echo "Could not read attempt ${PREV_ATTEMPT}, falling back to run history: ${LAST}"
-          fi
-
-          # Match the workflow FILE rather than its display name, which a
-          # `run-name:` override changes; fall back to the name if the ref does
-          # not resolve to a path inside this repo.
-          WF_PATH="${WORKFLOW_REF%%@*}"
-          export WF_PATH="${WF_PATH#"${REPO}/"}"
-
-          # Most recent CONCLUSIVE run on this branch, excluding the current one:
-          # cancelled and skipped runs are not evidence either way.
-          if ! PREV=$(gh api "repos/${REPO}/actions/runs?branch=${BRANCH}&status=completed&per_page=50" \
-            --jq '[ .workflow_runs[]
-                    | select(.path == env.WF_PATH or .name == env.WORKFLOW)
-                    | select((.id|tostring) != env.RUN_ID)
-                    | select(.conclusion == "success" or .conclusion == "failure"
-                             or .conclusion == "timed_out" or .conclusion == "startup_failure")
-                  ][0].conclusion // ""' 2>&1); then
-            # Almost always a missing `actions: read` grant on the caller job.
-            # Stay quiet rather than fail: a notify job must never redden a green run.
-            echo "Could not read run history, staying quiet: ${PREV}"
-            echo "should_post=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "prev_conclusion=${PREV}" >> "$GITHUB_OUTPUT"
-          case "${PREV}" in
-            success|"")
-              echo "should_post=false" >> "$GITHUB_OUTPUT"
-              echo "Previous run concluded '${PREV:-none}', not a recovery, staying quiet."
-              ;;
-            *)
-              echo "should_post=true" >> "$GITHUB_OUTPUT"
-              echo "Previous run concluded '${PREV}', posting recovery."
-              ;;
-          esac
-
-      # A staging pipeline failure means different things depending on where the
-      # release train is. Once the freeze window is open staging IS the release
-      # candidate, so a red pipeline blocks the release and is worth interrupting
-      # the channel for. Mid-week it is the integration branch and the same red
-      # is routine — panic styling there just teaches people to scroll past it.
-      #
-      # The freeze signal is the `staging-freeze` repository ruleset that the
-      # freeze/unfreeze workflows toggle between `active` and `disabled`, not an
-      # inference from workflow-run history: a freeze that skipped itself because
-      # staging had nothing unreleased still concludes `success`, and history
-      # cannot tell that apart from a real freeze.
-      #
-      # Reading rulesets needs admin, which the default workflow token does not
-      # carry, so this reuses the App that owns the toggle. Every failure path
-      # below falls through to `frozen=true`: a notify job that cannot establish
-      # the freeze state must escalate rather than silently downgrade a real
-      # release-blocking failure.
+      # Minted here rather than inside the composite because a composite action's
+      # steps cannot use `continue-on-error`, and a repo with no release-train App
+      # must degrade to "assume frozen" rather than fail the notify job.
       - name: Mint release-train App token
         id: freeze-token
-        if: inputs.freeze-scoped && inputs.status != 'recovered'
+        if: inputs.freeze-scoped
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - name: Check release-freeze state
-        id: freeze
-        if: inputs.freeze-scoped && inputs.status != 'recovered'
-        env:
-          GH_TOKEN: ${{ steps.freeze-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          RULESET_NAME: staging-freeze
-          OUTSIDE_FREEZE: ${{ inputs.outside-freeze }}
-        run: |
-          set -uo pipefail
-
-          escalate() {
-            echo "::warning::$1 Treating staging as frozen so this failure still escalates."
-            echo "frozen=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          }
-
-          [ -n "${GH_TOKEN:-}" ] || escalate "Could not mint the release-train App token."
-
-          ENFORCEMENT=$(gh api "repos/${REPO}/rulesets" \
-            --jq ".[] | select(.name == \"${RULESET_NAME}\") | .enforcement" 2>&1) \
-            || escalate "Could not read rulesets: ${ENFORCEMENT}."
-          [ -n "${ENFORCEMENT}" ] || escalate "Ruleset '${RULESET_NAME}' not found."
-
-          if [ "${ENFORCEMENT}" = "active" ]; then
-            echo "frozen=true" >> "$GITHUB_OUTPUT"
-            echo "Ruleset '${RULESET_NAME}' is active — staging is frozen, escalating."
-          else
-            echo "frozen=false" >> "$GITHUB_OUTPUT"
-            echo "Ruleset '${RULESET_NAME}' is '${ENFORCEMENT}' — staging is not frozen, downgrading to '${OUTSIDE_FREEZE}'."
-          fi
-
-      # Collapse the three outcomes (recovered / failed / failed-outside-freeze)
-      # into flat strings. Deciding this in shell keeps the Slack payload from
-      # growing a second and third nested ternary per field, which is where this
-      # kind of template stops being reviewable.
-      - name: Compose message
-        id: msg
-        env:
-          STATUS: ${{ inputs.status }}
-          FREEZE_SCOPED: ${{ inputs.freeze-scoped }}
-          FROZEN: ${{ steps.freeze.outputs.frozen }}
-          OUTSIDE_FREEZE: ${{ inputs.outside-freeze }}
-        run: |
-          set -euo pipefail
-          POST=true
-          if [ "${STATUS}" = "recovered" ]; then
-            LEVEL=recovered; COLOR='#00C851'; ICON=':white_check_mark:'; VERB=recovered
-            PREFIX=Recovered; NOTE=''
-          elif [ "${FREEZE_SCOPED}" = "true" ] && [ "${FROZEN}" = "false" ]; then
-            LEVEL=notice; COLOR='#B0B4BA'; ICON=':warning:'; VERB=failed
-            PREFIX=Failed; NOTE=' (outside the release freeze, not release-blocking)'
-            if [ "${OUTSIDE_FREEZE}" = "silent" ]; then POST=false; fi
-          else
-            LEVEL=alert; COLOR='#FF4444'; ICON=':rotating_light:'; VERB=failed
-            PREFIX=FAILED; NOTE=''
-          fi
-          {
-            echo "post=${POST}"
-            echo "level=${LEVEL}"
-            echo "color=${COLOR}"
-            echo "icon=${ICON}"
-            echo "verb=${VERB}"
-            echo "prefix=${PREFIX}"
-            echo "note=${NOTE}"
-          } >> "$GITHUB_OUTPUT"
-          echo "level=${LEVEL} post=${POST}"
-
-      - name: Notify Slack
-        # Failure mode always posts; on a real pipeline, recovery posts only after
-        # a failing run; a manual dispatch always posts (smoke test).
-        #
-        # The payload carries a top-level `text` as well as the blocks. Slack
-        # renders the blocks, but `text` is what a push notification, a screen
-        # reader, and a notification-list preview show, so without it the alert
-        # arrives on a phone as an empty message — which is the one context where
-        # a pipeline failure most needs to be readable.
-        # `steps.msg.outputs.post` carries the one extra veto: a freeze-scoped
-        # failure outside the freeze window when the caller asked for silence.
-        if: steps.msg.outputs.post == 'true' && (inputs.status != 'recovered' || github.event_name == 'workflow_dispatch' || steps.prev.outputs.should_post == 'true')
-        uses: slackapi/slack-github-action@v1.26.0
+      - name: Notify
+        uses: ./.ci-shared/notify-pipeline-status
         with:
-          channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
-          payload: |
-            {
-              "text": "${{ steps.msg.outputs.prefix }}: ${{ github.event.repository.name }} ${{ inputs.env-name }} pipeline on ${{ github.ref_name }}${{ steps.msg.outputs.note }}",
-              "attachments": [
-                {
-                  "color": "${{ steps.msg.outputs.color }}",
-                  "blocks": [
-                    {
-                      "type": "section",
-                      "text": {
-                        "type": "mrkdwn",
-                        "text": "${{ steps.msg.outputs.icon }} *<${{ github.server_url }}/${{ github.repository }}|${{ github.event.repository.name }}>* — *${{ inputs.env-name }}* pipeline ${{ steps.msg.outputs.verb }} on `${{ github.ref_name }}`${{ steps.msg.outputs.note }}"
-                      },
-                      "fields": [
-                        {
-                          "type": "mrkdwn",
-                          "text": "*Workflow*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|${{ github.workflow }}>"
-                        },
-                        {
-                          "type": "mrkdwn",
-                          "text": "*${{ inputs.status == 'recovered' && 'Fixed by' || 'Triggered by' }}*\n${{ github.triggering_actor }}"
-                        },
-                        {
-                          "type": "mrkdwn",
-                          "text": "*Commit*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
-                        },
-                        {
-                          "type": "mrkdwn",
-                          "text": "*Branch*\n<${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}|${{ github.ref_name }}>"
-                        }
-                      ]
-                    }
-                  ]
-                }
-              ]
-            }
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}
+          env-name: ${{ inputs.env-name }}
+          status: ${{ inputs.status }}
+          freeze-scoped: ${{ inputs.freeze-scoped }}
+          ruleset-name: ${{ inputs.ruleset-name }}
+          freeze-token: ${{ steps.freeze-token.outputs.token }}
+          github-token: ${{ github.token }}
+          force-post: ${{ inputs.force-post }}
+          slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

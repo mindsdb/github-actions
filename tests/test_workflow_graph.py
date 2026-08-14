@@ -365,12 +365,23 @@ class TestTheIncident:
 class TestEventKeys:
     def test_push_keys_per_branch(self):
         assert gate.event_keys({"on": {"push": {"branches": ["main", "staging"]}}}) == [
-            "push:main",
-            "push:staging",
+            "push:main#*",
+            "push:staging#*",
         ]
 
     def test_push_with_no_branch_filter_keys_on_the_event(self):
-        assert gate.event_keys({"on": {"push": None}}) == ["push"]
+        assert gate.event_keys({"on": {"push": None}}) == ["push#*"]
+
+    def test_pull_request_expands_to_its_declared_types(self):
+        assert gate.event_keys({"on": {"pull_request": {"types": ["closed"]}}}) == ["pull_request#closed"]
+
+    def test_unspecified_pull_request_types_are_githubs_defaults_not_everything(self):
+        """The false positive this fixes: `closed` and the defaults are disjoint."""
+        assert gate.event_keys({"on": {"pull_request": None}}) == [
+            "pull_request#opened",
+            "pull_request#reopened",
+            "pull_request#synchronize",
+        ]
 
     def test_schedule_and_dispatch_are_exempt(self):
         """They have no pipeline to belong to, which is why they get their own run."""
@@ -379,9 +390,23 @@ class TestEventKeys:
     def test_workflow_call_is_not_an_event_key(self):
         assert gate.event_keys({"on": {"workflow_call": None}}) == []
 
-    def test_pull_request_keys_on_the_event_not_the_base(self):
-        """A base-branch filter does not separate run trees the way a push branch does."""
-        assert gate.event_keys({"on": {"pull_request": {"types": ["opened"]}}}) == ["pull_request"]
+    def test_a_declared_pull_request_type_becomes_the_only_key(self):
+        assert gate.event_keys({"on": {"pull_request": {"types": ["opened"]}}}) == ["pull_request#opened"]
+
+    def test_a_base_branch_filter_narrows_the_key(self):
+        """Named for what the code does. The old name here claimed `pull_request`
+        keys on the event and not the base, and the code has never done that: the
+        branch loop applies to every event, not only `push`. The input had no
+        `branches:` at all, so it passed either way and pinned nothing.
+
+        The consequence is a real (and pre-existing) blind spot: a workflow filtered
+        to `main` and one with no filter both fire on a PR to `main` and do not
+        collide, because a filter is not treated as a subset of no filter.
+        """
+        assert gate.event_keys({"on": {"pull_request": {"branches": ["main"], "types": ["opened"]}}}) == [
+            "pull_request:main#opened"
+        ]
+        assert gate.event_keys({"on": {"pull_request": {"types": ["opened"]}}}) == ["pull_request#opened"]
 
 
 class TestRunTrees:
@@ -399,6 +424,46 @@ class TestRunTrees:
         write(tmp_path, "staging.yml", {"on": {"push": {"branches": ["staging"]}}, "jobs": {"b": {"runs-on": "x"}}})
         errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
         assert errors == []
+
+    def test_a_pr_close_cleanup_does_not_collide_with_the_pr_pipeline(self, tmp_path):
+        """Disjoint `types` never co-fire, so they are not two trees for one event.
+
+        This shape (a cleanup on PR close beside the PR pipeline) was the majority
+        of what this check reported, and the only way to silence it was a
+        `run-tree-ok` comment — which is how a real finding later gets waved
+        through on the same file.
+        """
+        write(
+            tmp_path,
+            "pipeline.yml",
+            {"on": {"pull_request": {"types": ["opened", "synchronize"]}}, "jobs": {"a": {"runs-on": "x"}}},
+        )
+        write(
+            tmp_path,
+            "cleanup.yml",
+            {"on": {"pull_request": {"types": ["closed"]}}, "jobs": {"b": {"runs-on": "x"}}},
+        )
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert errors == []
+
+    def test_an_unspecified_pr_trigger_still_collides_with_an_overlapping_one(self, tmp_path):
+        """Declaring nothing is not a licence to share the event with `opened`."""
+        write(tmp_path, "tests.yml", {"on": {"pull_request": None}, "jobs": {"a": {"runs-on": "x"}}})
+        write(
+            tmp_path,
+            "scan.yml",
+            {"on": {"pull_request": {"types": ["opened", "labeled"]}}, "jobs": {"b": {"runs-on": "x"}}},
+        )
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert len(errors) == 1
+        assert "tests.yml" in errors[0] and "scan.yml" in errors[0]
+
+    def test_an_overlap_on_several_types_is_reported_once(self, tmp_path):
+        """Three shared types said three times says nothing the first one did not."""
+        write(tmp_path, "a.yml", {"on": {"pull_request": None}, "jobs": {"a": {"runs-on": "x"}}})
+        write(tmp_path, "b.yml", {"on": {"pull_request": None}, "jobs": {"b": {"runs-on": "x"}}})
+        errors, _ = gate.check_run_trees(gate.load_workflows(tmp_path))
+        assert len(errors) == 1
 
     def test_two_schedules_do_not_collide(self, tmp_path):
         write(tmp_path, "nightly.yml", {"on": {"schedule": [{"cron": "0 5 * * *"}]}, "jobs": {"a": {"runs-on": "x"}}})

@@ -38,8 +38,20 @@ on:
         type: string
         default: staging-freeze
 
-permissions:
-  contents: read
+# No workflow-level `permissions:` block, deliberately, so this job inherits the
+# calling job's grant. That is what makes the notify step's recovery lookup work:
+# a block here would be the CEILING for this job's token as well as the caller's,
+# so declaring `contents: read` alone would cap the token to `contents: read` and
+# the lookup would be refused no matter what the caller granted. Declaring
+# `actions: read` instead is not an option either — every caller that has not yet
+# granted it would fail to LOAD, and these wrappers reach a repo's default branch
+# only at the next weekly release, so the two can never merge in step. Inheriting
+# gives both: the grant where a caller has it, and a refused lookup that logs why
+# and stays quiet where it does not.
+#
+# The cost is real and worth naming: `scripts/workflow_graph.py` check 2 compares
+# what a callee DECLARES against what its callers grant, so a job that declares
+# nothing is invisible to it. That check cannot help here.
 
 jobs:
   freeze-staging:
@@ -61,6 +73,18 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      # The ruleset read-modify-write lives in `scripts/freeze_state.py`, which is
+      # also what the alerting workflows use to READ the freeze state. One file
+      # owns the contract, so a repo that renames its ruleset cannot end up frozen
+      # by one name and alerted on another.
+      - name: Check out the shared release-freeze contract
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: mindsdb/github-actions
+          ref: ${{ job.workflow_sha }}
+          path: .ci-shared
           persist-credentials: false
 
       - name: Check for unreleased changes
@@ -98,23 +122,38 @@ jobs:
           ENFORCEMENT: active
         run: |
           set -euo pipefail
-          RID=$(gh api "repos/${REPO}/rulesets" \
-            --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id")
-          if [ -z "$RID" ]; then
-            echo "::error::Ruleset '${RULESET_NAME}' not found in ${REPO} — provisioning has drifted."
-            exit 1
-          fi
-          # GET the full ruleset, flip only `enforcement`, PUT the whole body back.
-          # A partial PUT is not guaranteed to preserve omitted fields. The body is
-          # written to a temp file (never echoed) so ruleset internals don't leak
-          # into logs — three of these repos are public.
-          BODY="${RUNNER_TEMP}/ruleset-${RID}.json"
-          gh api "repos/${REPO}/rulesets/${RID}" \
-            --jq "{name, target, enforcement: \"${ENFORCEMENT}\", bypass_actors, conditions, rules}" > "$BODY"
-          gh api --method PUT "repos/${REPO}/rulesets/${RID}" --input "$BODY" > /dev/null
-          echo "Ruleset '${RULESET_NAME}' (#${RID}) enforcement set to ${ENFORCEMENT} — ${STAGING} is FROZEN."
+          # Fails loudly on purpose, unlike the alerting path's read: a freeze
+          # that could not be applied has to stop the release train rather than
+          # let the window appear to open.
+          python3 .ci-shared/scripts/freeze_state.py set \
+            --repo "${REPO}" \
+            --ruleset-name "${RULESET_NAME}" \
+            --enforcement "${ENFORCEMENT}" \
+            --body-path "${RUNNER_TEMP}/ruleset.json"
+          echo "${STAGING} is FROZEN."
           {
             echo "## Staging branch FROZEN"
             echo ""
             echo "The \`${STAGING}\` branch is **frozen** via ruleset \`${RULESET_NAME}\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The alert lives here rather than in each repo's wrapper, which is what
+      # made every wrapper `if: failure()` and therefore incapable of ever saying
+      # a failure had been FIXED. Ending the job with this step covers both
+      # directions in one place for all seven consumers.
+      # `continue-on-error` because the alert must never decide the job's fate. It
+      # runs under `always()` on green runs too now, and the Slack action calls
+      # `core.setFailed` on any Slack-side error, so without this a rotated bot
+      # token or a bot removed from the channel would report a successful run as a
+      # failure — and for the freeze that also skips the release-PR refresh, which
+      # gates on this run's conclusion.
+      - name: Notify the engineering channel
+        if: ${{ always() && job.status != 'cancelled' }}
+        continue-on-error: true
+        uses: ./.ci-shared/notify-pipeline-status
+        with:
+          env-name: "staging freeze"
+          status: ${{ job.status == 'failure' && 'failed' || 'recovered' }}
+          github-token: ${{ github.token }}
+          slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

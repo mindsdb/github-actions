@@ -372,28 +372,67 @@ def _walk(
     return found
 
 
+# What `pull_request` fires on when a workflow does not say. Needed because a
+# workflow that declares nothing and one that declares `types: [closed]` are
+# DISJOINT, and treating "unspecified" as "everything" reported them as a clash.
+# That false positive is not academic: it is most of what this check found in the
+# repos that had a PR-close cleanup workflow, and an exemption comment was the
+# only way to silence it, which is how a real finding later gets waved through.
+PULL_REQUEST_DEFAULT_TYPES = frozenset({"opened", "synchronize", "reopened"})
+
+# For any other event, an unspecified `types:` means "whatever this event's
+# defaults are", which varies per event and is not worth encoding. `*` collides
+# with everything in the same bucket, so the check stays conservative: it may
+# still over-report on an exotic event, never under-report.
+ANY_TYPE = "*"
+
+
 def event_keys(workflow: dict) -> list[str]:
-    """The events that can start this workflow, keyed finely enough to spot a clash.
+    """The (event, branch, type) triples that can start this workflow.
 
-    `push` is keyed per branch, because a workflow on `push: staging` and one on
-    `push: main` do not collide. Everything else keys on the event name alone.
+    Keyed finely enough to spot a real clash and no finer:
 
-    `schedule`, `workflow_dispatch`, and `workflow_call` are deliberately absent: a
-    schedule or a manual run has no pipeline to belong to, and a `workflow_call` is
-    not an entry point at all.
+    - **branch**, because `push: staging` and `push: main` do not collide.
+    - **type**, because `pull_request: types: [closed]` and a workflow that runs
+      on `opened`/`synchronize` never run on the same event. A PR-close cleanup
+      workflow sitting beside the PR pipeline is the common shape, and it is not
+      a second run tree for the same trigger.
+
+    `schedule`, `workflow_dispatch`, and `workflow_call` are deliberately absent:
+    a schedule or a manual run has no pipeline to belong to, and a
+    `workflow_call` is not an entry point at all.
     """
     keys: list[str] = []
     for event, config in triggers(workflow).items():
         if event in ("schedule", "workflow_dispatch", "workflow_call"):
             continue
-        branches = None
+        branches, types = None, None
         if isinstance(config, dict):
             branches = config.get("branches")
-        if isinstance(branches, list) and branches:
-            keys.extend(f"{event}:{branch}" for branch in branches)
+            types = config.get("types")
+
+        if isinstance(types, list) and types:
+            type_keys = [str(t) for t in types]
+        elif event in ("pull_request", "pull_request_target"):
+            type_keys = sorted(PULL_REQUEST_DEFAULT_TYPES)
         else:
-            keys.append(str(event))
+            type_keys = [ANY_TYPE]
+
+        branch_keys = (
+            [str(b) for b in branches] if isinstance(branches, list) and branches else [ANY_TYPE]
+        )
+
+        for branch in branch_keys:
+            for type_key in type_keys:
+                suffix = "" if branch == ANY_TYPE else f":{branch}"
+                keys.append(f"{event}{suffix}#{type_key}")
     return keys
+
+
+def describe_event(key: str) -> str:
+    """`push:main#*` -> ``push:main``; `pull_request#closed` -> ``pull_request (closed)``."""
+    event, _, type_key = key.partition("#")
+    return event if type_key == ANY_TYPE else f"{event} ({type_key})"
 
 
 def check_run_trees(
@@ -413,20 +452,29 @@ def check_run_trees(
         for event in event_keys(workflow):
             by_event.setdefault(event, []).append(key)
 
-    for event, owners in sorted(by_event.items()):
+    # One finding per COLLIDING SET, not per event key. Keying by type means an
+    # overlapping pair now matches on `opened`, `synchronize` and `reopened`
+    # alike, and reporting that three times says nothing the first one did not.
+    collisions: dict[frozenset[str], list[str]] = {}
+    for event, owners in by_event.items():
         if len(owners) > 1:
-            names = ", ".join(sorted(owners))
-            errors.append(
-                f"`{event}` starts {len(owners)} workflows, so it produces {len(owners)} "
-                f"disconnected run trees: {names}\n"
-                f"    Fold the side ones into the event's pipeline as `workflow_call` jobs, so one run "
-                f"shows everything that happened. A job that should not pay for itself on every run "
-                f"gates on a path check; a job behind an `environment:` approval needs an ungated plan "
-                f"job before it, since an approval blocks a job from starting.\n"
-                f"    If a workflow genuinely has to keep its own run tree (a vendor OIDC claim bound to its "
-                f"filename, a release-train hook on someone else's event), add a `run-tree-ok: <reason>` "
-                f"comment to it."
-            )
+            collisions.setdefault(frozenset(owners), []).append(event)
+
+    for owner_set, events in sorted(collisions.items(), key=lambda item: sorted(item[1])):
+        owners = sorted(owner_set)
+        names = ", ".join(owners)
+        triggers_shown = ", ".join(f"`{describe_event(event)}`" for event in sorted(events))
+        errors.append(
+            f"{triggers_shown} starts {len(owners)} workflows, so it produces {len(owners)} "
+            f"disconnected run trees: {names}\n"
+            f"    Fold the side ones into the event's pipeline as `workflow_call` jobs, so one run "
+            f"shows everything that happened. A job that should not pay for itself on every run "
+            f"gates on a path check; a job behind an `environment:` approval needs an ungated plan "
+            f"job before it, since an approval blocks a job from starting.\n"
+            f"    If a workflow genuinely has to keep its own run tree (a vendor OIDC claim bound to its "
+            f"filename, a release-train hook on someone else's event), add a `run-tree-ok: <reason>` "
+            f"comment to it."
+        )
 
     if not allow_external_reusables:
         called = {callee for workflow in workflows.values() for _, callee in local_calls(workflow)}

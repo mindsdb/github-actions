@@ -28,6 +28,11 @@
 #
 # Called by a per-repo wrapper, e.g.
 #   auth/.github/workflows/sync-main-to-staging.yml
+# The wrapper carries NO notify job: this workflow ends with one. The wrappers
+# used to own it, written `if: failure()`, which meant a sync could report that
+# it broke and never that it was fixed. On 2026-08-14 cowork's sync failed and
+# alerted, the re-run succeeded, and the notify job was SKIPPED, leaving the
+# channel holding a red alert for a sync that had already recovered.
 #
 # Requires: vars.RELEASE_APP_CLIENT_ID + secrets.RELEASE_APP_PRIVATE_KEY
 # (org-provisioned; secret reaches here via `secrets: inherit`).
@@ -50,8 +55,20 @@ on:
         type: string
         default: ubuntu-latest
 
-permissions:
-  contents: read
+# No workflow-level `permissions:` block, deliberately, so this job inherits the
+# calling job's grant. That is what makes the notify step's recovery lookup work:
+# a block here would be the CEILING for this job's token as well as the caller's,
+# so declaring `contents: read` alone would cap the token to `contents: read` and
+# the lookup would be refused no matter what the caller granted. Declaring
+# `actions: read` instead is not an option either — every caller that has not yet
+# granted it would fail to LOAD, and these wrappers reach a repo's default branch
+# only at the next weekly release, so the two can never merge in step. Inheriting
+# gives both: the grant where a caller has it, and a refused lookup that logs why
+# and stays quiet where it does not.
+#
+# The cost is real and worth naming: `scripts/workflow_graph.py` check 2 compares
+# what a callee DECLARES against what its callers grant, so a job that declares
+# nothing is invisible to it. That check cannot help here.
 
 jobs:
   sync:
@@ -68,6 +85,16 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
+
+      # After the checkout above, which would otherwise clean this back out of
+      # the workspace.
+      - name: Check out the shared alert implementation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: mindsdb/github-actions
+          ref: ${{ job.workflow_sha }}
+          path: .ci-shared
+          persist-credentials: false
 
       - name: Sync base branch into staging
         env:
@@ -116,3 +143,20 @@ jobs:
 
           echo "::error::Could not fast-forward ${STAGING} after 2 attempts. ${STAGING} is moving faster than this workflow can merge, or the App lost its bypass on ${STAGING}."
           exit 1
+
+      # `continue-on-error` because the alert must never decide the job's fate. It
+      # runs under `always()` on green runs too now, and the Slack action calls
+      # `core.setFailed` on any Slack-side error, so without this a rotated bot
+      # token or a bot removed from the channel would report a successful run as a
+      # failure — and for the freeze that also skips the release-PR refresh, which
+      # gates on this run's conclusion.
+      - name: Notify the engineering channel
+        if: ${{ always() && job.status != 'cancelled' }}
+        continue-on-error: true
+        uses: ./.ci-shared/notify-pipeline-status
+        with:
+          env-name: "main -> staging sync"
+          status: ${{ job.status == 'failure' && 'failed' || 'recovered' }}
+          github-token: ${{ github.token }}
+          slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

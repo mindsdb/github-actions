@@ -1,11 +1,30 @@
-# Reusable workflow: open (or update) the weekly staging -> main release PR.
+# Reusable workflow: keep the staging -> main release PR open and current.
 #
-# Chains off a successful "Staging Freeze" run via the caller's workflow_run
-# trigger. Idempotent: if an open staging -> main PR already exists it is left
-# untouched. Skips entirely when staging has no unreleased changes.
+# It used to run once a week, at freeze time, and the release queue was invisible
+# until then: the only way to know what Friday would ship was to diff two
+# branches by hand. So the caller now also fires it after each staging pipeline,
+# and this workflow UPDATES an open PR rather than skipping it. The commit list
+# and contributor list are rewritten every time, so the PR is a live view of what
+# is queued from the first merge after an unfreeze.
 #
-# The ahead-check is kept even though the caller guards on freeze success — a
-# manual workflow_dispatch can invoke this workflow directly.
+# **It opens as a DRAFT and becomes ready at freeze time.** An always-open
+# staging -> main PR is a merge button sitting next to production all week, and
+# the whole point of the freeze window is that staging is only a release
+# candidate inside it. Draft is what makes the rolling PR safe: it cannot be
+# merged by accident, GitHub greys it out, and the transition to ready is a
+# visible event that says the window is open. The freeze state is read from the
+# same `scripts/freeze_state.py` the freeze workflow writes, so the two cannot
+# disagree about when that is.
+#
+# Idempotent in both directions: it never opens a second PR, and re-running it
+# against an unchanged branch rewrites the same body. The find-then-create is not
+# atomic though, so the CALLER carries a `concurrency: release-pr` group. Without
+# it the freeze and a staging merge in the same minute produce two runs, the loser's
+# `gh pr create` takes a 422, and `set -euo pipefail` turns that into a red
+# "release PR pipeline failed" alert for a PR that exists and is fine.
+#
+# The ahead-check is kept even though the freeze caller guards on freeze success —
+# a manual workflow_dispatch can invoke this workflow directly.
 #
 # The PR is created with the `mindsdb-release-train` App token (NOT the default
 # GITHUB_TOKEN) so that opening the PR triggers the normal CI checks — PRs
@@ -31,9 +50,25 @@ on:
         description: "Target branch for the release PR"
         type: string
         default: main
+      ruleset-name:
+        description: "The freeze ruleset to read, to decide draft vs ready. Must match what the repo's release-freeze caller sets."
+        type: string
+        default: staging-freeze
 
-permissions:
-  contents: read
+# No workflow-level `permissions:` block, deliberately, so this job inherits the
+# calling job's grant. That is what makes the notify step's recovery lookup work:
+# a block here would be the CEILING for this job's token as well as the caller's,
+# so declaring `contents: read` alone would cap the token to `contents: read` and
+# the lookup would be refused no matter what the caller granted. Declaring
+# `actions: read` instead is not an option either — every caller that has not yet
+# granted it would fail to LOAD, and these wrappers reach a repo's default branch
+# only at the next weekly release, so the two can never merge in step. Inheriting
+# gives both: the grant where a caller has it, and a refused lookup that logs why
+# and stays quiet where it does not.
+#
+# The cost is real and worth naming: `scripts/workflow_graph.py` check 2 compares
+# what a callee DECLARES against what its callers grant, so a job that declares
+# nothing is invisible to it. That check cannot help here.
 
 jobs:
   create-pr:
@@ -50,6 +85,32 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Check out the shared release-freeze contract
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: mindsdb/github-actions
+          ref: ${{ job.workflow_sha }}
+          path: .ci-shared
+          persist-credentials: false
+
+      # Decides draft vs ready. Escalating to "frozen" on a lookup failure is the
+      # safe direction everywhere else in this system; here it is not, because it
+      # would mark the PR ready to merge on a branch nobody has validated. So this
+      # one reader fails closed the other way.
+      - name: Check release-freeze state
+        id: freeze
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          RULESET_NAME: ${{ inputs.ruleset-name }}
+        run: |
+          set -uo pipefail
+          if ! python3 .ci-shared/scripts/freeze_state.py read \
+                 --repo "${REPO}" --ruleset-name "${RULESET_NAME}" --on-error fail; then
+            echo "::warning::Could not read the freeze state. Leaving the release PR as a draft."
+            echo "frozen=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Check for unreleased changes
         id: check
@@ -78,25 +139,47 @@ jobs:
           AHEAD: ${{ steps.check.outputs.ahead }}
           STAGING: ${{ inputs.staging-branch }}
           BASE: ${{ inputs.base-branch }}
+          FROZEN: ${{ steps.freeze.outputs.frozen }}
         run: |
           set -euo pipefail
-
-          # Skip if a staging -> main PR is already open.
-          EXISTING=$(gh pr list --repo "${REPO}" --base "${BASE}" --head "${STAGING}" \
-            --state open --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING" ]; then
-            echo "PR #${EXISTING} already exists — skipping creation."
-            echo "::notice title=Weekly release PR::https://github.com/${REPO}/pull/${EXISTING}"
-            exit 0
-          fi
 
           COMMITS=$(git log --oneline --no-merges "origin/${BASE}..origin/${STAGING}")
           CONTRIBUTORS=$(git log --format='%an' "origin/${BASE}..origin/${STAGING}" | sort -u | sed 's/^/- /')
 
-          BODY=$(cat <<EOF
-          ## Weekly release: ${STAGING} → ${BASE}
+          # Find the PR before writing about it. The body describes whether this is
+          # a draft, and only the PR itself knows that: an existing PR may already
+          # be ready for review, either because a human marked it or because it
+          # predates the draft behaviour, and nothing below ever re-drafts one. A
+          # state line derived from the freeze alone told four already-ready release
+          # PRs that they were "not ready to merge".
+          EXISTING=$(gh pr list --repo "${REPO}" --base "${BASE}" --head "${STAGING}" \
+            --state open --json number --jq '.[0].number // empty')
 
-          **${AHEAD} commit(s)** ready for production release.
+          WAS_DRAFT=true
+          if [ -n "$EXISTING" ]; then
+            WAS_DRAFT=$(gh pr view "$EXISTING" --repo "${REPO}" --json isDraft --jq '.isDraft')
+          fi
+
+          # What the PR will be once this run is done: draft only while the window
+          # is closed AND it is not already ready.
+          if [ "${FROZEN}" = "true" ] || [ "${WAS_DRAFT}" != "true" ]; then
+            DRAFT_AFTER=false
+          else
+            DRAFT_AFTER=true
+          fi
+
+          if [ "${DRAFT_AFTER}" = "true" ]; then
+            STATE_LINE="> Draft until the release freeze opens. \`${STAGING}\` is still the integration branch, so this list will keep growing and this PR is not ready to merge."
+          elif [ "${FROZEN}" = "true" ]; then
+            STATE_LINE="> The release freeze is **open**: \`${STAGING}\` is the release candidate and this PR is ready to merge once it has been validated."
+          else
+            STATE_LINE="> The release freeze is **closed**, so \`${STAGING}\` is still the integration branch and this list will keep growing. This PR is already marked ready for review and nothing re-drafts it, so treat it as mergeable only once the window opens."
+          fi
+
+          BODY=$(cat <<EOF
+          ## Release: ${STAGING} → ${BASE}
+
+          **${AHEAD} commit(s)** queued for the next production release.
 
           ### Changes
           \`\`\`
@@ -110,7 +193,10 @@ jobs:
           - [ ] Staging has been validated
           - [ ] No known blockers
 
-          > Created automatically at staging freeze time. Merge when ready to release.
+          ${STATE_LINE}
+          >
+          > Opened and kept current automatically. The commit list is rewritten on every
+          > staging merge, so it always reflects what would ship right now.
           EOF
           )
 
@@ -119,10 +205,56 @@ jobs:
           BODY="${BODY//$'\n'          /$'\n'}"
           BODY="${BODY#          }"
 
-          PR_URL=$(gh pr create \
-            --repo "${REPO}" \
-            --base "${BASE}" \
-            --head "${STAGING}" \
-            --title "Weekly release: ${STAGING} → ${BASE}" \
-            --body "$BODY")
-          echo "::notice title=Weekly release PR::${PR_URL}"
+          TITLE="Release: ${STAGING} → ${BASE} (${AHEAD} commits)"
+
+          if [ -z "$EXISTING" ]; then
+            # New PR. Draft unless the window is already open, so a rolling PR can
+            # never be merged during the week it is accumulating.
+            DRAFT=()
+            [ "${DRAFT_AFTER}" = "true" ] && DRAFT=(--draft)
+            PR_URL=$(gh pr create \
+              --repo "${REPO}" \
+              --base "${BASE}" \
+              --head "${STAGING}" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              "${DRAFT[@]}")
+            echo "::notice title=Release PR::${PR_URL}"
+            exit 0
+          fi
+
+          gh pr edit "$EXISTING" --repo "${REPO}" --title "$TITLE" --body "$BODY"
+
+          # Ready-for-review is the visible signal that the window opened. Only
+          # ever draft -> ready: re-drafting a PR someone deliberately marked ready
+          # would fight the human.
+          if [ "${FROZEN}" = "true" ] && [ "${WAS_DRAFT}" = "true" ]; then
+            gh pr ready "$EXISTING" --repo "${REPO}"
+            echo "Freeze is open — PR #${EXISTING} marked ready for review."
+          fi
+          echo "::notice title=Release PR::https://github.com/${REPO}/pull/${EXISTING}"
+
+      # The alert lives here rather than in each repo's wrapper, which is what
+      # made every wrapper `if: failure()` and therefore incapable of ever saying
+      # a failure had been FIXED. Ending the job with this step covers both
+      # directions in one place for all seven consumers.
+      # `continue-on-error` because the alert must never decide the job's fate. It
+      # runs under `always()` on green runs too now, and the Slack action calls
+      # `core.setFailed` on any Slack-side error, so without this a rotated bot
+      # token or a bot removed from the channel would report a successful run as a
+      # failure — and for the freeze that also skips the release-PR refresh, which
+      # gates on this run's conclusion.
+      - name: Notify the engineering channel
+        if: ${{ always() && job.status != 'cancelled' }}
+        continue-on-error: true
+        uses: ./.ci-shared/notify-pipeline-status
+        with:
+          env-name: "release PR"
+          status: ${{ job.status == 'failure' && 'failed' || 'recovered' }}
+          # This workflow is reached by `workflow_run`, where GITHUB_REF is the
+          # DEFAULT branch rather than the branch whose pipeline finished, so the
+          # message would otherwise say the release PR failed on `main`.
+          branch: ${{ inputs.staging-branch }}
+          github-token: ${{ github.token }}
+          slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
+          slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

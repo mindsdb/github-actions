@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+# The actionlint binary. `ci.yml` and this repo's own "how to test" steps both
+# download it into the repo root, so it turns up untracked in every checkout
+# where anyone has run the lint by hand.
+/actionlint
