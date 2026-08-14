@@ -390,8 +390,22 @@ class TestEventKeys:
     def test_workflow_call_is_not_an_event_key(self):
         assert gate.event_keys({"on": {"workflow_call": None}}) == []
 
-    def test_pull_request_keys_on_the_event_not_the_base(self):
-        """A base-branch filter does not separate run trees the way a push branch does."""
+    def test_a_declared_pull_request_type_becomes_the_only_key(self):
+        assert gate.event_keys({"on": {"pull_request": {"types": ["opened"]}}}) == ["pull_request#opened"]
+
+    def test_a_base_branch_filter_narrows_the_key(self):
+        """Named for what the code does. The old name here claimed `pull_request`
+        keys on the event and not the base, and the code has never done that: the
+        branch loop applies to every event, not only `push`. The input had no
+        `branches:` at all, so it passed either way and pinned nothing.
+
+        The consequence is a real (and pre-existing) blind spot: a workflow filtered
+        to `main` and one with no filter both fire on a PR to `main` and do not
+        collide, because a filter is not treated as a subset of no filter.
+        """
+        assert gate.event_keys({"on": {"pull_request": {"branches": ["main"], "types": ["opened"]}}}) == [
+            "pull_request:main#opened"
+        ]
         assert gate.event_keys({"on": {"pull_request": {"types": ["opened"]}}}) == ["pull_request#opened"]
 
 
