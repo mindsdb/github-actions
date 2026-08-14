@@ -92,6 +92,10 @@ on:
         description: "The freeze ruleset to read. Must match what the repo's release-freeze caller sets, or this reads a name that does not exist and escalates every staging failure forever."
         type: string
         default: staging-freeze
+      force-post:
+        description: "Post a 'recovered' message with no prior failure to recover from. Only the smoke-test dispatch sets this; a real pipeline leaves it off, or every green run reports a recovery."
+        type: boolean
+        default: false
       runs-on:
         description: "Runner label for the notify job"
         type: string
@@ -102,9 +106,16 @@ on:
         # this would have nothing to run on.
         default: ubuntu-latest
   # Manual smoke test: run this workflow from the Actions tab to post a sample
-  # message to the eng channel. `status: recovered` always posts here (the
-  # prior-run check is skipped on a manual dispatch), so both styles are testable
-  # on demand.
+  # message to the eng channel. `force-post` defaults ON here, so `status:
+  # recovered` posts without a prior failure and both styles are testable on
+  # demand.
+  #
+  # This used to be inferred from `github.event_name == 'workflow_dispatch'`, which
+  # was wrong: a called workflow inherits the CALLER's context, so that condition
+  # was also true when somebody manually ran a release-train wrapper, and every one
+  # of those declares `workflow_dispatch`. A successful manual "Staging Freeze"
+  # therefore posted a green Recovered for a failure that never happened. An input
+  # can tell the two apart; an event name cannot.
   workflow_dispatch:
     inputs:
       env-name:
@@ -116,6 +127,10 @@ on:
         type: choice
         options: [failed, recovered]
         default: failed
+      force-post:
+        description: "Post even without a prior failure. On by default: this is the smoke test."
+        type: boolean
+        default: true
       runs-on:
         description: "Runner label"
         type: string
@@ -130,13 +145,13 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     steps:
       - name: Check out the shared alert implementation
-        uses: actions/checkout@v5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: mindsdb/github-actions
           # The commit of THIS reusable, not of main. A consumer that pins this
           # workflow to a sha gets that sha's composite and scripts too, which is
           # what makes the pin mean anything.
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ job.workflow_sha }}
           path: .ci-shared
           persist-credentials: false
 
@@ -161,5 +176,6 @@ jobs:
           ruleset-name: ${{ inputs.ruleset-name }}
           freeze-token: ${{ steps.freeze-token.outputs.token }}
           github-token: ${{ github.token }}
+          force-post: ${{ inputs.force-post }}
           slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
           slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

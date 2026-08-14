@@ -44,14 +44,20 @@ on:
         type: string
         default: staging-freeze
 
-permissions:
-  contents: read
-  # NOT `actions: read`, deliberately, even though the notify step's recovery
-  # lookup wants it. Declaring it here would make every caller that has not yet
-  # granted it fail to LOAD rather than merely degrade, and these wrappers reach
-  # a repo's default branch only at the next weekly release, so the two can never
-  # be merged in step. Without the grant the lookup is refused, logs why, and
-  # stays quiet; a caller that adds `actions: read` turns recovery messages on.
+# No workflow-level `permissions:` block, deliberately, so this job inherits the
+# calling job's grant. That is what makes the notify step's recovery lookup work:
+# a block here would be the CEILING for this job's token as well as the caller's,
+# so declaring `contents: read` alone would cap the token to `contents: read` and
+# the lookup would be refused no matter what the caller granted. Declaring
+# `actions: read` instead is not an option either — every caller that has not yet
+# granted it would fail to LOAD, and these wrappers reach a repo's default branch
+# only at the next weekly release, so the two can never merge in step. Inheriting
+# gives both: the grant where a caller has it, and a refused lookup that logs why
+# and stays quiet where it does not.
+#
+# The cost is real and worth naming: `scripts/workflow_graph.py` check 2 compares
+# what a callee DECLARES against what its callers grant, so a job that declares
+# nothing is invisible to it. That check cannot help here.
 
 jobs:
   unfreeze-staging:
@@ -64,39 +70,20 @@ jobs:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      # This is the checkout that pushes, and it is first only so that it cannot
-      # clean the shared checkout below out of the workspace. Checking out pushes
-      # nothing, so "unlock before push" is still honoured by the step order
-      # further down.
-      #
-      # The sync step runs on a manual dispatch too, which it did not used to. The
-      # old guard was `github.event_name == 'pull_request'`, reasoned as "no PR
-      # merged, nothing to sync", and that reasoning is wrong in the one case that
-      # matters: a dispatch is what you reach for when the PR-triggered run could
-      # not run. On 2026-07-27 auth's PR-triggered unfreeze died as a
-      # `startup_failure` (an invalid caller, so zero jobs), the operator recovered
-      # with a dispatch, and it unfroze staging while silently skipping the sync —
-      # leaving main squash-merged into a `main` that `staging` did not contain,
-      # which had to be merged by hand an hour later. The escape hatch was strictly
-      # less capable than the path it exists to replace.
-      #
-      # Nothing needs the event to decide this: the sync step below already exits 0
-      # when `staging` is an ancestor of `main`, so a dispatch with genuinely
-      # nothing to sync is a logged no-op rather than a wasted push.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-
       # The ruleset read-modify-write lives in `scripts/freeze_state.py`, which is
       # also what the alerting workflows use to READ the freeze state. One file
       # owns the contract, so unfreezing and "staging alerts are off again" can
       # never disagree about which ruleset they mean.
+      #
+      # This has to precede the unlock, because the unlock runs that script. It is
+      # therefore the one step whose failure leaves staging FROZEN, which is the
+      # bad direction — so it is also the only one, and the credentialed checkout
+      # that used to sit here moved below the unlock where it belongs.
       - name: Check out the shared release-freeze contract
-        uses: actions/checkout@v5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: mindsdb/github-actions
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ job.workflow_sha }}
           path: .ci-shared
           persist-credentials: false
 
@@ -122,7 +109,36 @@ jobs:
             echo "The \`${STAGING}\` branch is **unfrozen** via ruleset \`${RULESET_NAME}\` (triggered by PR #${PR_NUMBER:-manual})."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Order is load-bearing and this is the whole reason for it: unlock first,
+      # then push. If anything from here down fails, staging is left UNLOCKED,
+      # which is the acceptable direction. Checking out is not a push, but it can
+      # still fail, so it sits after the unlock rather than before it.
+      #
+      # `path:` keeps it out of the workspace root, so it cannot clean the shared
+      # checkout above back out and the order is free rather than a constraint.
+      #
+      # The sync step runs on a manual dispatch too, which it did not used to. The
+      # old guard was `github.event_name == 'pull_request'`, reasoned as "no PR
+      # merged, nothing to sync", and that reasoning is wrong in the one case that
+      # matters: a dispatch is what you reach for when the PR-triggered run could
+      # not run. On 2026-07-27 auth's PR-triggered unfreeze died as a
+      # `startup_failure` (an invalid caller, so zero jobs), the operator recovered
+      # with a dispatch, and it unfroze staging while silently skipping the sync —
+      # leaving main squash-merged into a `main` that `staging` did not contain,
+      # which had to be merged by hand an hour later. The escape hatch was strictly
+      # less capable than the path it exists to replace.
+      #
+      # Nothing needs the event to decide this: the sync step below already exits 0
+      # when `staging` is an ancestor of `main`, so a dispatch with genuinely
+      # nothing to sync is a logged no-op rather than a wasted push.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          path: repo
+
       - name: Sync main back into staging
+        working-directory: repo
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
@@ -149,8 +165,14 @@ jobs:
       # made every wrapper `if: failure()` and therefore incapable of ever saying
       # a failure had been FIXED. Ending the job with this step covers both
       # directions in one place for all seven consumers.
+      # `continue-on-error` because the alert must never decide the job's fate. It
+      # runs under `always()` on green runs too now, and the Slack action calls
+      # `core.setFailed` on any Slack-side error, so without this a rotated bot
+      # token or a bot removed from the channel would report a successful unfreeze
+      # as a failure.
       - name: Notify the engineering channel
         if: ${{ always() && job.status != 'cancelled' }}
+        continue-on-error: true
         uses: ./.ci-shared/notify-pipeline-status
         with:
           env-name: "staging unfreeze"

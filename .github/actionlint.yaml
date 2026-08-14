@@ -7,13 +7,26 @@ self-hosted-runner:
     - mdb-dev
     - mdb-prod
 
-# actionlint's model of the `github` context predates `job_workflow_sha`, which
-# is real and documented: "for jobs using a reusable workflow, the commit SHA for
-# the reusable workflow file". The reusables here use it to check their own
-# scripts out at their own commit, which is what makes a consumer's `@<sha>` pin
-# mean anything — pinning the workflow while its scripts float on `main` is not a
-# pin. The ignore is scoped to that one property name so nothing else is muted.
+# The reusables check their own scripts and composite out at `job.workflow_sha`,
+# the commit of the workflow file that defines the running job. That is what makes
+# a consumer's `@<sha>` pin mean anything, because pinning the workflow while its
+# scripts float on `main` is not a pin.
+#
+# actionlint 1.7.12 does not know the `job.workflow_*` properties yet. Its `job`
+# context model is `{check_run_id, container, services, status}`, and GitHub added
+# `workflow_ref`, `workflow_sha`, `workflow_repository` and `workflow_file_path`
+# in April 2026, after that release. The ignore is scoped to the one property name
+# so nothing else is muted, and it should be deleted once actionlint catches up.
+#
+# Do NOT reinstate the previous form of this ignore, which muted
+# `property "job_workflow_sha" is not defined`. That error was TRUE:
+# `github.job_workflow_sha` is an OIDC token claim and has never existed in the
+# `github` context (actions/runner#2417, "only supported as an OIDC claim"), so it
+# evaluated to empty and `actions/checkout` silently took the default branch —
+# exactly the un-pinned behaviour the comment above claimed to prevent. The tell
+# was that actionlint already carried the newer `github.workflow_ref` and
+# `github.workflow_sha`; it was not behind, the property was not real.
 paths:
   .github/workflows/**.yml:
     ignore:
-      - 'property "job_workflow_sha" is not defined'
+      - 'property "workflow_sha" is not defined'

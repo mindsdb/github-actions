@@ -365,12 +365,12 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     steps:
       - name: Check out the shared sweep and freeze contract
-        uses: actions/checkout@v5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: mindsdb/github-actions
           # The commit of THIS reusable, so a branch under review runs its own
           # version rather than silently testing main's.
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ job.workflow_sha }}
           path: .ci-shared
           persist-credentials: false
 
