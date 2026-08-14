@@ -74,7 +74,11 @@ jobs:
     secrets: inherit
 ```
 
-The reusables do **not** declare `actions: read` themselves. Declaring it would make every caller that has not yet granted it fail to *load* rather than merely degrade, and these wrappers reach a repo's default branch only at the next weekly release, so the two can never be merged in step. Without the grant the lookup is refused, says so in the log, and stays quiet.
+The four release-train reusables declare **no `permissions:` block at all**, so their job inherits exactly what the calling job grants. That is what makes the grant above work, and getting it wrong is silent: a `permissions:` block in a called workflow is the ceiling for its own token as well, so declaring `contents: read` there caps the token to `contents: read` and the recovery lookup is refused no matter what the caller granted. Declaring `actions: read` instead is not an option either — every caller that has not yet granted it would fail to *load*, and these wrappers reach a repo's default branch only at the next weekly release, so the two can never be merged in step. Inheriting gives both halves: the grant where a caller has it, and a refused lookup that logs why and stays quiet where it does not.
+
+The cost is worth naming. `scripts/workflow_graph.py` check 2 compares what a callee *declares* against what its callers grant, so a job that declares nothing is invisible to it. That check cannot help on these four.
+
+`notify-main-failure.yml` is the exception: it *does* declare `actions: read`, at workflow level, and always has. Every caller of it must grant the scope or the run is a `startup_failure`.
 
 ## Merge-to-main panic alerts
 
@@ -206,7 +210,13 @@ The same watchdog runs a second sweep, `red-branch-sweep` (on by default), for t
 
 It is a **backstop, not an echo**: a finding must be at least `min-age-minutes` old (default 30), which turns the message from "this failed" — which the pipeline already said — into "this is still failing and nobody has touched it". On `staging` it only speaks while the freeze is on, and **the window opening is itself a trigger**, so a branch that broke on Tuesday is reported on Friday. That is keyed on a successful run of the `Staging Freeze` workflow rather than on a clock, so moving the freeze moves the alerting with it and neither has to know about the other.
 
-`startup_failure` is reported only by the first sweep and excluded from this one, so one incident never produces two alerts. Selection logic lives in `scripts/branch_health.py` with unit tests, because it is date arithmetic plus a two-way trigger and that does not belong in a jq expression.
+`startup_failure` is reported only by the first sweep and excluded from this one, so one incident never produces two alerts. It still counts as the newest run, though, so a startup failure supersedes an older red rather than letting the sweep reach past it and report both.
+
+**Know how wide it is.** The sweep reads run history, not notify wiring, so by default it reports *any* red workflow on a swept branch — including a scheduled job or a one-off check that never opted into an in-run alert. Pass `workflows:` with the paths that matter to narrow it. The sweep never reports the watchdog itself, which it derives from `github.workflow_ref` rather than asking the caller.
+
+Age is measured from the current attempt's `run_started_at`, not the run's `created_at`. A re-run keeps the original `created_at` forever, so an age window measured from it filters out the very attempt that just failed — and a re-run is the most common way a failure gets fixed, or re-broken.
+
+Selection logic lives in `scripts/branch_health.py` with unit tests, because it is date arithmetic plus a two-way trigger and that does not belong in a jq expression.
 
 Alerts repeat, by design: one failing push produces about three messages at that cadence and window, and then silence. Alerting only on the *transition* into a broken state gives exactly one message per break, which was rejected after replaying it against the auth incident — it would have said nothing about the second failing push, since the run before that one had also failed to start. A stateless sweep cannot be exactly-once, so the choice is a message that can be missed or a few that cannot, and the window is what bounds the few.
 
@@ -258,7 +268,11 @@ They used to carry three separate copies of that knowledge, and only two of them
 
 The flip is a read-modify-write of the whole ruleset: a partial `PUT` is not guaranteed to preserve the fields it omits, and the omitted fields are the bypass actors and branch conditions, so getting it wrong unlocks the branch it was asked to lock. The body goes to a file and is never echoed, because three of the consuming repos are public and a ruleset body names its bypass actors.
 
-Every consumer checks these scripts out at `github.job_workflow_sha` — the commit of the reusable itself, not of `main`. Pinning a workflow while its scripts float is not a pin.
+The four release-train reusables and both notify reusables check these scripts out at `job.workflow_sha` — the commit of the workflow file that defines the running job, so a consumer that pins the workflow to a SHA gets that SHA's scripts too. Pinning a workflow while its scripts float is not a pin.
+
+Use `job.workflow_sha`, not `github.job_workflow_sha`. The latter looks right, is quoted in GitHub's OIDC documentation, and does not exist in the `github` context — it is a token claim only ([actions/runner#2417](https://github.com/actions/runner/issues/2417)), so it evaluates to empty and `actions/checkout` silently falls back to the default branch. GitHub added `job.workflow_sha`, `job.workflow_ref`, `job.workflow_repository` and `job.workflow_file_path` for exactly this in April 2026. actionlint does not know them yet, hence the scoped ignore in `.github/actionlint.yaml`.
+
+`workflow-lint.yml` deliberately does **not** pin: it pulls `scripts/workflow_graph.py` from the default branch, so a lint-rule fix reaches every consumer without seven wrapper bumps.
 
 ## Reading a Kubernetes secret
 
@@ -376,10 +390,9 @@ repo if desired; branch names default to `staging`/`main`. Each is triggers plus
 a `uses:` — **no notify job**, because every reusable posts its own.
 
 > **Pinning:** these call `@main`, matching every other call site in this repo.
-> The reusables check their own scripts and composite out at
-> `github.job_workflow_sha`, so a caller that *does* pin to a SHA gets that
-> SHA's behaviour end to end rather than a pinned workflow running `main`'s
-> logic. Note that the previously pinned wrappers had gone two commits stale and
+> The reusables check their own scripts and composite out at `job.workflow_sha`,
+> so a caller that *does* pin to a SHA gets that SHA's behaviour end to end
+> rather than a pinned workflow running `main`'s logic. Note that the previously pinned wrappers had gone two commits stale and
 > were still running a `release-unfreeze.yml` that skipped the sync-back on a
 > manual dispatch, months after that was fixed here.
 
@@ -480,15 +493,25 @@ on:
 permissions:
   contents: read
 
+# The find-then-create in the reusable is not atomic, so two overlapping runs
+# (the freeze and a staging merge in the same minute) would race.
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
 jobs:
   create-pr:
-    # A failed FREEZE means staging was never locked, so the release PR would be
-    # premature. A failed staging PIPELINE says nothing about what is queued, so
-    # the refresh still runs.
+    # Both sources spelled out. A failed FREEZE means staging was never locked, so
+    # the release PR would be premature. A failed staging PIPELINE says nothing
+    # about what is queued, so the refresh still runs. The pipeline is checked for
+    # `head_branch` because it can be dispatched on another ref; the freeze cannot
+    # be, since a `schedule` run is attributed to the default branch.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.name != 'Staging Freeze' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.name == 'Staging Freeze' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      (github.event.workflow_run.name == 'Staging - Build and Deploy on push to staging' &&
+       github.event.workflow_run.head_branch == 'staging')
     permissions:
       contents: read
       actions: read
