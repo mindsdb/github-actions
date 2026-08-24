@@ -214,6 +214,8 @@ It is a **backstop, not an echo**: a finding must be at least `min-age-minutes` 
 
 **Know how wide it is.** The sweep reads run history, not notify wiring, so by default it reports *any* red workflow on a swept branch — including a scheduled job or a one-off check that never opted into an in-run alert. Pass `workflows:` with the paths that matter to narrow it. The sweep never reports the watchdog itself, which it derives from `github.workflow_ref` rather than asking the caller.
 
+**What the wide default leaves out** is the runs GitHub synthesizes for its own products: `dynamic/dependabot/dependabot-updates`, `dynamic/github-code-scanning/codeql`, `dynamic/pages/pages-build-deployment`. They have no workflow file, GitHub attributes them to the default branch, and in a `main` run listing they look exactly like a pipeline. A Dependabot version update that fails is not a statement about whether `main` got deployed, which is the only thing either sweep is asking, so both sweeps drop the `dynamic/` prefix. Naming one in `workflows:` reports it again; an explicit ask wins.
+
 Age is measured from the current attempt's `run_started_at`, not the run's `created_at`. A re-run keeps the original `created_at` forever, so an age window measured from it filters out the very attempt that just failed — and a re-run is the most common way a failure gets fixed, or re-broken.
 
 Selection logic lives in `scripts/branch_health.py` with unit tests, because it is date arithmetic plus a two-way trigger and that does not belong in a jq expression.

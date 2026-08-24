@@ -34,7 +34,9 @@ What it deliberately does NOT report is ``startup_failure``. That is the case
 where GitHub rejected the run at load time and no job ran at all, which
 ``notify-startup-failure`` already sweeps for with a different message and a
 different thing to check. Splitting them keeps one finding from producing two
-alerts.
+alerts. Nor does it report the runs GitHub synthesizes for its own products
+(Dependabot updates, default-setup code scanning, Pages builds), which sit on the
+default branch and look like pipelines but say nothing about a deploy.
 
 When it fires, per branch:
 
@@ -79,6 +81,16 @@ Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 # failure that a later run had already replaced, giving two alerts for one branch.
 CONCLUSIVE = ("success", "failure", "timed_out", "startup_failure")
 RED = ("failure", "timed_out")
+
+# Runs GitHub synthesizes for its own products live under this prefix:
+# `dynamic/dependabot/dependabot-updates`, `dynamic/github-code-scanning/codeql`,
+# `dynamic/pages/pages-build-deployment`. They have no workflow file in the repo,
+# they are attributed to the default branch, and in a `main` run listing they look
+# exactly like a pipeline — so the wide default scope swept them in. A Dependabot
+# version update that fails alerted the channel as "main is still red", which says
+# nothing about whether main is deployed, and that is the only question this sweep
+# is asking. Naming one in `workflows:` still reports it: an explicit ask wins.
+SYNTHESIZED_PREFIX = "dynamic/"
 
 # The freeze workflow's per-repo wrapper keeps this name verbatim, because the
 # release-PR workflow chains off it by name. That makes it a stable handle for
@@ -147,11 +159,16 @@ def freeze_opened_within(freeze_runs: Iterable[dict], *, cutoff: datetime) -> bo
 def in_scope(path: str, *, only: Sequence[str], exclude: Sequence[str]) -> bool:
     """Whether this workflow file is one the sweep speaks about.
 
-    ``only`` empty means every workflow on the branch, which is the default and is
-    the widest this gets. It is worth knowing how wide that is: the sweep reads run
-    history, not the notify wiring, so it reports any red workflow on a deploy
+    ``only`` empty means every workflow FILE in the repo, which is the default and
+    is the widest this gets. It is worth knowing how wide that is: the sweep reads
+    run history, not the notify wiring, so it reports any red workflow on a deploy
     branch and not only the pipelines that opted into an in-run alert. A repo that
     wants it narrowed passes `workflows:` with the paths that matter.
+
+    What the wide default does NOT include is the runs GitHub synthesizes for its
+    own products (see ``SYNTHESIZED_PREFIX``), because none of them says anything
+    about whether the branch got deployed. An allowlist that names one overrides
+    that, so a repo can still ask for it.
 
     ``exclude`` always carries the sweep's own workflow. A watchdog whose own run
     went red would otherwise report itself on the next tick, which reads as a
@@ -159,7 +176,9 @@ def in_scope(path: str, *, only: Sequence[str], exclude: Sequence[str]) -> bool:
     """
     if path in exclude:
         return False
-    return not only or path in only
+    if only:
+        return path in only
+    return not path.startswith(SYNTHESIZED_PREFIX)
 
 
 def select_red(

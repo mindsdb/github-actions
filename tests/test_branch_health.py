@@ -262,6 +262,27 @@ class TestScope:
         )
         assert [f["path"] for f in findings] == ["a.yml"]
 
+    def test_a_synthesized_dependabot_run_is_not_a_pipeline(self):
+        """A red Dependabot update on `main` is not "main is still red"."""
+        runs = [run(path="dynamic/dependabot/dependabot-updates", run_id=1)]
+        assert select(runs, branch="main", frozen=False) == []
+
+    def test_the_other_synthesized_namespaces_are_out_too(self):
+        runs = [
+            run(path="dynamic/github-code-scanning/codeql", run_id=1),
+            run(path="dynamic/pages/pages-build-deployment", run_id=2),
+        ]
+        assert select(runs, branch="main", frozen=False) == []
+
+    def test_an_allowlist_that_names_a_synthesized_run_still_reports_it(self):
+        """The default is a scope decision, not a ban: an explicit ask wins."""
+        path = "dynamic/dependabot/dependabot-updates"
+        findings = health.select_red(
+            [run(path=path)], branch="main", cutoff=CUTOFF, settled=SETTLED, frozen=False,
+            staging_branch="staging", only=[path],
+        )
+        assert [f["path"] for f in findings] == [path]
+
     def test_the_sweep_never_reports_itself(self):
         """A watchdog whose own run went red would otherwise alert on itself."""
         runs = [run(path=".github/workflows/pipeline-watchdog.yml", run_id=1)]
