@@ -147,7 +147,7 @@ on:
         type: number
         default: 30
       workflows:
-        description: "Space-separated workflow paths the red-branch sweep may report on. Empty means every workflow with a run on these branches, which is wider than the set that opted into an in-run alert: the sweep reads run history, not notify wiring, so a red scheduled job or a red one-off check on a deploy branch counts too. Narrow it here if that is not wanted."
+        description: "Space-separated workflow paths the red-branch sweep may report on. Empty means every workflow FILE with a run on these branches, which is wider than the set that opted into an in-run alert: the sweep reads run history, not notify wiring, so a red scheduled job or a red one-off check on a deploy branch counts too. Narrow it here if that is not wanted. The runs GitHub synthesizes for its own products (`dynamic/...`: Dependabot updates, default-setup code scanning, Pages builds) are out of the wide default; name one here to get it back."
         type: string
         default: ""
       staging-branch:
@@ -181,7 +181,7 @@ on:
         type: number
         default: 30
       workflows:
-        description: "Workflow paths to report on (space separated); empty means all"
+        description: "Workflow paths to report on (space separated); empty means every workflow file, excluding GitHub's synthesized `dynamic/...` runs"
         type: string
         default: ""
       staging-branch:
@@ -253,8 +253,16 @@ jobs:
             # changes the display name, the path is stable). The previous run's
             # conclusion rides along for the message rather than as a filter, so
             # a failing push into an already-broken branch is still reported.
+            #
+            # `dynamic/` is the prefix on the runs GitHub synthesizes for its own
+            # products — Dependabot updates, default-setup code scanning, Pages
+            # builds. They have no workflow file, they sit on the default branch,
+            # and neither sweep is asking about them: "the branch is not deployed"
+            # is a statement about a pipeline. See SYNTHESIZED_PREFIX in
+            # scripts/branch_health.py, which drops them from the other sweep.
             jq --argjson cutoff "${CUTOFF}" --arg branch "${BRANCH}" '
               [ .workflow_runs[]
+                | select(.path | startswith("dynamic/") | not)
                 | select(.conclusion == "success" or .conclusion == "failure"
                          or .conclusion == "timed_out" or .conclusion == "startup_failure")
                 | { id, path, name, conclusion, created_at, head_sha, html_url,
