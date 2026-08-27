@@ -40,6 +40,10 @@
 # There is no runner input. This check calls the GitHub API and nothing else, so
 # it has no reason to sit on a pod inside our clusters, and leaving a knob here
 # is how ten repos ended up pointing it at `mdb-dev`.
+#
+# The ledger branch is created here rather than assumed. The action writes with
+# the contents API, which 404s on a branch that does not exist, so a repo
+# adopting this workflow would otherwise fail on its first signature.
 
 name: CLA Assistant
 
@@ -86,6 +90,29 @@ jobs:
       || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
     runs-on: ubuntu-latest
     steps:
+      # The action writes the ledger through the contents API, and that API
+      # cannot create a branch: it answers 404 for a `branch:` that does not
+      # exist, so the very first signature in a new repo fails and the
+      # contributor sees a red check with nothing to act on. Upstream never
+      # creates it and upstream is archived, so it is created here.
+      - name: Ensure the signature ledger branch exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LEDGER_BRANCH: ${{ inputs.branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh api "/repos/${REPO}/git/ref/heads/${LEDGER_BRANCH}" >/dev/null 2>&1; then
+            # Expect: this is the path every run after the first one takes
+            echo "Ledger branch ${LEDGER_BRANCH} already exists."
+            exit 0
+          fi
+          BASE=$(gh api "/repos/${REPO}" --jq .default_branch)
+          SHA=$(gh api "/repos/${REPO}/git/ref/heads/${BASE}" --jq .object.sha)
+          # Expect: refs/heads/<branch>, created at the default branch tip
+          gh api -X POST "/repos/${REPO}/git/refs" \
+            -f ref="refs/heads/${LEDGER_BRANCH}" -f sha="${SHA}" --jq .ref
+
       - name: "CLA Assistant"
         uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
