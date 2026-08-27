@@ -1,5 +1,5 @@
 # Reusable workflow: the CLA signature check on pull requests from outside
-# contributors, for the public repos (cowork, cowork-server, anton).
+# contributors, for the public repos.
 #
 # The bot comments on an unsigned PR, records a signature when the contributor
 # replies with the agreement sentence, and re-checks on `recheck`. Signatures are
@@ -11,7 +11,7 @@
 #   anton/.github/workflows/cla.yml
 #     name: "MindsDB Anton CLA Assistant"
 #     permissions:
-#       actions: write
+#       actions: read
 #       contents: write
 #       pull-requests: write
 #       statuses: write
@@ -30,6 +30,16 @@
 # The caller must declare those four permissions: the action writes the
 # signature file, comments on the PR, and sets the commit status, and a called
 # workflow can never hold more than its caller grants.
+#
+# `actions` is READ, not write. The only write it would buy is
+# `pullRerunRunner.ts`'s re-run of a previously failed CLA run, and that API
+# refuses a `GITHUB_TOKEN`, so the call fails and the action swallows the error.
+# The scope cannot be dropped entirely: the same file lists the repo's workflows
+# first, and `main.ts` turns any throw into a failed job.
+#
+# There is no runner input. This check calls the GitHub API and nothing else, so
+# it has no reason to sit on a pod inside our clusters, and leaving a knob here
+# is how ten repos ended up pointing it at `mdb-dev`.
 
 name: CLA Assistant
 
@@ -52,24 +62,32 @@ on:
         description: "Branch the signature ledger is committed to"
         type: string
         default: 'cla'
-      runs-on:
-        description: "Runner label for the check"
-        type: string
-        default: ubuntu-latest
 
 permissions:
-  actions: write
+  actions: read
   contents: write
   pull-requests: write
   statuses: write
 
 jobs:
   CLAssistant:
-    runs-on: ${{ inputs.runs-on }}
+    # Gate the JOB, not the step. Every caller also triggers on `issue_comment`,
+    # which fires on a comment on any issue in the repo, from any account. At
+    # step level that still starts a runner and then does nothing; here the run
+    # reports the job as skipped and claims nothing.
+    #
+    # Every `pull_request_target` runs, and that is deliberate: the bot has to
+    # look at each opened, synchronized and closed PR to decide whether its
+    # author has signed. Narrowing this to comments only is what leaves a repo
+    # with a CLA check that never asks anybody to sign.
+    if: >-
+      github.event_name == 'pull_request_target'
+      || github.event.comment.body == 'recheck'
+      || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
+    runs-on: ubuntu-latest
     steps:
       - name: "CLA Assistant"
-        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

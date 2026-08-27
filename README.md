@@ -357,10 +357,17 @@ the group name) and skipping auto-version commits with
 
 `cla-assistant.yml` runs the contributor-agreement check on the public repos. The
 wrapper keeps the `issue_comment` + `pull_request_target` triggers (the action
-reads those payloads directly) and the four write permissions, and passes the
+reads those payloads directly) and declares the permissions, and passes the
 per-repo agreement URL and allowlist:
 
 ```yaml
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
   cla:
     uses: mindsdb/github-actions/.github/workflows/cla-assistant.yml@<sha> # v1
     with:
@@ -369,7 +376,31 @@ per-repo agreement URL and allowlist:
 ```
 
 Signatures are committed to the calling repo's own `cla` branch, so each repo
-keeps its own ledger.
+keeps its own ledger. `path-to-signatures` and `branch` default to that shape;
+pass them only where a repo already keeps its ledger somewhere else.
+
+**There is no runner input, and that is the point.** This check calls the GitHub
+API and nothing else, so it never needs a pod in our clusters. Ten public repos
+reached `mdb-dev` through a hand-rolled copy of this job, and an outside account
+opening a pull request or leaving a comment started every one of those runs with
+no approval, because `pull_request_target` and `issue_comment` both execute in
+base-repo context.
+
+**The permission that is read rather than write is `actions`.** The upstream
+README asks for `actions: write`. The only write it buys is
+`pullRerunRunner.ts` re-running a previously failed CLA run, and that API
+refuses a `GITHUB_TOKEN`, so the call fails and the action logs and continues.
+Dropping the scope altogether does break it: the same file lists the repo's
+workflows first, and `main.ts` turns any throw into a failed job.
+
+**The job carries the event filter, not the step.** `issue_comment` fires on a
+comment on any issue in the repo, from any account. Filtering inside the step
+still starts a runner for every one of them. Filtering on the job means the run
+reports it as skipped. Every `pull_request_target` still runs, because the bot
+has to look at each opened, synchronized and closed pull request to decide
+whether its author has signed. Four repos learned that the hard way, gating on
+`github.event_name == 'pull_request'` while triggering on events that are not
+`pull_request`, so their check quietly never asked anybody to sign.
 
 ### Prerequisites (provisioned once, org level, scoped to the release-train repos)
 
