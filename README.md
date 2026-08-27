@@ -371,13 +371,31 @@ jobs:
   cla:
     uses: mindsdb/github-actions/.github/workflows/cla-assistant.yml@<sha> # v1
     with:
-      path-to-document: 'https://github.com/mindsdb/mindsdb/blob/main/assets/contributions-agreement/individual-contributor.md'
+      path-to-document: 'https://github.com/mindsdb/mindshub/blob/main/assets/contributions-agreement/individual-contributor.md'
       allowlist: bot*, ZoranPandovski, ...
 ```
+
+`mindsdb/mindshub` is the repository that holds the agreement. `mindsdb/mindsdb`
+and `mindsdb/minds` both still resolve to it through a rename redirect, and
+neither belongs in a new caller: a redirect stops being harmless the moment
+somebody creates a repository at the old name, and this is the page a
+contributor reads before agreeing to it.
 
 Signatures are committed to the calling repo's own `cla` branch, so each repo
 keeps its own ledger. `path-to-signatures` and `branch` default to that shape;
 pass them only where a repo already keeps its ledger somewhere else.
+
+**A new caller needs no setup, because the reusable creates the ledger itself.**
+Both halves of it, and the action supplies neither. The branch: the action writes
+through the contents API, and that API answers 404 for a `branch:` that does not
+exist rather than creating one. The file: the action does try, and the code is
+dead — `setupClaCheck.ts` guards its create path with `error.status === "404"`,
+a string compared strictly against Octokit's numeric `RequestError.status`, so
+the branch never runs and a missing ledger fails the job with `Could not
+retrieve repository contents. Status: 404` instead. Upstream is archived, so the
+first step creates the branch at the default-branch tip and seeds an empty
+ledger, byte-identical to what the action would have written. Every run after
+the first short-circuits on two API calls.
 
 **There is no runner input, and that is the point.** This check calls the GitHub
 API and nothing else, so it never needs a pod in our clusters. Ten public repos
