@@ -25,7 +25,9 @@
 #         uses: mindsdb/github-actions/.github/workflows/cla-assistant.yml@<sha> # v1
 #         with:
 #           path-to-document: 'https://github.com/mindsdb/mindshub/blob/main/assets/contributions-agreement/individual-contributor.md'
-#           allowlist: bot*, ZoranPandovski, ...
+#
+# That is the whole wrapper. `allowlist`, `path-to-signatures` and `branch` all
+# default, so a caller passes the agreement URL and nothing else.
 #
 # The caller must declare those four permissions: the action writes the
 # signature file, comments on the PR, and sets the commit status, and a called
@@ -46,6 +48,30 @@
 # exist; and its own handler for a missing FILE is dead code, because it
 # compares `error.status` against the string `"404"`. A repo adopting this
 # workflow would otherwise fail on its first signature either way.
+#
+# THE ALLOWLIST IS BOTS, NOT PEOPLE, AND IT LIVES HERE RATHER THAN PER REPO.
+#
+# Staff sign like everybody else. It is one comment, it produces an actual
+# signed record instead of an assumption that somebody's employment agreement
+# was in place and covered the work, and it removes a list that nobody prunes.
+# Fifteen repos previously carried six different hand-maintained lists naming
+# 25 people between them, and 11 of those 25 had already left the org, so each
+# was a former colleague still exempt from signing.
+#
+# Bots stay, because a bot cannot sign: it cannot post the agreement sentence,
+# so with no exemption its pull request is red forever. Only the two that
+# actually open pull requests here are listed. `github-actions[bot]` needs no
+# entry, since the action filters user id 41898282 in `graphql.ts` itself.
+#
+# Add a bot by editing the default below, not by passing the input. Anything
+# passed per repo drifts, which is the whole reason this moved.
+#
+# Never use a `*` wildcard here. The action turns `bot*` into
+# `new RegExp("bot.*").test(login)`, which is unanchored and searches anywhere
+# in the string, so `bot*` also exempts `robotnik`, `sabotage` and
+# `elliotbotson`. Anyone could opt out of the CLA by choosing a username. Every
+# entry is an exact, case-sensitive login: matching is `pattern === committer`,
+# so `Stpmax` never matched `StpMax` in any of the old lists.
 
 name: CLA Assistant
 
@@ -57,9 +83,9 @@ on:
         type: string
         required: true
       allowlist:
-        description: "Comma-separated logins exempt from signing (bots, employees)"
+        description: "Comma-separated logins exempt from signing. Bots only; see the header. Override only for a genuine one-off."
         type: string
-        required: true
+        default: 'dependabot[bot], mindsdb-release-train[bot]'
       path-to-signatures:
         description: "Signature ledger path inside the calling repo"
         type: string
