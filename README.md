@@ -358,7 +358,7 @@ the group name) and skipping auto-version commits with
 `cla-assistant.yml` runs the contributor-agreement check on the public repos. The
 wrapper keeps the `issue_comment` + `pull_request_target` triggers (the action
 reads those payloads directly) and declares the permissions, and passes the
-per-repo agreement URL and allowlist:
+agreement URL. That is the whole wrapper:
 
 ```yaml
 permissions:
@@ -372,7 +372,6 @@ jobs:
     uses: mindsdb/github-actions/.github/workflows/cla-assistant.yml@<sha> # v1
     with:
       path-to-document: 'https://github.com/mindsdb/mindshub/blob/main/assets/contributions-agreement/individual-contributor.md'
-      allowlist: bot*, ZoranPandovski, ...
 ```
 
 `mindsdb/mindshub` is the repository that holds the agreement. `mindsdb/mindsdb`
@@ -380,6 +379,30 @@ and `mindsdb/minds` both still resolve to it through a rename redirect, and
 neither belongs in a new caller: a redirect stops being harmless the moment
 somebody creates a repository at the old name, and this is the page a
 contributor reads before agreeing to it.
+
+**Staff sign like everybody else, and the allowlist is bots.** It defaults here
+and a wrapper does not pass it. Fifteen repos used to carry six different
+hand-maintained lists naming 25 people between them, and by the time anyone
+counted, 11 of those 25 had left the org and were still exempt from signing. A
+list of people is an access-control list, so it needs an owner and a review, and
+nobody was ever going to give six copies either. Asking an employee for one
+comment is cheaper, and it produces a signature rather than an assumption that
+an employment agreement was in place and covered the work.
+
+Bots stay, because a bot cannot sign. It cannot post the agreement sentence, so
+without an exemption its pull request is red forever, and `lightwood` alone has
+36 Dependabot pull requests in its last 100. Two are listed, `dependabot[bot]`
+and `mindsdb-release-train[bot]`, which are the only two that open pull requests
+anywhere in the fleet. `github-actions[bot]` needs no entry: the action already
+filters user id 41898282 in `graphql.ts`.
+
+**Never put a `*` in that list.** The action compiles `bot*` to
+`new RegExp("bot.*")` and calls `.test()`, which is unanchored and searches
+anywhere in the string, so `bot*` also exempts `robotnik`, `sabotage` and
+`elliotbotson`. That is an opt-out anybody can grant themselves by choosing a
+username. Every entry is an exact login and matching is case-sensitive
+`pattern === committer`, which is why the old lists' `Stpmax` never once matched
+`StpMax`. `tests/test_cla_allowlist.py` fails the build on either mistake.
 
 Signatures are committed to the calling repo's own `cla` branch, so each repo
 keeps its own ledger. `path-to-signatures` and `branch` default to that shape;
