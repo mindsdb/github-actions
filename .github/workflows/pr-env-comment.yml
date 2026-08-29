@@ -206,7 +206,7 @@ jobs:
               ALL="$(jq -cn --arg e "$ENV_NAME" --arg d "$HOST_SUFFIX" --argjson extra "${LINKS:-[]}" '
                 [ {label: "Console",   url: "https://\($e).\($d)"},
                   {label: "Auth API",        url: "https://auth-\($e).\($d)"},
-                  {label: "Cowork Web",   url: "https://cowork-\($e).\($d)"} ]
+                  {label: "Cowork Web",   url: "https://cowork-\($e).\($d)"},
                   {label: "Keycloak Admin",  url: "https://auth-\($e).\($d)/auth/admin/"},
                   {label: "Inference API",   url: "https://api-\($e).\($d)/v1"},
                   {label: "Cowork Server API",   url: "https://cowork-\($e).\($d)/api"} ]
