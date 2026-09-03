@@ -55,6 +55,28 @@
 # Must run from a `pull_request` event; PR number and head SHA are read from
 # $GITHUB_EVENT_PATH so callers don't have to pass them.
 #
+# ENDPOINT. The action talks to the in-cluster Service
+# (`argo-cd-argocd-server.argocd.svc.cluster.local`) by default, not to
+# `argo.dev.mindsdb.com`. Every caller runs on `mdb-dev`, a runner pod in the
+# same cluster, so the Service is the shortest path and the only one that does
+# not depend on ingress or DNS state. It also holds while the internal-ops
+# cutover (ENG-2079) is mid-flight: `argo.dev.mindsdb.com` moved to the private
+# ingress class before its private DNS record existed, so the public hostname
+# resolves to the public ALB, whose controller no longer reconciles that Ingress
+# and answers a bare HTTP 404. The argocd CLI surfaces that as
+# `rpc error: code = Unknown ... status code 404`, which matches none of the
+# tolerated states in the `app set` retry below and fails the deploy.
+#
+# argocd-server runs with `server.insecure: true`, so it serves cleartext on
+# Service port 80 and expects TLS to terminate at the ingress. `--plaintext` is
+# therefore required for the Service and wrong for the hostname; the
+# `argocd-plaintext: auto` default derives it from `argocd-server` so the two
+# inputs cannot drift apart. Pass the public hostname to route through the
+# ingress instead, which needs the runner to be inside the VPC or on the VPN.
+#
+# The `ci-pr-envs` token is a JWT the server validates itself, so it is
+# unaffected by which endpoint is used.
+#
 # Requires `curl` + `jq` on the runner. Does NOT require `gh` (the action
 # talks to the GitHub REST API directly). Uses the ambient `aws` CLI for
 # the ECR existence checks when present (degrades to a warning when not).
@@ -71,9 +93,20 @@ inputs:
     description: GitHub PAT used to query cross-referenced PRs' head SHAs.
     required: true
   argocd-server:
-    description: ArgoCD server hostname.
+    description: >-
+      ArgoCD server endpoint. Defaults to the in-cluster Service, because every
+      caller of this action runs on `mdb-dev`, a runner pod in the same cluster.
+      Set the public hostname (`argo.dev.mindsdb.com`) to go through the ingress
+      instead; that route is reachable only from inside the VPC or over the VPN.
     required: false
-    default: argo.dev.mindsdb.com
+    default: argo-cd-argocd-server.argocd.svc.cluster.local
+  argocd-plaintext:
+    description: >-
+      Whether to talk to the server over cleartext HTTP. `auto` (default) picks
+      it from `argocd-server`: cleartext for an in-cluster or loopback endpoint,
+      TLS for anything else. `true`/`false` override that.
+    required: false
+    default: auto
   argocd-version:
     description: ArgoCD CLI version installed when missing from the runner.
     required: false
@@ -92,6 +125,7 @@ runs:
     - shell: bash
       env:
         ARGOCD_SERVER: ${{ inputs.argocd-server }}
+        ARGOCD_PLAINTEXT: ${{ inputs.argocd-plaintext }}
         ARGOCD_AUTH_TOKEN: ${{ inputs.argocd-token }}
         ARGOCD_VERSION: ${{ inputs.argocd-version }}
         GH_TOKEN: ${{ inputs.gh-token }}
@@ -391,6 +425,40 @@ runs:
           fi
         fi
 
+        # Flags every argocd call needs, resolved once.
+        #
+        # --grpc-web is unconditional: it is harmless on a direct connection and
+        # required through the nginx ingress.
+        #
+        # --plaintext is the endpoint question. argocd-server runs with
+        # `server.insecure: true`, so it serves cleartext on Service port 80 and
+        # expects TLS to terminate upstream at the ingress. Talking to the
+        # Service directly therefore MUST be plaintext, and talking to the public
+        # hostname must NOT be. `auto` reads that off the endpoint rather than
+        # making callers keep two inputs consistent by hand; an explicit
+        # true/false still wins for anything this rule does not cover.
+        case "${ARGOCD_PLAINTEXT:-auto}" in
+          true)  ARGOCD_PLAINTEXT_RESOLVED=true ;;
+          false) ARGOCD_PLAINTEXT_RESOLVED=false ;;
+          auto)
+            case "$ARGOCD_SERVER" in
+              *.svc.cluster.local|*.svc.cluster.local:*|*.svc|*.svc:*|localhost|localhost:*|127.0.0.1|127.0.0.1:*)
+                ARGOCD_PLAINTEXT_RESOLVED=true ;;
+              *)
+                ARGOCD_PLAINTEXT_RESOLVED=false ;;
+            esac
+            ;;
+          *)
+            echo "::error::argocd-plaintext must be 'auto', 'true' or 'false' (got '${ARGOCD_PLAINTEXT}')."
+            exit 1
+            ;;
+        esac
+        ARGOCD_FLAGS=(--grpc-web)
+        if [ "$ARGOCD_PLAINTEXT_RESOLVED" = true ]; then
+          ARGOCD_FLAGS+=(--plaintext)
+        fi
+        echo "ArgoCD endpoint: ${ARGOCD_SERVER} (plaintext=${ARGOCD_PLAINTEXT_RESOLVED})"
+
         # Skip `argocd login` — it doesn't honour --auth-token (login only
         # accepts username/password/sso), and the ARGOCD_SERVER +
         # ARGOCD_AUTH_TOKEN env vars set above are picked up by every
@@ -409,7 +477,7 @@ runs:
         # typical Application finaliser cleanup.
         echo "argocd app set ${PARENT_APP} ${set_args[*]}"
         for i in $(seq 1 30); do
-          if set_err="$("$ARGOCD_BIN" app set "$PARENT_APP" --grpc-web "${set_args[@]}" 2>&1)"; then
+          if set_err="$("$ARGOCD_BIN" app set "$PARENT_APP" "${ARGOCD_FLAGS[@]}" "${set_args[@]}" 2>&1)"; then
             break
           fi
           case "$set_err" in
@@ -441,7 +509,7 @@ runs:
         # nothing is running the CLI errors ("Unable to terminate operation.
         # No operation is in progress"), which is the normal case and fine.
         # (TerminateOperation requires the `applications, sync` RBAC grant.)
-        if term_err="$("$ARGOCD_BIN" app terminate-op "$PARENT_APP" --grpc-web 2>&1)"; then
+        if term_err="$("$ARGOCD_BIN" app terminate-op "$PARENT_APP" "${ARGOCD_FLAGS[@]}" 2>&1)"; then
           echo "Terminated in-flight sync on ${PARENT_APP}; automated sync will restart with the new parameters."
         else
           echo "No in-flight sync to terminate on ${PARENT_APP} (${term_err})."
@@ -460,7 +528,7 @@ runs:
         # That's the success case for us — bail with a friendly log, not
         # exit 1. Any other failure (RBAC, connectivity) still fatals.
         echo "argocd app sync ${PARENT_APP} --async"
-        if sync_err="$("$ARGOCD_BIN" app sync "$PARENT_APP" --grpc-web --async 2>&1)"; then
+        if sync_err="$("$ARGOCD_BIN" app sync "$PARENT_APP" "${ARGOCD_FLAGS[@]}" --async 2>&1)"; then
           echo "Sync queued."
         else
           case "$sync_err" in
@@ -485,7 +553,7 @@ runs:
         # onto every child, so this one selector covers both.
         WAIT_SELECTOR="pr-env.mindsdb.com/anchor-repo=${OWN_SLUG},pr-env.mindsdb.com/pr-number=${PR_NUMBER}"
         echo "argocd app wait -l ${WAIT_SELECTOR} --sync --health --operation --timeout ${WAIT_TIMEOUT}"
-        if "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" --grpc-web --sync --health --operation --timeout "$WAIT_TIMEOUT"; then
+        if "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" "${ARGOCD_FLAGS[@]}" --sync --health --operation --timeout "$WAIT_TIMEOUT"; then
           exit 0
         fi
 
@@ -498,7 +566,7 @@ runs:
         # up here as SharedResourceWarning. Never let the diagnostics
         # themselves fail the step ahead of the explicit exit below.
         echo "::error::PR env did not converge within ${WAIT_TIMEOUT}s. State at timeout:"
-        "$ARGOCD_BIN" app list -l "$WAIT_SELECTOR" --grpc-web -o json 2>/dev/null | jq -r '
+        "$ARGOCD_BIN" app list -l "$WAIT_SELECTOR" "${ARGOCD_FLAGS[@]}" -o json 2>/dev/null | jq -r '
           .[] | "  \(.metadata.name)  sync=\(.status.sync.status)  health=\(.status.health.status)",
                 (.status.conditions[]? | "      \(.type): \(.message)")
         ' >&2 || true

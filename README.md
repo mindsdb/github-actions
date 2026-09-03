@@ -305,6 +305,40 @@ What actually goes wrong with a GitHub secret is different and has a cheaper fix
 
 `k8s-secret` is also not a containment boundary. The ability to read Secrets belongs to the self-hosted runner, which holds cluster credentials because it deploys. What bounds *that* is who can trigger a run on such a runner — hence a `pull_request`-triggered job on a public repo needs `if: github.event.pull_request.head.repo.full_name == github.repository` — and the runner ServiceAccount's RBAC.
 
+## PR environment rollout
+
+`argocd-pr-env-deploy` applies a PR's image tags to its ArgoCD environment and
+blocks until the environment is Synced and Healthy.
+
+It talks to ArgoCD over the **in-cluster Service** by default
+(`argo-cd-argocd-server.argocd.svc.cluster.local`), not over the public
+hostname. Every caller runs on `mdb-dev`, a runner pod in the same cluster, so
+the Service is the shortest path and the only one that does not depend on
+ingress or DNS state. The public hostname sits behind the internal-ops ingress
+and is reachable only from inside the VPC or over the VPN.
+
+`argocd-plaintext` defaults to `auto` and derives the transport from
+`argocd-server`: cleartext for an in-cluster or loopback endpoint, TLS for
+anything else. argocd-server runs with `server.insecure: true`, so it serves
+cleartext on Service port 80 and expects TLS to terminate at the ingress. That
+makes the two inputs a matched pair, which is why one derives from the other
+instead of both being set by hand.
+
+```yaml
+  deploy-pr-env:
+    runs-on: mdb-dev
+    steps:
+      - uses: mindsdb/github-actions/argocd-pr-env-deploy@main
+        with:
+          argocd-token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          gh-token: ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}
+          # Only when the runner is outside the cluster:
+          # argocd-server: argo.dev.mindsdb.com
+```
+
+The `ci-pr-envs` token is a JWT the server validates itself, so it works
+unchanged over either endpoint.
+
 ## PR environment comments
 
 `pr-env-comment.yml` posts and keeps updating one comment saying where a PR's environment is and how to sign in. The account, Secret name, namespace, and hosts arrive as **inputs** — this repo is public, and while none of those is a credential, together they are a free recon package. The mechanism is shared; the facts stay in the private caller. A reusable that cannot be described without naming our infrastructure has not earned promotion here.
