@@ -13,6 +13,78 @@ Use an action from this repo in your workflow like this:
 
 **NOTE: This needs to go AFTER any `actions/checkout` step for the current repo**
 
+## Public web probe
+
+The `Public web probe` workflow checks public Console routes, Cowork, and the MindsHub website every
+five minutes. It runs from a GitHub-hosted runner, so it tests the same edge routes a user reaches
+without depending on either Kubernetes cluster. Every response must be exactly `200`, redirects are
+not followed, and each endpoint must contain its own stable body marker.
+
+The monitoring tiers use the shortest cadence that each runner supports:
+
+| Tier | Cadence | Runner | Contract |
+| --- | --- | --- | --- |
+| Origin uptime | 60 seconds | Cloudflare Health Checks | Direct production Console and Cowork ALB routes plus the stable website Pages hostname return 200 with their body markers |
+| Public route matrix | 5 minutes | This GitHub Actions workflow | Every endpoint below serves its expected body through the edge |
+| Staging integration | Nightly | Each service repository | Existing deployed suites run with writes allowed |
+| Production smoke | Nightly | `cowork-server` | A bounded authenticated GET-only selection runs without writes or model turns |
+| Certificates | Existing | Prometheus | `CertificatesExpiringIn7Days` retains certificate coverage |
+
+An authenticated 15-minute browser journey is not scheduled by this work. It needs a separate
+interaction contract and test plan before it can become an actionable signal.
+
+The first attempt covers 20 public endpoints: all 18 Console environment and route pairs, the Cowork
+root, and the MindsHub website root. If any endpoint fails, the script waits 15 seconds and retries
+only those failures. A recovered retry keeps the run green and sends no failure alert. An endpoint
+that fails twice makes the run red and passes every persistent failure to
+`notify-main-failure.yml`, which posts to the engineering Slack channel. That message names each
+failing environment, route, and observed result. A `200` response without the configured marker is
+reported as either `status 200 missing SPA marker` or `status 200 missing website marker`. The next
+successful run uses that reusable workflow's existing recovery lookup, so routine green runs stay
+silent.
+
+The reviewable source of truth is [`config/console-route-probe.json`](config/console-route-probe.json).
+The Console matrix crosses these environments:
+
+<!-- console-route-probe-environments:start -->
+- `production`: `https://console.mindshub.ai`
+- `staging`: `https://console.staging.mindshub.ai`
+<!-- console-route-probe-environments:end -->
+
+with these routes:
+
+<!-- console-route-probe-routes:start -->
+- `/`
+- `/home`
+- `/cowork`
+- `/cowork-web`
+- `/login`
+- `/settings`
+- `/billing`
+- `/projects`
+- `/assets/`
+<!-- console-route-probe-routes:end -->
+
+The same configuration checks two production roots separately because they do not serve the nine
+Console routes:
+
+<!-- standalone-public-probes:start -->
+- `production Cowork`: `https://cowork.mindshub.ai/` requires `<div id="root"></div>`
+- `production website`: `https://mindshub.ai/` requires `<meta property="og:site_name" content="MindsHub by MindsDB">`
+<!-- standalone-public-probes:end -->
+
+Run the same probe locally without changing its production configuration:
+
+```bash
+python3 scripts/probe_console_routes.py --retry-delay-seconds 0
+```
+
+ENG-2317 is the activation gate. Do not merge or promote this workflow to the `github-actions`
+`main` branch, and do not manually dispatch it, until ENG-2317 is deployed to production and the
+local command above passes all 18 Console environment and route pairs and all 20 public endpoints. A
+merge to `main` enables the cron; a merge or dispatch before that gate can send an immediate failure
+or recovery message through the real Slack integration.
+
 ## Release-train reusable workflows
 
 Four reusable workflows automate the weekly `staging → main` release cycle.

@@ -1,0 +1,40 @@
+{
+  "spa_marker": "<div id=\"root\"></div>",
+  "environments": [
+    {
+      "name": "production",
+      "base_url": "https://console.mindshub.ai"
+    },
+    {
+      "name": "staging",
+      "base_url": "https://console.staging.mindshub.ai"
+    }
+  ],
+  "routes": [
+    "/",
+    "/home",
+    "/cowork",
+    "/cowork-web",
+    "/login",
+    "/settings",
+    "/billing",
+    "/projects",
+    "/assets/"
+  ],
+  "standalone_endpoints": [
+    {
+      "name": "production Cowork",
+      "base_url": "https://cowork.mindshub.ai",
+      "route": "/",
+      "body_marker": "<div id=\"root\"></div>",
+      "marker_label": "SPA"
+    },
+    {
+      "name": "production website",
+      "base_url": "https://mindshub.ai",
+      "route": "/",
+      "body_marker": "<meta property=\"og:site_name\" content=\"MindsHub by MindsDB\">",
+      "marker_label": "website"
+    }
+  ]
+}
