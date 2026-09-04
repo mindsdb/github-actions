@@ -54,12 +54,12 @@ inputs:
     description: "'true' to stay silent entirely while the staging freeze window is closed"
     required: false
     default: "false"
-  ruleset-name:
-    description: "The freeze ruleset to read"
+  freeze-property:
+    description: "The freeze custom property to read"
     required: false
-    default: staging-freeze
+    default: staging_frozen
   freeze-token:
-    description: "A release-train App token that can read rulesets. Empty means 'could not mint', which escalates to frozen."
+    description: "A release-train App token. Empty means 'could not mint', which escalates to frozen."
     required: false
     default: ""
   github-token:
@@ -92,14 +92,14 @@ runs:
     # the prior-run lookup that recovery mode would otherwise spend an API call
     # on.
     #
-    # The signal is the repository ruleset that the freeze/unfreeze workflows
-    # toggle, not an inference from workflow-run history: a freeze that skipped
+    # The signal is the `staging_frozen` custom property that the freeze/unfreeze
+    # workflows set, not an inference from workflow-run history: a freeze that skipped
     # itself because staging had nothing unreleased still concludes `success`,
     # and history cannot tell that apart from a real freeze.
     #
     # `scripts/freeze_state.py` is also what those workflows use to WRITE it, so
-    # one file owns the ruleset contract and renaming a ruleset is one edit
-    # rather than four that agree by luck.
+    # one file owns the contract and renaming the property is one edit rather
+    # than four that agree by luck.
     - name: Check release-freeze state
       id: freeze
       if: inputs.freeze-scoped == 'true'
@@ -107,7 +107,7 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.freeze-token }}
         REPO: ${{ github.repository }}
-        RULESET_NAME: ${{ inputs.ruleset-name }}
+        FREEZE_PROPERTY: ${{ inputs.freeze-property }}
         SHARED: ${{ inputs.shared-path }}
       run: |
         set -uo pipefail
@@ -121,7 +121,7 @@ runs:
           exit 0
         fi
         python3 "${SHARED}/scripts/freeze_state.py" read \
-          --repo "${REPO}" --ruleset-name "${RULESET_NAME}" --on-error escalate
+          --repo "${REPO}" --property-name "${FREEZE_PROPERTY}" --on-error escalate
 
     # For the recovery message, find out how the PREVIOUS conclusive run of this
     # same workflow on this same branch ended. This step only gathers evidence;
