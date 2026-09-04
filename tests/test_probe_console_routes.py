@@ -50,12 +50,23 @@ EXPECTED_STANDALONE_ENDPOINTS = (
         "SPA",
     ),
     (
+        "staging Cowork",
+        "https://cowork.staging.mindshub.ai",
+        "/",
+        CONSOLE_MARKER,
+        "SPA",
+    ),
+    (
         "production website",
         "https://mindshub.ai",
         "/",
         '<meta property="og:site_name" content="MindsHub by MindsDB">',
         "website",
     ),
+)
+EXPECTED_CONSOLE_ENDPOINT_COUNT = len(EXPECTED_ENVIRONMENTS) * len(EXPECTED_ROUTES)
+EXPECTED_ENDPOINT_COUNT = EXPECTED_CONSOLE_ENDPOINT_COUNT + len(
+    EXPECTED_STANDALONE_ENDPOINTS
 )
 SPA_SHELL = """<!doctype html><html><body><div id="root"></div></body></html>"""
 WEBSITE_PAGE = (
@@ -86,6 +97,10 @@ def standalone_endpoint(base_url):
 
 def cowork_endpoint():
     return standalone_endpoint("https://cowork.mindshub.ai")
+
+
+def staging_cowork_endpoint():
+    return standalone_endpoint("https://cowork.staging.mindshub.ai")
 
 
 def website_endpoint():
@@ -135,6 +150,9 @@ class TestResponseContract:
 
     def test_200_cowork_spa_shell_passes(self):
         assert probe.evaluate(cowork_endpoint(), response()) is None
+
+    def test_200_staging_cowork_spa_shell_passes(self):
+        assert probe.evaluate(staging_cowork_endpoint(), response()) is None
 
     def test_200_website_marker_passes(self):
         assert probe.evaluate(website_endpoint(), response(body=WEBSITE_PAGE)) is None
@@ -207,7 +225,7 @@ class TestRetryDebounce:
         )
         assert outcome.passed
         assert outcome.first_failures == ()
-        assert len(fetcher.calls) == 20
+        assert len(fetcher.calls) == EXPECTED_ENDPOINT_COUNT
         assert sleeper_calls == []
 
     def test_one_failed_attempt_then_success_is_green(self):
@@ -229,7 +247,7 @@ class TestRetryDebounce:
         assert outcome.final_failures == ()
         assert sleeper_calls == [7]
         assert Counter(url for url, _ in fetcher.calls)[target] == 2
-        assert len(fetcher.calls) == 21
+        assert len(fetcher.calls) == EXPECTED_ENDPOINT_COUNT + 1
 
     def test_website_failure_then_success_is_green(self):
         target = website_endpoint().url
@@ -307,7 +325,7 @@ class TestRetryDebounce:
         assert len(label) <= probe.MAX_ALERT_LABEL_CHARS
         for failure in failures:
             assert failure.summary in label
-        assert label.count("status 503") == 20
+        assert label.count("status 503") == EXPECTED_ENDPOINT_COUNT
         assert output.read_text(encoding="utf-8") == f"alert_label={label}\n"
 
     def test_transient_outcome_makes_main_exit_green_and_write_a_quiet_label(
@@ -318,7 +336,9 @@ class TestRetryDebounce:
         monkeypatch.setattr(
             probe,
             "run_probe",
-            lambda *args, **kwargs: probe.ProbeOutcome(20, (failure,), ()),
+            lambda *args, **kwargs: probe.ProbeOutcome(
+                EXPECTED_ENDPOINT_COUNT, (failure,), ()
+            ),
         )
         assert (
             probe.main(["--github-output", str(output), "--retry-delay-seconds", "0"])
@@ -334,7 +354,9 @@ class TestRetryDebounce:
         monkeypatch.setattr(
             probe,
             "run_probe",
-            lambda *args, **kwargs: probe.ProbeOutcome(20, (failure,), (failure,)),
+            lambda *args, **kwargs: probe.ProbeOutcome(
+                EXPECTED_ENDPOINT_COUNT, (failure,), (failure,)
+            ),
         )
         assert (
             probe.main(["--github-output", str(output), "--retry-delay-seconds", "0"])
@@ -360,8 +382,11 @@ class TestConfigurationAndDocumentation:
         environments = tuple((item.name, item.base_url) for item in config.environments)
         assert environments == EXPECTED_ENVIRONMENTS
         assert config.routes == EXPECTED_ROUTES
-        assert len(config.console_endpoints) == 18
-        assert len({item.url for item in config.console_endpoints}) == 18
+        assert len(config.console_endpoints) == EXPECTED_CONSOLE_ENDPOINT_COUNT
+        assert (
+            len({item.url for item in config.console_endpoints})
+            == EXPECTED_CONSOLE_ENDPOINT_COUNT
+        )
         standalone = tuple(
             (
                 item.environment,
@@ -373,8 +398,8 @@ class TestConfigurationAndDocumentation:
             for item in config.standalone_endpoints
         )
         assert standalone == EXPECTED_STANDALONE_ENDPOINTS
-        assert len(config.endpoints) == 20
-        assert len({item.url for item in config.endpoints}) == 20
+        assert len(config.endpoints) == EXPECTED_ENDPOINT_COUNT
+        assert len({item.url for item in config.endpoints}) == EXPECTED_ENDPOINT_COUNT
 
     @pytest.mark.parametrize(
         ("field", "value", "message"),
@@ -470,7 +495,7 @@ class TestConfigurationAndDocumentation:
     def test_readme_records_the_tier_and_cadence_decisions(self):
         readme = README_PATH.read_text(encoding="utf-8")
         for contract in (
-            "| Origin uptime | 60 seconds | Cloudflare Health Checks |",
+            "| Public uptime | 60 seconds | Cloudflare Health Checks |",
             "| Public route matrix | 5 minutes | This GitHub Actions workflow |",
             "| Staging integration | Nightly | Each service repository |",
             "| Production smoke | Nightly | `cowork-server` |",
@@ -485,7 +510,7 @@ class TestConfigurationAndDocumentation:
         assert "ENG-2317 is the activation gate." in readme
         assert "Do not merge or promote this workflow" in readme
         assert "passes all 18 Console environment and route pairs" in readme
-        assert "all 20 public endpoints" in readme
+        assert f"all {EXPECTED_ENDPOINT_COUNT} public endpoints" in readme
 
     def test_workflow_runs_every_five_minutes_and_keeps_the_notify_terminal(self):
         workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
@@ -530,7 +555,10 @@ class TestConfigurationAndDocumentation:
             "routes",
             "standalone_endpoints",
         }
-        assert len(raw["environments"]) * len(raw["routes"]) == 18
+        assert (
+            len(raw["environments"]) * len(raw["routes"])
+            == EXPECTED_CONSOLE_ENDPOINT_COUNT
+        )
         assert (
             tuple(
                 (
