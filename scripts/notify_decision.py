@@ -24,20 +24,29 @@ The three outcomes:
     half of a story the channel was never told is worse than posting neither.
 
 ``alert``
-    A failure. Always posts, because the freeze veto above is the only thing that
-    may suppress one.
+    A failure whose predecessor was not already failing. The freeze veto above is
+    the only other thing that may suppress one. A failure after a failure posts
+    nothing: the channel has already been told, and a standing breakage that
+    re-pages on every run is how a real alert gets missed. ENG-2324's public web
+    probe runs every five minutes, so one unfixed route was worth about 220 Slack
+    messages a day until this rule existed.
 
 ``recovered``
     A success whose predecessor failed. Posts only on that evidence, or when
     ``--force-post`` says this is the smoke test. A green run after a green run
     posts nothing, which is what keeps the channel worth reading.
 
+Both directions therefore turn on the same evidence, and they fail open in
+opposite directions on purpose. No evidence posts an alert and withholds a
+recovery, because an unreported failure is the expensive mistake and a duplicate
+alert is the cheap one.
+
 ``--prev-conclusion`` is the conclusion of the previous conclusive run, or of the
 previous attempt of this run. Empty means "no evidence": either the lookup was
 never made because nothing was going to post anyway, or it was refused. Refused
-is the common one — the recovery lookup needs ``actions: read`` on the calling
-job — and it has to read as "not a recovery" rather than as an error, because a
-notify step must never turn a green pipeline red.
+is the common one — the lookup needs ``actions: read`` on the calling job — and
+it has to read as "not a recovery" rather than as an error, because a notify step
+must never turn a green pipeline red.
 """
 
 from __future__ import annotations
@@ -80,7 +89,10 @@ def decide(
         level = "recovered"
         post = force_post == "true" or prev_conclusion in FAILED_CONCLUSIONS
     else:
-        level, post = "alert", True
+        level = "alert"
+        # Only evidence of an already-failing predecessor suppresses an alert. An
+        # empty conclusion is absence of evidence, so it still pages.
+        post = force_post == "true" or prev_conclusion not in FAILED_CONCLUSIONS
 
     return {"post": "true" if post else "false", "level": level, **STYLES[level]}
 
@@ -90,7 +102,12 @@ def why(decision: dict[str, str], *, status: str, force_post: str, prev_conclusi
     if decision["level"] == "silenced":
         return "Freeze-scoped and the window is closed, so nothing posts in either direction."
     if decision["level"] == "alert":
-        return "Posting a failure."
+        if decision["post"] == "true":
+            return "Posting a failure."
+        return (
+            f"Previous run also concluded '{prev_conclusion}', so this breakage has already "
+            "been reported. Staying quiet until it recovers."
+        )
     if force_post == "true":
         return "Posting a recovery unconditionally (--force-post: this is the smoke test)."
     if decision["post"] == "true":
@@ -121,9 +138,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force-post",
         default="false",
-        help="post a recovery without evidence; set only by the notify workflow's own smoke-test dispatch",
+        help="post without evidence in either direction; set only by the notify workflow's own smoke-test dispatch",
     )
-    parser.add_argument("--prev-conclusion", default="", help="empty means no evidence either way")
+    parser.add_argument(
+        "--prev-conclusion",
+        default="",
+        help="empty means no evidence either way, which posts an alert and withholds a recovery",
+    )
     args = parser.parse_args(argv)
 
     decision = decide(
