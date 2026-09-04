@@ -352,8 +352,32 @@ def format_alert_label(failures: Sequence[Failure]) -> str:
 
     if not failures:
         return DEFAULT_ALERT_LABEL
-    summaries = "; ".join(failure.summary for failure in failures)
-    return _compact(f"public routes: {summaries}", limit=MAX_ALERT_LABEL_CHARS)
+
+    label_prefix = "public routes: "
+    separator = "; "
+    full_label = label_prefix + separator.join(failure.summary for failure in failures)
+    if len(full_label) <= MAX_ALERT_LABEL_CHARS:
+        return full_label
+
+    # A broad DNS or TLS outage can put the maximum-length network detail on all
+    # 21 endpoints. The full details remain in the workflow log; the Slack label
+    # keeps every endpoint identity and its actionable result category.
+    compact_summaries = separator.join(
+        f"{failure.endpoint.environment} {failure.endpoint.route} "
+        f"{_compact_alert_reason(failure.reason)}"
+        for failure in failures
+    )
+    compact_label = label_prefix + compact_summaries
+    if len(compact_label) > MAX_ALERT_LABEL_CHARS:
+        raise ValueError("failure identities exceed the alert-label size limit")
+    return compact_label
+
+
+def _compact_alert_reason(reason: str) -> str:
+    network_prefix = "network error"
+    if reason.startswith(f"{network_prefix}: "):
+        return network_prefix
+    return reason
 
 
 def write_github_output(path: str | None, *, alert_label: str) -> None:

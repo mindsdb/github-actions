@@ -328,6 +328,29 @@ class TestRetryDebounce:
         assert label.count("status 503") == EXPECTED_ENDPOINT_COUNT
         assert output.read_text(encoding="utf-8") == f"alert_label={label}\n"
 
+    def test_network_outage_label_keeps_all_21_endpoints_and_results(self):
+        failures = tuple(
+            probe.evaluate(
+                target,
+                probe.FetchResult(
+                    status=None,
+                    error="x" * (probe.MAX_NETWORK_ERROR_CHARS + 10),
+                ),
+            )
+            for target in probe.load_config().endpoints
+        )
+        assert all(failures)
+
+        label = probe.format_alert_label(failures)
+
+        assert len(label) <= probe.MAX_ALERT_LABEL_CHARS
+        assert label.count("network error") == EXPECTED_ENDPOINT_COUNT
+        for failure in failures:
+            endpoint_result = (
+                f"{failure.endpoint.environment} {failure.endpoint.route} network error"
+            )
+            assert endpoint_result in label
+
     def test_transient_outcome_makes_main_exit_green_and_write_a_quiet_label(
         self, tmp_path, monkeypatch
     ):
