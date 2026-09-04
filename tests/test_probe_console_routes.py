@@ -171,6 +171,30 @@ class TestResponseContract:
         failure = probe.evaluate(endpoint(), response(301, "Moved"))
         assert failure.summary == "staging /home status 301"
 
+    def test_a_redirect_names_where_it_went(self):
+        """The ENG-2324 diagnosis was in the destination, not the status.
+
+        Production `/cowork` paged as a bare "status 301" for every run. The fact
+        that it lands on `/cowork/` and 403s there, which is what identifies the
+        shadowed-docroot bug, was only ever visible by hand.
+        """
+        failure = probe.evaluate(
+            endpoint("/cowork"),
+            probe.FetchResult(status=301, body="Moved", location="/cowork/"),
+        )
+        assert failure.summary == "staging /cowork status 301 to /cowork/"
+
+    def test_a_redirect_destination_cannot_blow_the_label_budget(self):
+        """The origin controls this header, so its length cannot be trusted."""
+        failure = probe.evaluate(
+            endpoint(),
+            probe.FetchResult(status=302, location="/" + "x" * 500),
+        )
+        assert len(failure.reason) <= len("status 302 to ") + probe.MAX_REDIRECT_TARGET_CHARS
+
+    def test_a_non_redirect_failure_gains_no_destination_clause(self):
+        assert probe.evaluate(endpoint(), response(403, "Forbidden")).reason == "status 403"
+
     def test_200_nginx_page_fails_without_the_spa_marker(self):
         failure = probe.evaluate(endpoint(), response(200, NGINX_PAGE))
         assert failure.summary == "staging /home status 200 missing SPA marker"
@@ -209,6 +233,35 @@ class TestResponseContract:
         )
         result = probe.fetch_endpoint(endpoint(), 4)
         assert (result.status, result.body) == (301, "Moved")
+
+    def test_fetch_captures_the_redirect_destination(self, monkeypatch):
+        class RedirectingOpener:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    301,
+                    "Moved",
+                    {"Location": "/cowork/"},
+                    BytesIO(b"Moved"),
+                )
+
+        monkeypatch.setattr(
+            probe.urllib.request, "build_opener", lambda *handlers: RedirectingOpener()
+        )
+        assert probe.fetch_endpoint(endpoint("/cowork"), 4).location == "/cowork/"
+
+    def test_an_error_response_without_a_location_header_reports_none(self, monkeypatch):
+        """A 403 carries no Location, and reading one must not raise."""
+
+        class ForbiddenOpener:
+            def open(self, request, timeout):
+                raise HTTPError(request.full_url, 403, "Forbidden", {}, BytesIO(b"nginx"))
+
+        monkeypatch.setattr(
+            probe.urllib.request, "build_opener", lambda *handlers: ForbiddenOpener()
+        )
+        result = probe.fetch_endpoint(endpoint("/assets/"), 4)
+        assert (result.status, result.location) == (403, None)
 
 
 class TestRetryDebounce:
@@ -397,6 +450,60 @@ class TestRetryDebounce:
         assert output.read_text(encoding="utf-8") == (
             "alert_label=bad 'host' certificate / mismatch\n"
         )
+
+
+class TestTheAlertLabelSurvivesEveryOutageShape:
+    """The label is the outage report, so it may never be the thing that breaks.
+
+    `format_alert_label` used to raise once failure identities outgrew the cap,
+    and `main` did not catch it. That turned the widest possible outage into a
+    crash in the step whose only job is to say something is down.
+    """
+
+    def test_a_full_redirect_outage_keeps_every_endpoint_and_drops_the_targets(self):
+        failures = tuple(
+            probe.evaluate(target, probe.FetchResult(status=301, location="/" + "x" * 300))
+            for target in probe.load_config().endpoints
+        )
+        label = probe.format_alert_label(failures)
+
+        assert len(label) <= probe.MAX_ALERT_LABEL_CHARS
+        assert label.count("status 301") == EXPECTED_ENDPOINT_COUNT
+        assert "xxx" not in label
+        for failure in failures:
+            identity = f"{failure.endpoint.environment} {failure.endpoint.route} status 301"
+            assert identity in label
+
+    def test_identities_too_large_to_fit_degrade_to_a_count(self):
+        oversized = probe.Endpoint(
+            "e" * 200,
+            "https://oversized.example",
+            "/" + "r" * 200,
+            CONSOLE_MARKER,
+            "SPA",
+        )
+        failures = tuple(probe.Failure(oversized, "status 503") for _ in range(50))
+
+        label = probe.format_alert_label(failures)
+
+        assert len(label) <= probe.MAX_ALERT_LABEL_CHARS
+        assert "50 endpoints failed" in label
+
+    def test_the_degraded_label_still_fits_the_step_output(self, tmp_path):
+        """Whatever the label degrades to still has to survive `write_github_output`,
+        which is what the notifier reads."""
+        oversized = probe.Endpoint(
+            "e" * 200, "https://oversized.example", "/" + "r" * 200, CONSOLE_MARKER, "SPA"
+        )
+        label = probe.format_alert_label(
+            tuple(probe.Failure(oversized, "status 503") for _ in range(50))
+        )
+        output = tmp_path / "github-output"
+        probe.write_github_output(str(output), alert_label=label)
+
+        written = output.read_text(encoding="utf-8")
+        assert written == f"alert_label={label}\n"
+        assert written.count("\n") == 1
 
 
 class TestConfigurationAndDocumentation:

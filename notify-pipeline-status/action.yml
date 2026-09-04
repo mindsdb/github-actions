@@ -63,13 +63,17 @@ inputs:
     required: false
     default: ""
   github-token:
-    description: "Token for the prior-run lookup behind the recovery message. Needs actions:read."
+    description: "Token for the prior-run lookup that both suppresses a duplicate alert and licenses a recovery. Needs actions:read. Without it every run of a standing failure re-pages."
     required: false
     default: ""
   force-post:
-    description: "'true' to post a recovery with no prior failure to recover from. The smoke test, and nothing else: a release-train wrapper must leave this alone or every manual run reports a recovery that did not happen."
+    description: "'true' to post with no prior run to compare against, in either direction. The smoke test, and nothing else: a release-train wrapper must leave this alone or every manual run reports a recovery that did not happen."
     required: false
     default: "false"
+  repeat-alert-after-minutes:
+    description: "How long a still-failing pipeline stays quiet before it reports the failure again. Repeats are collapsed so a standing breakage does not page every run, but never indefinitely: a run's conclusion says that it failed, not what failed, so a suppressed repeat can hide an outage that grew. Raise it for a noisy known breakage; do not disable it."
+    required: false
+    default: "60"
   branch:
     description: "Branch to name in the message. Defaults to the running ref, which is wrong for a `workflow_run` caller, where GITHUB_REF is the default branch rather than the branch whose pipeline finished."
     required: false
@@ -123,15 +127,23 @@ runs:
         python3 "${SHARED}/scripts/freeze_state.py" read \
           --repo "${REPO}" --ruleset-name "${RULESET_NAME}" --on-error escalate
 
-    # For the recovery message, find out how the PREVIOUS conclusive run of this
-    # same workflow on this same branch ended. This step only gathers evidence;
-    # `notify_decision.py` below decides what it means.
+    # Find out how the PREVIOUS conclusive run of this same workflow on this same
+    # branch ended. This step only gathers evidence; `notify_decision.py` below
+    # decides what it means.
     #
-    # Skipped when nothing it could find would change the outcome: a failure posts
-    # regardless, `force-post` posts regardless, and a freeze-scoped caller outside
-    # the window posts nothing either way. `steps.freeze.outputs.frozen` is empty
-    # when the freeze step did not run, which is not 'false', so an unscoped caller
-    # still reaches this.
+    # BOTH directions need that evidence. A failure used to post unconditionally
+    # and skip this lookup, so a standing breakage re-paged on every run:
+    # ENG-2324's five-minute probe turned one unfixed production route into about
+    # 220 Slack messages a day. The conclusion that suppresses a duplicate alert
+    # is the same conclusion that licenses a recovery, so one lookup serves both
+    # and the two directions fail open opposite ways — no evidence pages, and no
+    # evidence withholds a recovery.
+    #
+    # Still skipped when nothing it could find would change the outcome:
+    # `force-post` posts regardless, and a freeze-scoped caller outside the window
+    # posts nothing either way. `steps.freeze.outputs.frozen` is empty when the
+    # freeze step did not run, which is not 'false', so an unscoped caller still
+    # reaches this.
     #
     # BRANCH is deliberately the running ref rather than `inputs.branch`. For a
     # `workflow_run` caller those differ: the run is attributed to the default
@@ -139,7 +151,7 @@ runs:
     # branch whose pipeline finished.
     - name: Check how the previous run ended
       id: prev
-      if: inputs.status == 'recovered' && inputs.force-post != 'true' && steps.freeze.outputs.frozen != 'false'
+      if: inputs.force-post != 'true' && steps.freeze.outputs.frozen != 'false'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -174,24 +186,69 @@ runs:
         WF_PATH="${WORKFLOW_REF%%@*}"
         export WF_PATH="${WF_PATH#"${REPO}/"}"
 
-        # Most recent CONCLUSIVE run on this branch, excluding the current one:
-        # cancelled and skipped runs are not evidence either way.
-        if ! PREV=$(gh api "repos/${REPO}/actions/runs?branch=${BRANCH}&status=completed&per_page=50" \
-          --jq '[ .workflow_runs[]
-                  | select(.path == env.WF_PATH or .name == env.WORKFLOW)
-                  | select((.id|tostring) != env.RUN_ID)
-                  | select(.conclusion == "success" or .conclusion == "failure"
-                           or .conclusion == "timed_out" or .conclusion == "startup_failure")
-                ][0].conclusion // ""' 2>&1); then
+        # Ask for THIS workflow's history rather than the branch's most recent
+        # fifty runs. A frequent cron on the same branch crowds every other
+        # workflow out of a branch-wide page: at ENG-2324's five-minute cadence
+        # fifty slots span about four hours, so an hourly workflow found no
+        # evidence of itself and silently dropped its recovery message. The
+        # per-workflow endpoint takes the file name and cannot be crowded out.
+        #
+        # A caller whose `workflow_ref` points outside this repo has no such
+        # endpoint here, so that case keeps the branch scan and its name filter.
+        ENDPOINT="repos/${REPO}/actions/runs?branch=${BRANCH}&status=completed&per_page=50"
+        CALLER='select(.path == env.WF_PATH or .name == env.WORKFLOW)'
+        case "$WF_PATH" in
+          .github/workflows/*)
+            ENDPOINT="repos/${REPO}/actions/workflows/${WF_PATH##*/}/runs?branch=${BRANCH}&status=completed&per_page=10"
+            CALLER='.'
+            ;;
+        esac
+
+        # Most recent CONCLUSIVE run of this workflow on this branch, excluding
+        # the current one: cancelled and skipped runs are not evidence either way.
+        #
+        # Also measure the CURRENT FAILURE STREAK and when it started, which is
+        # what lets a repeated failure be quiet without being silent. The streak
+        # is the leading run of failures in this history; its oldest member dates
+        # the breakage. A page that truncates the streak understates its age,
+        # which makes the reminder fire sooner rather than later.
+        read -r -d '' RUNS_JQ <<'JQ' || true
+        [ .workflow_runs[]
+          | CALLER_FILTER
+          | select((.id|tostring) != env.RUN_ID)
+          | select(.conclusion == "success" or .conclusion == "failure"
+                   or .conclusion == "timed_out" or .conclusion == "startup_failure")
+        ]
+        | map({conclusion, created_at})
+        | (map(.conclusion == "failure" or .conclusion == "timed_out"
+               or .conclusion == "startup_failure") | index(false)) as $break
+        | (if $break == null then length else $break end) as $streak
+        | [ (.[0].conclusion // ""),
+            (.[0].created_at // ""),
+            ($streak | tostring),
+            (if $streak > 0 then .[$streak - 1].created_at else "" end)
+          ]
+        | @tsv
+        JQ
+        RUNS_JQ="${RUNS_JQ//CALLER_FILTER/${CALLER}}"
+
+        if ! ROW=$(gh api "$ENDPOINT" --jq "$RUNS_JQ" 2>&1); then
           # Almost always a missing `actions: read` grant on the caller job. Report
           # no evidence rather than failing: an unreadable history has to read as
           # "not a recovery", because a notify step must never redden a green run.
-          echo "Could not read run history, so there is no evidence either way: ${PREV}"
+          # It also has to read as "not a duplicate", so the alert still pages.
+          echo "Could not read run history, so there is no evidence either way: ${ROW}"
           exit 0
         fi
 
-        echo "prev_conclusion=${PREV}" >> "$GITHUB_OUTPUT"
+        IFS=$'\t' read -r PREV PREV_STARTED STREAK STREAK_STARTED <<<"${ROW}"
+        {
+          echo "prev_conclusion=${PREV}"
+          echo "prev_started_at=${PREV_STARTED}"
+          echo "streak_started_at=${STREAK_STARTED}"
+        } >> "$GITHUB_OUTPUT"
         echo "Previous conclusive run on ${BRANCH} concluded '${PREV:-none}'."
+        echo "Consecutive failures before this run: ${STREAK:-0}, oldest at ${STREAK_STARTED:-n/a}."
 
     # One decision, one place, with tests. See scripts/notify_decision.py for the
     # three outcomes and why `force-post` is an input rather than an event check.
@@ -205,9 +262,15 @@ runs:
         FROZEN: ${{ steps.freeze.outputs.frozen }}
         FORCE_POST: ${{ inputs.force-post }}
         PREV_CONCLUSION: ${{ steps.prev.outputs.prev_conclusion }}
+        PREV_STARTED_AT: ${{ steps.prev.outputs.prev_started_at }}
+        STREAK_STARTED_AT: ${{ steps.prev.outputs.streak_started_at }}
+        REPEAT_AFTER_MINUTES: ${{ inputs.repeat-alert-after-minutes }}
       run: |
         set -euo pipefail
         python3 "${SHARED}/scripts/notify_decision.py" \
+          --streak-started-at "${STREAK_STARTED_AT}" \
+          --prev-started-at "${PREV_STARTED_AT}" \
+          --repeat-alert-after-minutes "${REPEAT_AFTER_MINUTES}" \
           --status "${STATUS}" \
           --freeze-scoped "${FREEZE_SCOPED}" \
           --frozen "${FROZEN}" \

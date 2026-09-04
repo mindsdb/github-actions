@@ -28,6 +28,7 @@ DEFAULT_CONFIG_PATH = (
 DEFAULT_ALERT_LABEL = "public web probe"
 MAX_BODY_BYTES = 64 * 1024
 MAX_NETWORK_ERROR_CHARS = 64
+MAX_REDIRECT_TARGET_CHARS = 64
 MAX_ALERT_LABEL_CHARS = 2_000
 
 
@@ -89,6 +90,11 @@ class FetchResult:
     status: int | None
     body: str = ""
     error: str | None = None
+    # Where a redirect points. A bare "status 301" tells the on-call that a route
+    # moved but not where to, and the destination is usually the whole diagnosis:
+    # production /cowork reported 301 for a week while the answer, that it lands
+    # on /cowork/ and 403s there, was only ever visible by hand.
+    location: str | None = None
 
 
 @dataclass(frozen=True)
@@ -258,9 +264,12 @@ def fetch_endpoint(endpoint: Endpoint, timeout_seconds: float) -> FetchResult:
                 body=_decode_body(response.read(MAX_BODY_BYTES)),
             )
     except urllib.error.HTTPError as error:
+        # NoRedirectHandler declines every 3xx, which urllib then raises here, so
+        # this is the branch that sees a redirect's Location.
         return FetchResult(
             status=int(error.code),
             body=_decode_body(error.read(MAX_BODY_BYTES)),
+            location=error.headers.get("Location"),
         )
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         return FetchResult(status=None, error=_compact(str(error)))
@@ -282,6 +291,9 @@ def evaluate(endpoint: Endpoint, result: FetchResult) -> Failure | None:
         )
     if result.status != 200:
         status = "unknown" if result.status is None else str(result.status)
+        if result.location:
+            target = _compact(result.location, limit=MAX_REDIRECT_TARGET_CHARS)
+            return Failure(endpoint, f"status {status} to {target}")
         return Failure(endpoint, f"status {status}")
     if endpoint.body_marker not in result.body:
         return Failure(endpoint, f"status 200 missing {endpoint.marker_label} marker")
@@ -368,16 +380,27 @@ def format_alert_label(failures: Sequence[Failure]) -> str:
         for failure in failures
     )
     compact_label = label_prefix + compact_summaries
-    if len(compact_label) > MAX_ALERT_LABEL_CHARS:
-        raise ValueError("failure identities exceed the alert-label size limit")
-    return compact_label
+    if len(compact_label) <= MAX_ALERT_LABEL_CHARS:
+        return compact_label
+
+    # Last resort, reached only if the endpoint list outgrows the label. Report
+    # the count and leave the identities to the run log. Raising here instead
+    # would crash the one step whose job is to say that something is down, and it
+    # would do so precisely when the outage is at its widest.
+    return _compact(
+        f"{label_prefix}{len(failures)} endpoints failed, see the run log",
+        limit=MAX_ALERT_LABEL_CHARS,
+    )
 
 
 def _compact_alert_reason(reason: str) -> str:
+    """The endpoint's result category, minus the detail that varies in length."""
+
     network_prefix = "network error"
     if reason.startswith(f"{network_prefix}: "):
         return network_prefix
-    return reason
+    status, redirected, _ = reason.partition(" to ")
+    return status if redirected else reason
 
 
 def write_github_output(path: str | None, *, alert_label: str) -> None:

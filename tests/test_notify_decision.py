@@ -12,8 +12,8 @@ The policy these pin, in the order it is easy to get wrong:
 
 - staging outside the freeze window is silent in BOTH directions
 - a green run whose predecessor was also green posts nothing
-- a failure always posts, and the freeze veto is the only thing that may stop it
-- an unreadable run history reads as "not a recovery", never as an error
+- a red run whose predecessor was also red posts nothing
+- an unreadable run history posts an alert and withholds a recovery, never errors
 """
 
 import importlib.util
@@ -28,7 +28,13 @@ _spec.loader.exec_module(notify)
 
 
 def decide(**kwargs):
-    """`decide` with the defaults a caller that passes nothing would get."""
+    """`decide` with the defaults a caller that passes nothing would get.
+
+    The streak clock defaults to the middle of a reminder window: a failing
+    streak that began at 12:00, a previous run at 12:30 and now 12:40, all inside
+    the first 60-minute window. Deduplication tests therefore read as
+    deduplication, and a test that cares about the reminder sets its own clock.
+    """
     return notify.decide(
         **{
             "status": "failed",
@@ -36,6 +42,9 @@ def decide(**kwargs):
             "frozen": "",
             "force_post": "false",
             "prev_conclusion": "",
+            "streak_started_at": "2026-09-04T12:00:00Z",
+            "prev_started_at": "2026-09-04T12:30:00Z",
+            "now": "2026-09-04T12:40:00Z",
             **kwargs,
         }
     )
@@ -85,15 +94,133 @@ class TestRecoveryNeedsAPriorFailure:
         assert decide(status="recovered", prev_conclusion="")["post"] == "false"
 
 
-class TestFailuresAlwaysPost:
-    def test_a_failure_posts_with_no_history_lookup_at_all(self):
-        assert decide(status="failed")["post"] == "true"
+class TestTheFirstFailurePosts:
+    def test_a_failure_after_a_green_run_posts(self):
+        assert decide(status="failed", prev_conclusion="success")["post"] == "true"
 
     def test_a_failure_posts_while_the_freeze_window_is_open(self):
         assert decide(status="failed", freeze_scoped="true", frozen="true")["post"] == "true"
 
-    def test_the_freeze_veto_is_the_only_thing_that_silences_a_failure(self):
+    def test_the_freeze_veto_silences_a_failure(self):
         assert decide(status="failed", freeze_scoped="true", frozen="false")["post"] == "false"
+
+    @pytest.mark.parametrize("conclusion", ["success", "cancelled", "skipped"])
+    def test_anything_that_is_not_a_prior_failure_lets_the_alert_through(self, conclusion):
+        """`cancelled` and `skipped` are not evidence the channel was already told,
+        for the same reason they are not evidence anything was broken."""
+        assert decide(status="failed", prev_conclusion=conclusion)["post"] == "true"
+
+
+class TestRepeatFailuresStayQuiet:
+    """The ENG-2324 regression: one standing breakage paged every five minutes.
+
+    The public web probe runs on a `*/5` cron. Production `/cowork` and `/assets/`
+    had been returning 301 and 403 since before the probe existed, so every run
+    re-reported the same two routes: about 220 Slack messages a day into the
+    channel that also carries the paging Cloudflare checks. Nothing suppressed a
+    failure except the freeze veto, and a cron probe is never freeze-scoped.
+    """
+
+    @pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure"])
+    def test_a_failure_whose_predecessor_also_failed_posts_nothing(self, conclusion):
+        assert decide(status="failed", prev_conclusion=conclusion)["post"] == "false"
+
+    def test_the_suppressed_alert_still_reads_as_an_alert(self):
+        """Only `post` changes. A deduped failure is not a recovery and not a
+        silenced freeze, and the log line has to be able to say which it was."""
+        assert decide(status="failed", prev_conclusion="failure")["level"] == "alert"
+
+    def test_no_evidence_still_pages(self):
+        """Absence of evidence is not evidence the channel was already told. The
+        lookup needs `actions: read`, and a caller that forgot the grant must
+        still get its first alert rather than silence."""
+        assert decide(status="failed", prev_conclusion="")["post"] == "true"
+
+    def test_the_smoke_test_overrides_the_dedupe(self):
+        assert decide(status="failed", force_post="true", prev_conclusion="failure")["post"] == "true"
+
+    def test_the_log_line_says_why_it_stayed_quiet(self):
+        d = decide(status="failed", prev_conclusion="failure")
+        reason = notify.why(d, status="failed", force_post="false", prev_conclusion="failure")
+        assert "already been reported" in reason
+
+    def test_a_repeat_still_reports_itself_once_the_reminder_is_due(self):
+        """The reason this is a digest and not a mute.
+
+        A conclusion says THAT a run failed, never WHAT failed. Two endpoints
+        down and twenty-one endpoints down are both `failure`, so suppressing
+        every repeat would let an outage grow behind an alert already sent. The
+        reminder bounds how long that can go unmentioned.
+        """
+        quiet = decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T12:40:00Z",
+            now="2026-09-04T12:50:00Z",
+            repeat_after_minutes=60,
+        )
+        due = decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T12:55:00Z",
+            now="2026-09-04T13:05:00Z",
+            repeat_after_minutes=60,
+        )
+        assert (quiet["post"], due["post"]) == ("false", "true")
+
+    def test_the_reminder_fires_once_per_window_not_every_run_after_it(self):
+        """A five-minute cron crossing the hour must not start paging again."""
+        assert decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T13:05:00Z",
+            now="2026-09-04T13:10:00Z",
+            repeat_after_minutes=60,
+        )["post"] == "false"
+
+    @pytest.mark.parametrize(
+        "streak_started_at,prev_started_at",
+        [("", "2026-09-04T12:40:00Z"), ("2026-09-04T12:00:00Z", ""), ("nonsense", "nonsense")],
+    )
+    def test_unreadable_streak_timestamps_page_rather_than_stay_quiet(
+        self, streak_started_at, prev_started_at
+    ):
+        """A reminder that fires early costs one message. One that never fires
+        hides a growing outage."""
+        assert decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at=streak_started_at,
+            prev_started_at=prev_started_at,
+            now="2026-09-04T12:50:00Z",
+        )["post"] == "true"
+
+    def test_a_nonpositive_interval_cannot_be_used_to_mute_the_channel(self):
+        """`repeat-alert-after-minutes: 0` must not mean 'never remind'."""
+        assert decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T12:40:00Z",
+            now="2026-09-04T12:50:00Z",
+            repeat_after_minutes=0,
+        )["post"] == "true"
+
+    def test_a_standing_breakage_pages_once_then_recovers_once(self):
+        """The whole point, as the sequence the channel actually sees: one red on
+        the run that breaks, silence while it stays broken, one green when it is
+        fixed. Three messages for a three-day outage, not eight hundred."""
+        posts = [
+            decide(status="failed", prev_conclusion="success")["post"],
+            decide(status="failed", prev_conclusion="failure")["post"],
+            decide(status="failed", prev_conclusion="failure")["post"],
+            decide(status="recovered", prev_conclusion="failure")["post"],
+            decide(status="recovered", prev_conclusion="success")["post"],
+        ]
+        assert posts == ["true", "false", "false", "true", "false"]
 
 
 class TestFreezeScoping:

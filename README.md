@@ -40,8 +40,21 @@ sends no failure alert. An endpoint that fails twice makes the run red and passe
 failure to `notify-main-failure.yml`, which posts to the engineering Slack channel. That message
 names each failing environment, route, and observed result. A `200` response without the configured
 marker is reported as either `status 200 missing SPA marker` or
-`status 200 missing website marker`. The next successful run uses that reusable workflow's
-existing recovery lookup, so routine green runs stay silent.
+`status 200 missing website marker`. A redirect names its destination, as in
+`production /cowork status 301 to /cowork/`, because the status alone says a route moved but not
+where to, and the destination is usually the diagnosis.
+
+**One breakage pages once, then hourly.** A failing endpoint alerts on the run that breaks it, then
+goes quiet, then repeats itself once an hour for as long as it lasts, because `notify-pipeline-status`
+collapses a failure whose predecessor also failed. At this cadence the alternative is roughly 220
+messages a day for a single unfixed route, which is how a real page gets scrolled past. Routine green
+runs stay silent through the same lookup.
+
+The hourly repeat is not a formality. A run's conclusion records **that** it failed, never **what**
+failed, so two dead routes and a total console outage are both `failure`. Suppressing every repeat
+would let the second grow behind an alert already sent for the first. The repeat bounds how long a
+change in the failing set can go unmentioned; raise `repeat-alert-after-minutes` for a known noisy
+breakage, but do not try to disable it.
 
 The reviewable source of truth is [`config/console-route-probe.json`](config/console-route-probe.json).
 The Console matrix crosses these environments:
@@ -188,11 +201,36 @@ single job runs unless the workflow was cancelled and derives the outcome from
 
 `recovered` is not the same as green: the reusable looks up the previous
 conclusive run of the same workflow on the same branch and stays silent unless it
-failed, so a routine green merge posts nothing. That lookup needs `actions: read`
-on this job, because the default workflow token carries contents + packages read
-only and a called workflow can never hold more than its caller grants. Without
-it the lookup is refused and the job stays silent (it never fails the run), so a
-missing recovery message is the symptom to look for.
+failed, so a routine green merge posts nothing.
+
+**The same lookup collapses repeated failures.** A red run whose predecessor was
+also red posts nothing, so a standing breakage pages once rather than on every
+run. The two directions fail open in opposite ways on purpose: with no evidence,
+an alert posts and a recovery does not, because an unreported failure costs more
+than a duplicate one.
+
+**Collapsed is not muted.** A conclusion says that a run failed, not what failed,
+so a suppressed repeat could hide an outage that grew behind an alert already
+sent. A still-failing pipeline therefore reports itself again every
+`repeat-alert-after-minutes` (default 60), measured from the oldest failure in
+the current streak so the repeat lands once per window at any cadence. An
+unreadable or missing streak clock posts rather than staying quiet, and setting
+the interval to zero or a non-number falls back to the default instead of
+muting the channel.
+
+That lookup needs `actions: read` on this job, because the default workflow token
+carries contents + packages read only and a called workflow can never hold more
+than its caller grants. Without it the lookup is refused and the job stays silent
+(it never fails the run), so a missing recovery message is the symptom to look
+for — and, since the deduplication reads the same evidence, a caller missing the
+grant also re-pages every run of a standing failure.
+
+The lookup asks the per-workflow runs endpoint rather than paging the branch's
+recent runs, so one frequent cron cannot crowd another workflow out of its own
+history. It used to read fifty branch-wide runs and filter afterwards, which the
+five-minute public web probe compressed to about four hours of coverage; any
+workflow whose previous run was older than that found no evidence and silently
+dropped its recovery message.
 
 ### Scoping staging alerts to the freeze window
 
@@ -241,8 +279,8 @@ Requires two org secrets, reaching the workflow via `secrets: inherit`:
 must be a member of that channel.
 
 `workflow_dispatch` on the reusable itself is a smoke test: it posts a sample
-message in either style, skipping the prior-run lookup so `recovered` always
-posts.
+message in either style, skipping the prior-run lookup so both `recovered` and a
+repeated `failed` always post.
 
 ### The one failure it cannot see: a run that never started
 
