@@ -1,0 +1,55 @@
+name: Public web probe
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: console-route-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    outputs:
+      alert_label: ${{ steps.probe.outputs.alert_label }}
+    steps:
+      - name: Check out the route contract and probe
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Preserve the script's concise failure output before the next step marks
+      # the job red. The terminal notification job includes that output in its
+      # pipeline label.
+      - name: Probe public web routes
+        id: probe
+        continue-on-error: true
+        env:
+          PROBE_RETRY_DELAY_SECONDS: "15"
+        run: python3 scripts/probe_console_routes.py
+
+      - name: Mark a persistent route failure
+        if: steps.probe.outcome == 'failure'
+        env:
+          ALERT_LABEL: ${{ steps.probe.outputs.alert_label }}
+        run: |
+          printf '%s\n' "${ALERT_LABEL:-public web probe failed}" >&2
+          exit 1
+
+  notify:
+    needs: [probe]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      actions: read
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: ${{ needs.probe.outputs.alert_label || 'public web probe' }}
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+    secrets: inherit
