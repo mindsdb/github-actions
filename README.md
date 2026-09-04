@@ -21,9 +21,9 @@ They live in `.github/workflows/` and are called from ~25-line per-repo wrappers
 
 | Reusable workflow | Name (keep identical in callers) | What it does |
 |---|---|---|
-| `release-freeze.yml` | `Staging Freeze` | Activates the `staging-freeze` ruleset to lock staging (skips if staging == main) |
+| `release-freeze.yml` | `Staging Freeze` | Sets the repo's `staging_frozen` property, which puts staging under the org freeze ruleset (skips if staging == main) |
 | `release-pr.yml` | `Create staging to main release PR` | Keeps the `staging → main` PR open and current: a draft that lists what is queued, marked ready for review when the freeze opens |
-| `release-unfreeze.yml` | `Staging Unfreeze` | Disables the ruleset when the release PR merges, then syncs `main` back into `staging` |
+| `release-unfreeze.yml` | `Staging Unfreeze` | Clears the property when the release PR merges, then syncs `main` back into `staging` |
 | `sync-main-to-staging.yml` | `Sync main to staging` | Merges `main` into `staging` after **any** push to main, not just the release merge |
 
 `release-unfreeze.yml` syncs main back only on the release path, because its wrapper's guard requires the merged PR's head branch to be `staging`. A commit that reaches main any other way (a hotfix PR, a revert, a direct merge) fires nothing, and on a squash-merge repo that leaves the next release PR diffed against a `main` that `staging` does not contain. `sync-main-to-staging.yml` closes that window on `push: main`.
@@ -150,7 +150,7 @@ A workflow triggered on **both** main and staging from one notify job must not h
       freeze-scoped: ${{ github.ref_name == 'staging' }}
 ```
 
-Freeze state is read from the `staging-freeze` ruleset itself, not inferred from workflow history — a freeze that skipped itself because staging had nothing unreleased still concludes `success`, and history cannot tell that apart from a real freeze. Reading rulesets needs admin, so this reuses the same App that toggles them (`vars.RELEASE_APP_CLIENT_ID` + `secrets.RELEASE_APP_PRIVATE_KEY`); no extra `permissions:` on the caller. If the App token or the ruleset lookup fails, it escalates to the red alert rather than downgrading, so a lookup problem can never silence a real release-blocking failure.
+Freeze state is read from the `staging_frozen` custom property itself, not inferred from workflow history — a freeze that skipped itself because staging had nothing unreleased still concludes `success`, and history cannot tell that apart from a real freeze. This reuses the same App that sets the property (`vars.RELEASE_APP_CLIENT_ID` + `secrets.RELEASE_APP_PRIVATE_KEY`); no extra `permissions:` on the caller. If the App token or the property lookup fails, it escalates to the red alert rather than downgrading, so a lookup problem can never silence a real release-blocking failure.
 
 Leave `freeze-scoped` off for prod and freeze/unfreeze callers: a failure there is always worth interrupting for.
 
@@ -256,9 +256,9 @@ Blind spot to know about: it can only read local (`./.github/workflows/...`) cal
 
 ## The release-freeze contract
 
-A freeze is one thing: the `enforcement` field of a pre-provisioned repository ruleset, flipped between `active` and `disabled`. Four workflows care — freeze and unfreeze write it, and the two alerting paths read it to decide whether a red staging is worth interrupting anyone for.
+A freeze is one thing: the repo's `staging_frozen` custom property, set to `true` or `false`. A single org-level ruleset (terraform, `newprod/global/github`) blocks pushes to `staging` in every repo where it is `true`; the workflows never touch the ruleset. Four workflows care — freeze and unfreeze write it, and the two alerting paths read it to decide whether a red staging is worth interrupting anyone for.
 
-They used to carry three separate copies of that knowledge, and only two of them took the ruleset name as an input; the alerting path hardcoded it. Renaming the ruleset in one repo would therefore have moved the freeze and left the alerting reading a name that no longer existed — silent in the direction that hurts, because a reader that cannot establish the state escalates, so every ordinary mid-week staging red would have paged the channel forever and the cause would have looked like a Slack problem.
+They used to carry three separate copies of that knowledge, and only two of them took the name as an input; the alerting path hardcoded it. Renaming it in one repo would therefore have moved the freeze and left the alerting reading a name that no longer existed — silent in the direction that hurts, because a reader that cannot establish the state escalates, so every ordinary mid-week staging red would have paged the channel forever and the cause would have looked like a Slack problem.
 
 `scripts/freeze_state.py` now owns it, with two modes that fail in opposite directions on purpose:
 
@@ -266,9 +266,9 @@ They used to carry three separate copies of that knowledge, and only two of them
 |---|---|---|
 | `read --on-error escalate` | the alert paths | report frozen, exit 0 — never downgrade a real release-blocking failure, and never redden a green run |
 | `read --on-error fail` | `release-pr.yml` | leave the PR a draft — the safe direction there is the opposite one, since "ready" invites a merge of an unvalidated branch |
-| `set --enforcement …` | freeze and unfreeze | fail loudly — a freeze that did not apply must stop the release train rather than let the window appear to open |
+| `set --frozen …` | freeze and unfreeze | fail loudly — a freeze that did not apply must stop the release train rather than let the window appear to open |
 
-The flip is a read-modify-write of the whole ruleset: a partial `PUT` is not guaranteed to preserve the fields it omits, and the omitted fields are the bypass actors and branch conditions, so getting it wrong unlocks the branch it was asked to lock. The body goes to a file and is never echoed, because three of the consuming repos are public and a ruleset body names its bypass actors.
+A property the org does not define is a lookup error in both modes, not "thawed": that is provisioning drift, and the reader escalating on it is what makes the drift visible instead of silently opening every repo.
 
 The four release-train reusables and both notify reusables check these scripts out at `job.workflow_sha` — the commit of the workflow file that defines the running job, so a consumer that pins the workflow to a SHA gets that SHA's scripts too. Pinning a workflow while its scripts float is not a pin.
 
@@ -481,15 +481,15 @@ whether its author has signed. Four repos learned that the hard way, gating on
 
 - **`mindsdb-release-train` GitHub App** with `Administration`, `Contents`, and
   `Pull requests: write`, installed on each repo, and set as a **bypass actor**
-  on the `staging` ruleset. Per-job tokens are minted with
+  on the org `staging-freeze` ruleset. Per-job tokens are minted with
   `actions/create-github-app-token`.
 - **`vars.RELEASE_APP_CLIENT_ID`** (org variable) and
   **`secrets.RELEASE_APP_PRIVATE_KEY`** (org secret) — the private key reaches
   the reusable workflows via `secrets: inherit` in the caller.
-- A **pre-provisioned `staging-freeze` ruleset** in each repo: one `update` rule
-  targeting `staging`, created `disabled`, with the App as bypass actor. The
-  workflows only flip its `enforcement` between `active` and `disabled` — they
-  never touch the underlying branch protection.
+- The **`staging_frozen` org custom property** and the **`staging-freeze` org
+  ruleset** that targets repos where it is `true`, both defined in terraform
+  (`newprod/global/github/main.tf`). The workflows only set the property — they
+  never touch the ruleset or the underlying branch protection.
 
 ### Caller wrappers
 

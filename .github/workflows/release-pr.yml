@@ -50,10 +50,10 @@ on:
         description: "Target branch for the release PR"
         type: string
         default: main
-      ruleset-name:
-        description: "The freeze ruleset to read, to decide draft vs ready. Must match what the repo's release-freeze caller sets."
+      freeze-property:
+        description: "The freeze custom property to read, to decide draft vs ready. Must match what the repo's release-freeze caller sets."
         type: string
-        default: staging-freeze
+        default: staging_frozen
 
 # No workflow-level `permissions:` block, deliberately, so this job inherits the
 # calling job's grant. That is what makes the notify step's recovery lookup work:
@@ -103,11 +103,11 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          RULESET_NAME: ${{ inputs.ruleset-name }}
+          FREEZE_PROPERTY: ${{ inputs.freeze-property }}
         run: |
           set -uo pipefail
           if ! python3 .ci-shared/scripts/freeze_state.py read \
-                 --repo "${REPO}" --ruleset-name "${RULESET_NAME}" --on-error fail; then
+                 --repo "${REPO}" --property-name "${FREEZE_PROPERTY}" --on-error fail; then
             echo "::warning::Could not read the freeze state. Leaving the release PR as a draft."
             echo "frozen=false" >> "$GITHUB_OUTPUT"
           fi

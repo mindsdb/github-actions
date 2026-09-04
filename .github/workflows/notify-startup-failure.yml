@@ -154,10 +154,10 @@ on:
         description: "Which of `branches` is the release candidate, and so is only reported while the freeze window is open"
         type: string
         default: staging
-      ruleset-name:
-        description: "The freeze ruleset to read. Must match what the repo's release-freeze caller sets."
+      freeze-property:
+        description: "The freeze custom property to read. Must match what the repo's release-freeze caller sets."
         type: string
-        default: staging-freeze
+        default: staging_frozen
       runs-on:
         description: "Runner label for the sweep jobs"
         type: string
@@ -188,10 +188,10 @@ on:
         description: "Which branch is the release candidate"
         type: string
         default: staging
-      ruleset-name:
-        description: "The freeze ruleset to read"
+      freeze-property:
+        description: "The freeze custom property to read"
         type: string
-        default: staging-freeze
+        default: staging_frozen
       lookback-minutes:
         description: "Lookback window in minutes (widen it to replay a past incident)"
         type: number
@@ -390,10 +390,10 @@ jobs:
           path: .ci-shared
           persist-credentials: false
 
-      # Reading rulesets needs admin, which the default workflow token does not
-      # carry, so this reuses the App that owns the freeze toggle. A repo that is
-      # not on the release train has no App and no ruleset; the read escalates to
-      # frozen, which for this sweep means staging is swept like any other branch.
+      # This reuses the App that owns the freeze toggle, so the reader and the
+      # writer share one credential. A repo that is not on the release train has
+      # no App installed; the read escalates to frozen, which for this sweep means
+      # staging is swept like any other branch.
       - name: Mint release-train App token
         id: freeze-token
         continue-on-error: true
@@ -407,7 +407,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.freeze-token.outputs.token }}
           REPO: ${{ github.repository }}
-          RULESET_NAME: ${{ inputs.ruleset-name }}
+          FREEZE_PROPERTY: ${{ inputs.freeze-property }}
         run: |
           set -uo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -416,7 +416,7 @@ jobs:
             exit 0
           fi
           python3 .ci-shared/scripts/freeze_state.py read \
-            --repo "${REPO}" --ruleset-name "${RULESET_NAME}" --on-error escalate
+            --repo "${REPO}" --property-name "${FREEZE_PROPERTY}" --on-error escalate
 
       - name: Find deploy branches that are still red
         id: find

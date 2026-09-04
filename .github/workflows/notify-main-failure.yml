@@ -88,10 +88,10 @@ on:
         description: "Silence this caller entirely while the staging freeze window is closed. For staging pipelines, where neither a failure nor its recovery is release-relevant mid-week."
         type: boolean
         default: false
-      ruleset-name:
-        description: "The freeze ruleset to read. Must match what the repo's release-freeze caller sets, or this reads a name that does not exist and escalates every staging failure forever."
+      freeze-property:
+        description: "The freeze custom property to read. Must match what the repo's release-freeze caller sets, or this reads a name that does not exist and escalates every staging failure forever."
         type: string
-        default: staging-freeze
+        default: staging_frozen
       force-post:
         description: "Post a 'recovered' message with no prior failure to recover from. Only the smoke-test dispatch sets this; a real pipeline leaves it off, or every green run reports a recovery."
         type: boolean
@@ -173,7 +173,7 @@ jobs:
           env-name: ${{ inputs.env-name }}
           status: ${{ inputs.status }}
           freeze-scoped: ${{ inputs.freeze-scoped }}
-          ruleset-name: ${{ inputs.ruleset-name }}
+          freeze-property: ${{ inputs.freeze-property }}
           freeze-token: ${{ steps.freeze-token.outputs.token }}
           github-token: ${{ github.token }}
           force-post: ${{ inputs.force-post }}
