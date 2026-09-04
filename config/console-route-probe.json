@@ -30,6 +30,13 @@
       "marker_label": "SPA"
     },
     {
+      "name": "staging Cowork",
+      "base_url": "https://cowork.staging.mindshub.ai",
+      "route": "/",
+      "body_marker": "<div id=\"root\"></div>",
+      "marker_label": "SPA"
+    },
+    {
       "name": "production website",
       "base_url": "https://mindshub.ai",
       "route": "/",
