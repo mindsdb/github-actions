@@ -28,7 +28,13 @@ _spec.loader.exec_module(notify)
 
 
 def decide(**kwargs):
-    """`decide` with the defaults a caller that passes nothing would get."""
+    """`decide` with the defaults a caller that passes nothing would get.
+
+    The streak clock defaults to the middle of a reminder window: a failing
+    streak that began at 12:00, a previous run at 12:30 and now 12:40, all inside
+    the first 60-minute window. Deduplication tests therefore read as
+    deduplication, and a test that cares about the reminder sets its own clock.
+    """
     return notify.decide(
         **{
             "status": "failed",
@@ -36,6 +42,9 @@ def decide(**kwargs):
             "frozen": "",
             "force_post": "false",
             "prev_conclusion": "",
+            "streak_started_at": "2026-09-04T12:00:00Z",
+            "prev_started_at": "2026-09-04T12:30:00Z",
+            "now": "2026-09-04T12:40:00Z",
             **kwargs,
         }
     )
@@ -134,6 +143,71 @@ class TestRepeatFailuresStayQuiet:
         d = decide(status="failed", prev_conclusion="failure")
         reason = notify.why(d, status="failed", force_post="false", prev_conclusion="failure")
         assert "already been reported" in reason
+
+    def test_a_repeat_still_reports_itself_once_the_reminder_is_due(self):
+        """The reason this is a digest and not a mute.
+
+        A conclusion says THAT a run failed, never WHAT failed. Two endpoints
+        down and twenty-one endpoints down are both `failure`, so suppressing
+        every repeat would let an outage grow behind an alert already sent. The
+        reminder bounds how long that can go unmentioned.
+        """
+        quiet = decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T12:40:00Z",
+            now="2026-09-04T12:50:00Z",
+            repeat_after_minutes=60,
+        )
+        due = decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T12:55:00Z",
+            now="2026-09-04T13:05:00Z",
+            repeat_after_minutes=60,
+        )
+        assert (quiet["post"], due["post"]) == ("false", "true")
+
+    def test_the_reminder_fires_once_per_window_not_every_run_after_it(self):
+        """A five-minute cron crossing the hour must not start paging again."""
+        assert decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T13:05:00Z",
+            now="2026-09-04T13:10:00Z",
+            repeat_after_minutes=60,
+        )["post"] == "false"
+
+    @pytest.mark.parametrize(
+        "streak_started_at,prev_started_at",
+        [("", "2026-09-04T12:40:00Z"), ("2026-09-04T12:00:00Z", ""), ("nonsense", "nonsense")],
+    )
+    def test_unreadable_streak_timestamps_page_rather_than_stay_quiet(
+        self, streak_started_at, prev_started_at
+    ):
+        """A reminder that fires early costs one message. One that never fires
+        hides a growing outage."""
+        assert decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at=streak_started_at,
+            prev_started_at=prev_started_at,
+            now="2026-09-04T12:50:00Z",
+        )["post"] == "true"
+
+    def test_a_nonpositive_interval_cannot_be_used_to_mute_the_channel(self):
+        """`repeat-alert-after-minutes: 0` must not mean 'never remind'."""
+        assert decide(
+            status="failed",
+            prev_conclusion="failure",
+            streak_started_at="2026-09-04T12:00:00Z",
+            prev_started_at="2026-09-04T12:40:00Z",
+            now="2026-09-04T12:50:00Z",
+            repeat_after_minutes=0,
+        )["post"] == "true"
 
     def test_a_standing_breakage_pages_once_then_recovers_once(self):
         """The whole point, as the sequence the channel actually sees: one red on

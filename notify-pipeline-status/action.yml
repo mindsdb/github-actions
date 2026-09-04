@@ -70,6 +70,10 @@ inputs:
     description: "'true' to post with no prior run to compare against, in either direction. The smoke test, and nothing else: a release-train wrapper must leave this alone or every manual run reports a recovery that did not happen."
     required: false
     default: "false"
+  repeat-alert-after-minutes:
+    description: "How long a still-failing pipeline stays quiet before it reports the failure again. Repeats are collapsed so a standing breakage does not page every run, but never indefinitely: a run's conclusion says that it failed, not what failed, so a suppressed repeat can hide an outage that grew. Raise it for a noisy known breakage; do not disable it."
+    required: false
+    default: "60"
   branch:
     description: "Branch to name in the message. Defaults to the running ref, which is wrong for a `workflow_run` caller, where GITHUB_REF is the default branch rather than the branch whose pipeline finished."
     required: false
@@ -202,22 +206,49 @@ runs:
 
         # Most recent CONCLUSIVE run of this workflow on this branch, excluding
         # the current one: cancelled and skipped runs are not evidence either way.
-        if ! PREV=$(gh api "$ENDPOINT" \
-          --jq '[ .workflow_runs[]
-                  | '"${CALLER}"'
-                  | select((.id|tostring) != env.RUN_ID)
-                  | select(.conclusion == "success" or .conclusion == "failure"
-                           or .conclusion == "timed_out" or .conclusion == "startup_failure")
-                ][0].conclusion // ""' 2>&1); then
+        #
+        # Also measure the CURRENT FAILURE STREAK and when it started, which is
+        # what lets a repeated failure be quiet without being silent. The streak
+        # is the leading run of failures in this history; its oldest member dates
+        # the breakage. A page that truncates the streak understates its age,
+        # which makes the reminder fire sooner rather than later.
+        read -r -d '' RUNS_JQ <<'JQ' || true
+        [ .workflow_runs[]
+          | CALLER_FILTER
+          | select((.id|tostring) != env.RUN_ID)
+          | select(.conclusion == "success" or .conclusion == "failure"
+                   or .conclusion == "timed_out" or .conclusion == "startup_failure")
+        ]
+        | map({conclusion, created_at})
+        | (map(.conclusion == "failure" or .conclusion == "timed_out"
+               or .conclusion == "startup_failure") | index(false)) as $break
+        | (if $break == null then length else $break end) as $streak
+        | [ (.[0].conclusion // ""),
+            (.[0].created_at // ""),
+            ($streak | tostring),
+            (if $streak > 0 then .[$streak - 1].created_at else "" end)
+          ]
+        | @tsv
+        JQ
+        RUNS_JQ="${RUNS_JQ//CALLER_FILTER/${CALLER}}"
+
+        if ! ROW=$(gh api "$ENDPOINT" --jq "$RUNS_JQ" 2>&1); then
           # Almost always a missing `actions: read` grant on the caller job. Report
           # no evidence rather than failing: an unreadable history has to read as
           # "not a recovery", because a notify step must never redden a green run.
-          echo "Could not read run history, so there is no evidence either way: ${PREV}"
+          # It also has to read as "not a duplicate", so the alert still pages.
+          echo "Could not read run history, so there is no evidence either way: ${ROW}"
           exit 0
         fi
 
-        echo "prev_conclusion=${PREV}" >> "$GITHUB_OUTPUT"
+        IFS=$'\t' read -r PREV PREV_STARTED STREAK STREAK_STARTED <<<"${ROW}"
+        {
+          echo "prev_conclusion=${PREV}"
+          echo "prev_started_at=${PREV_STARTED}"
+          echo "streak_started_at=${STREAK_STARTED}"
+        } >> "$GITHUB_OUTPUT"
         echo "Previous conclusive run on ${BRANCH} concluded '${PREV:-none}'."
+        echo "Consecutive failures before this run: ${STREAK:-0}, oldest at ${STREAK_STARTED:-n/a}."
 
     # One decision, one place, with tests. See scripts/notify_decision.py for the
     # three outcomes and why `force-post` is an input rather than an event check.
@@ -231,9 +262,15 @@ runs:
         FROZEN: ${{ steps.freeze.outputs.frozen }}
         FORCE_POST: ${{ inputs.force-post }}
         PREV_CONCLUSION: ${{ steps.prev.outputs.prev_conclusion }}
+        PREV_STARTED_AT: ${{ steps.prev.outputs.prev_started_at }}
+        STREAK_STARTED_AT: ${{ steps.prev.outputs.streak_started_at }}
+        REPEAT_AFTER_MINUTES: ${{ inputs.repeat-alert-after-minutes }}
       run: |
         set -euo pipefail
         python3 "${SHARED}/scripts/notify_decision.py" \
+          --streak-started-at "${STREAK_STARTED_AT}" \
+          --prev-started-at "${PREV_STARTED_AT}" \
+          --repeat-alert-after-minutes "${REPEAT_AFTER_MINUTES}" \
           --status "${STATUS}" \
           --freeze-scoped "${FREEZE_SCOPED}" \
           --frozen "${FROZEN}" \

@@ -24,12 +24,20 @@ The three outcomes:
     half of a story the channel was never told is worse than posting neither.
 
 ``alert``
-    A failure whose predecessor was not already failing. The freeze veto above is
-    the only other thing that may suppress one. A failure after a failure posts
-    nothing: the channel has already been told, and a standing breakage that
-    re-pages on every run is how a real alert gets missed. ENG-2324's public web
-    probe runs every five minutes, so one unfixed route was worth about 220 Slack
-    messages a day until this rule existed.
+    A failure. It posts when the breakage is new, and again once per
+    ``--repeat-alert-after-minutes`` for as long as it lasts. The freeze veto
+    above is the only thing that suppresses one outright.
+
+    Repeats are collapsed because a standing breakage that re-pages on every run
+    is how a real alert gets missed: ENG-2324's public web probe runs every five
+    minutes, so one unfixed route was worth about 220 Slack messages a day.
+
+    They are collapsed but never silenced, because the run's conclusion says only
+    THAT it failed, not WHAT failed. Two endpoints down and twenty-one endpoints
+    down are both ``failure``, so suppressing every repeat would let an outage
+    grow behind an alert that had already been sent. The reminder bounds how long
+    a change in the failure can go unmentioned, and it is why this is a digest
+    rather than a mute.
 
 ``recovered``
     A success whose predecessor failed. Posts only on that evidence, or when
@@ -54,16 +62,75 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime, timezone
 
 # Conclusions a `success` can be a recovery FROM. `cancelled` and `skipped` are
 # not evidence that anything was broken, so recovering from them is not news.
 FAILED_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure"})
+
+# How long a repeated failure may stay quiet before it says so again.
+DEFAULT_REPEAT_ALERT_AFTER_MINUTES = 60
 
 STYLES: dict[str, dict[str, str]] = {
     "silenced": {"color": "", "icon": "", "verb": "", "prefix": ""},
     "recovered": {"color": "#00C851", "icon": ":white_check_mark:", "verb": "recovered", "prefix": "Recovered"},
     "alert": {"color": "#FF4444", "icon": ":rotating_light:", "verb": "failed", "prefix": "FAILED"},
 }
+
+
+def _parse_minutes(value: str) -> float:
+    """The reminder interval, falling back rather than rejecting the argument."""
+
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_REPEAT_ALERT_AFTER_MINUTES
+    return minutes if minutes > 0 else DEFAULT_REPEAT_ALERT_AFTER_MINUTES
+
+
+def _parse_time(value: str) -> datetime | None:
+    """A GitHub timestamp, or None when there is nothing usable to read."""
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def repeat_alert_is_due(
+    *,
+    streak_started_at: str,
+    prev_started_at: str,
+    now: str,
+    repeat_after_minutes: float,
+) -> bool:
+    """Whether a still-failing pipeline has crossed into a new reminder window.
+
+    Windows are counted from the oldest failure in the streak rather than from
+    the last message, because nothing records when a message was sent. Both this
+    run and its predecessor are placed in a window and a reminder is due when
+    they land in different ones, which posts exactly once per window at any
+    cadence.
+
+    Anything unreadable returns True. A reminder that fires early costs one
+    message; one that never fires hides a growing outage.
+    """
+
+    started = _parse_time(streak_started_at)
+    previous = _parse_time(prev_started_at)
+    current = _parse_time(now)
+    if started is None or previous is None or current is None:
+        return True
+    if repeat_after_minutes <= 0:
+        return True
+
+    window = repeat_after_minutes * 60
+    elapsed_now = (current - started).total_seconds()
+    elapsed_prev = (previous - started).total_seconds()
+    return int(elapsed_now // window) != int(elapsed_prev // window)
 
 
 def decide(
@@ -73,6 +140,10 @@ def decide(
     frozen: str,
     force_post: str,
     prev_conclusion: str,
+    streak_started_at: str = "",
+    prev_started_at: str = "",
+    now: str = "",
+    repeat_after_minutes: float = DEFAULT_REPEAT_ALERT_AFTER_MINUTES,
 ) -> dict[str, str]:
     """The full decision, as the flat strings the Slack payload interpolates.
 
@@ -90,9 +161,19 @@ def decide(
         post = force_post == "true" or prev_conclusion in FAILED_CONCLUSIONS
     else:
         level = "alert"
-        # Only evidence of an already-failing predecessor suppresses an alert. An
-        # empty conclusion is absence of evidence, so it still pages.
-        post = force_post == "true" or prev_conclusion not in FAILED_CONCLUSIONS
+        # Only evidence of an already-failing predecessor collapses an alert, and
+        # only until the next reminder is due. An empty conclusion is absence of
+        # evidence, so it still pages.
+        post = (
+            force_post == "true"
+            or prev_conclusion not in FAILED_CONCLUSIONS
+            or repeat_alert_is_due(
+                streak_started_at=streak_started_at,
+                prev_started_at=prev_started_at,
+                now=now,
+                repeat_after_minutes=repeat_after_minutes,
+            )
+        )
 
     return {"post": "true" if post else "false", "level": level, **STYLES[level]}
 
@@ -106,7 +187,7 @@ def why(decision: dict[str, str], *, status: str, force_post: str, prev_conclusi
             return "Posting a failure."
         return (
             f"Previous run also concluded '{prev_conclusion}', so this breakage has already "
-            "been reported. Staying quiet until it recovers."
+            "been reported. Staying quiet until it recovers or the next reminder is due."
         )
     if force_post == "true":
         return "Posting a recovery unconditionally (--force-post: this is the smoke test)."
@@ -145,6 +226,29 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="empty means no evidence either way, which posts an alert and withholds a recovery",
     )
+    parser.add_argument(
+        "--streak-started-at",
+        default="",
+        help="when the current run of consecutive failures began; empty means the reminder is due",
+    )
+    parser.add_argument(
+        "--prev-started-at",
+        default="",
+        help="when the previous conclusive run began; empty means the reminder is due",
+    )
+    parser.add_argument(
+        "--now",
+        default="",
+        help="override the current time, for tests",
+    )
+    # Deliberately a string, parsed leniently below. A composite action's input is
+    # "" when the caller does not set it, and a notify step must never fail the
+    # run it is reporting on — least of all by rejecting its own argument.
+    parser.add_argument(
+        "--repeat-alert-after-minutes",
+        default="",
+        help="how long a still-failing pipeline stays quiet before it says so again",
+    )
     args = parser.parse_args(argv)
 
     decision = decide(
@@ -153,6 +257,10 @@ def main(argv: list[str] | None = None) -> int:
         frozen=args.frozen,
         force_post=args.force_post,
         prev_conclusion=args.prev_conclusion,
+        streak_started_at=args.streak_started_at,
+        prev_started_at=args.prev_started_at,
+        now=args.now or datetime.now(timezone.utc).isoformat(),
+        repeat_after_minutes=_parse_minutes(args.repeat_alert_after_minutes),
     )
     emit(decision)
     print(why(decision, status=args.status, force_post=args.force_post, prev_conclusion=args.prev_conclusion))

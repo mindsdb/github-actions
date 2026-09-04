@@ -96,6 +96,10 @@ on:
         description: "Post a 'recovered' message with no prior failure to recover from. Only the smoke-test dispatch sets this; a real pipeline leaves it off, or every green run reports a recovery."
         type: boolean
         default: false
+      repeat-alert-after-minutes:
+        description: "How long a still-failing pipeline stays quiet before it reports the failure again. Repeats are collapsed so a standing breakage does not page every run, but never indefinitely: a conclusion says that a run failed, not what failed, so a suppressed repeat can hide an outage that grew."
+        type: number
+        default: 60
       runs-on:
         description: "Runner label for the notify job"
         type: string
@@ -177,5 +181,6 @@ jobs:
           freeze-token: ${{ steps.freeze-token.outputs.token }}
           github-token: ${{ github.token }}
           force-post: ${{ inputs.force-post }}
+          repeat-alert-after-minutes: ${{ inputs.repeat-alert-after-minutes || 60 }}
           slack-channel-id: ${{ secrets.SLACK_ENG_CHANNEL_ID }}
           slack-bot-token: ${{ secrets.GH_ACTIONS_SLACK_BOT_TOKEN }}

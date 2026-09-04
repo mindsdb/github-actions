@@ -44,11 +44,17 @@ marker is reported as either `status 200 missing SPA marker` or
 `production /cowork status 301 to /cowork/`, because the status alone says a route moved but not
 where to, and the destination is usually the diagnosis.
 
-**One breakage pages once.** A failing endpoint alerts on the run that breaks it and then stays
-quiet until it recovers, because `notify-pipeline-status` suppresses a failure whose predecessor
-also failed. At this cadence the alternative is roughly 220 messages a day for a single unfixed
-route, which is how a real page gets scrolled past. Routine green runs stay silent through the same
-lookup, so a three-day outage costs three messages: one red, silence, one green.
+**One breakage pages once, then hourly.** A failing endpoint alerts on the run that breaks it, then
+goes quiet, then repeats itself once an hour for as long as it lasts, because `notify-pipeline-status`
+collapses a failure whose predecessor also failed. At this cadence the alternative is roughly 220
+messages a day for a single unfixed route, which is how a real page gets scrolled past. Routine green
+runs stay silent through the same lookup.
+
+The hourly repeat is not a formality. A run's conclusion records **that** it failed, never **what**
+failed, so two dead routes and a total console outage are both `failure`. Suppressing every repeat
+would let the second grow behind an alert already sent for the first. The repeat bounds how long a
+change in the failing set can go unmentioned; raise `repeat-alert-after-minutes` for a known noisy
+breakage, but do not try to disable it.
 
 The reviewable source of truth is [`config/console-route-probe.json`](config/console-route-probe.json).
 The Console matrix crosses these environments:
@@ -197,11 +203,20 @@ single job runs unless the workflow was cancelled and derives the outcome from
 conclusive run of the same workflow on the same branch and stays silent unless it
 failed, so a routine green merge posts nothing.
 
-**The same lookup deduplicates failures.** A red run whose predecessor was also
-red posts nothing either, so a standing breakage pages once rather than on every
+**The same lookup collapses repeated failures.** A red run whose predecessor was
+also red posts nothing, so a standing breakage pages once rather than on every
 run. The two directions fail open in opposite ways on purpose: with no evidence,
 an alert posts and a recovery does not, because an unreported failure costs more
 than a duplicate one.
+
+**Collapsed is not muted.** A conclusion says that a run failed, not what failed,
+so a suppressed repeat could hide an outage that grew behind an alert already
+sent. A still-failing pipeline therefore reports itself again every
+`repeat-alert-after-minutes` (default 60), measured from the oldest failure in
+the current streak so the repeat lands once per window at any cadence. An
+unreadable or missing streak clock posts rather than staying quiet, and setting
+the interval to zero or a non-number falls back to the default instead of
+muting the channel.
 
 That lookup needs `actions: read` on this job, because the default workflow token
 carries contents + packages read only and a called workflow can never hold more

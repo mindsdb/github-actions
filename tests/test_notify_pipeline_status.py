@@ -49,6 +49,38 @@ class TestThePriorRunLookupRunsForBothDirections:
         assert "--prev-conclusion" in decide["run"]
 
 
+class TestTheRepeatReminderIsWiredEndToEnd:
+    """Collapsing repeats is only safe because the reminder bounds the silence.
+
+    A conclusion says THAT a run failed, not WHAT failed, so a suppressed repeat
+    can hide an outage that grew behind an alert already sent. If any link in
+    this chain breaks, deduplication silently becomes a mute.
+    """
+
+    def test_the_streak_clock_is_measured(self):
+        run = step("prev")["run"]
+        assert "streak_started_at=" in run
+        assert "prev_started_at=" in run
+
+    def test_the_streak_clock_reaches_the_decision(self):
+        decide = step("msg")
+        assert decide["env"]["STREAK_STARTED_AT"] == "${{ steps.prev.outputs.streak_started_at }}"
+        assert decide["env"]["PREV_STARTED_AT"] == "${{ steps.prev.outputs.prev_started_at }}"
+        assert "--streak-started-at" in decide["run"]
+        assert "--prev-started-at" in decide["run"]
+
+    def test_the_interval_is_an_input_with_a_bounded_default(self):
+        interval = ACTION["inputs"]["repeat-alert-after-minutes"]
+        assert float(interval["default"]) > 0
+        assert "--repeat-alert-after-minutes" in step("msg")["run"]
+
+    def test_the_streak_counts_only_leading_failures(self):
+        """A success in the history ends the streak, which is what dates the
+        breakage to when it actually started rather than to the oldest run."""
+        run = step("prev")["run"]
+        assert "index(false)" in run
+
+
 class TestTheLookupAsksForOneWorkflowsOwnHistory:
     """The branch-wide page is what a five-minute cron crowds out."""
 
