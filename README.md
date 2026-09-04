@@ -40,8 +40,15 @@ sends no failure alert. An endpoint that fails twice makes the run red and passe
 failure to `notify-main-failure.yml`, which posts to the engineering Slack channel. That message
 names each failing environment, route, and observed result. A `200` response without the configured
 marker is reported as either `status 200 missing SPA marker` or
-`status 200 missing website marker`. The next successful run uses that reusable workflow's
-existing recovery lookup, so routine green runs stay silent.
+`status 200 missing website marker`. A redirect names its destination, as in
+`production /cowork status 301 to /cowork/`, because the status alone says a route moved but not
+where to, and the destination is usually the diagnosis.
+
+**One breakage pages once.** A failing endpoint alerts on the run that breaks it and then stays
+quiet until it recovers, because `notify-pipeline-status` suppresses a failure whose predecessor
+also failed. At this cadence the alternative is roughly 220 messages a day for a single unfixed
+route, which is how a real page gets scrolled past. Routine green runs stay silent through the same
+lookup, so a three-day outage costs three messages: one red, silence, one green.
 
 The reviewable source of truth is [`config/console-route-probe.json`](config/console-route-probe.json).
 The Console matrix crosses these environments:
@@ -188,11 +195,27 @@ single job runs unless the workflow was cancelled and derives the outcome from
 
 `recovered` is not the same as green: the reusable looks up the previous
 conclusive run of the same workflow on the same branch and stays silent unless it
-failed, so a routine green merge posts nothing. That lookup needs `actions: read`
-on this job, because the default workflow token carries contents + packages read
-only and a called workflow can never hold more than its caller grants. Without
-it the lookup is refused and the job stays silent (it never fails the run), so a
-missing recovery message is the symptom to look for.
+failed, so a routine green merge posts nothing.
+
+**The same lookup deduplicates failures.** A red run whose predecessor was also
+red posts nothing either, so a standing breakage pages once rather than on every
+run. The two directions fail open in opposite ways on purpose: with no evidence,
+an alert posts and a recovery does not, because an unreported failure costs more
+than a duplicate one.
+
+That lookup needs `actions: read` on this job, because the default workflow token
+carries contents + packages read only and a called workflow can never hold more
+than its caller grants. Without it the lookup is refused and the job stays silent
+(it never fails the run), so a missing recovery message is the symptom to look
+for — and, since the deduplication reads the same evidence, a caller missing the
+grant also re-pages every run of a standing failure.
+
+The lookup asks the per-workflow runs endpoint rather than paging the branch's
+recent runs, so one frequent cron cannot crowd another workflow out of its own
+history. It used to read fifty branch-wide runs and filter afterwards, which the
+five-minute public web probe compressed to about four hours of coverage; any
+workflow whose previous run was older than that found no evidence and silently
+dropped its recovery message.
 
 ### Scoping staging alerts to the freeze window
 
@@ -241,8 +264,8 @@ Requires two org secrets, reaching the workflow via `secrets: inherit`:
 must be a member of that channel.
 
 `workflow_dispatch` on the reusable itself is a smoke test: it posts a sample
-message in either style, skipping the prior-run lookup so `recovered` always
-posts.
+message in either style, skipping the prior-run lookup so both `recovered` and a
+repeated `failed` always post.
 
 ### The one failure it cannot see: a run that never started
 
