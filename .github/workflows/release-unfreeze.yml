@@ -1,11 +1,12 @@
 # Reusable workflow: unfreeze staging when the weekly release PR merges, then
 # sync main back into staging.
 #
-# Unfreezing flips the pre-provisioned `staging-freeze` ruleset back to
-# `disabled`, reopening staging for normal development the moment the release
-# ships — no fixed Monday-morning wait. It is also what turns staging's alerting
-# back off: the alert path reads the same ruleset, so an unfrozen staging stops
-# paging the channel without anything else being told.
+# Unfreezing sets this repo's `staging_frozen` custom property back to `false`,
+# which takes the branch out of the org-level freeze ruleset and reopens staging
+# for normal development the moment the release ships — no fixed Monday-morning
+# wait. It is also what turns staging's alerting back off: the alert path reads
+# the same property, so an unfrozen staging stops paging the channel without
+# anything else being told.
 #
 # Order is load-bearing: unlock first, then push. If the sync-back push fails,
 # staging is left unlocked, which is the acceptable failure mode.
@@ -13,7 +14,7 @@
 # The sync-back merge (main -> staging) is load-bearing on squash-merge repos:
 # without it, every previously shipped commit reappears in the next release
 # PR's commit list. The push is performed with the `mindsdb-release-train` App
-# token; the App is the ruleset bypass actor on staging, so the push lands even
+# token; the App is the freeze ruleset's bypass actor, so the push lands even
 # though staging otherwise requires review.
 #
 # Called by a per-repo wrapper, e.g.
@@ -39,10 +40,10 @@ on:
         description: "Production branch to sync back from"
         type: string
         default: main
-      ruleset-name:
-        description: "Name of the pre-provisioned freeze ruleset to toggle"
+      freeze-property:
+        description: "Custom property that marks this repo frozen. Must match the org ruleset's condition in terraform."
         type: string
-        default: staging-freeze
+        default: staging_frozen
 
 # No workflow-level `permissions:` block, deliberately, so this job inherits the
 # calling job's grant. That is what makes the notify step's recovery lookup work:
@@ -70,10 +71,10 @@ jobs:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      # The ruleset read-modify-write lives in `scripts/freeze_state.py`, which is
-      # also what the alerting workflows use to READ the freeze state. One file
-      # owns the contract, so unfreezing and "staging alerts are off again" can
-      # never disagree about which ruleset they mean.
+      # The property write lives in `scripts/freeze_state.py`, which is also what
+      # the alerting workflows use to READ the freeze state. One file owns the
+      # contract, so unfreezing and "staging alerts are off again" can never
+      # disagree about which property they mean.
       #
       # This has to precede the unlock, because the unlock runs that script. It is
       # therefore the one step whose failure leaves staging FROZEN, which is the
@@ -87,26 +88,26 @@ jobs:
           path: .ci-shared
           persist-credentials: false
 
-      - name: Unfreeze staging (disable ruleset)
+      - name: Unfreeze staging (clear the frozen property)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          RULESET_NAME: ${{ inputs.ruleset-name }}
+          FREEZE_PROPERTY: ${{ inputs.freeze-property }}
           STAGING: ${{ inputs.staging-branch }}
-          ENFORCEMENT: disabled
+          FROZEN: "false"
         run: |
           set -euo pipefail
           python3 .ci-shared/scripts/freeze_state.py set \
             --repo "${REPO}" \
-            --ruleset-name "${RULESET_NAME}" \
-            --enforcement "${ENFORCEMENT}" \
-            --body-path "${RUNNER_TEMP}/ruleset.json"
+            --property-name "${FREEZE_PROPERTY}" \
+            --frozen "${FROZEN}" \
+            --body-path "${RUNNER_TEMP}/freeze-property.json"
           PR_NUMBER='${{ github.event.pull_request.number }}'
           echo "${STAGING} is UNFROZEN."
           {
             echo "## Staging branch UNFROZEN"
             echo ""
-            echo "The \`${STAGING}\` branch is **unfrozen** via ruleset \`${RULESET_NAME}\` (triggered by PR #${PR_NUMBER:-manual})."
+            echo "The \`${STAGING}\` branch is **unfrozen**: \`${FREEZE_PROPERTY}=false\` (triggered by PR #${PR_NUMBER:-manual})."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Order is load-bearing and this is the whole reason for it: unlock first,

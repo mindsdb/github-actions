@@ -36,62 +36,73 @@ def fake_runner(responses):
     return runner
 
 
-RULESET_LIST = json.dumps(
-    [
-        {"id": 7, "name": "staging-freeze", "enforcement": "disabled"},
-        {"id": 9, "name": "something-else", "enforcement": "active"},
-    ]
-)
-
-RULESET_DETAIL = json.dumps(
-    {
-        "id": 7,
-        "name": "staging-freeze",
-        "target": "branch",
-        "enforcement": "disabled",
-        "bypass_actors": [{"actor_id": 1, "actor_type": "Integration"}],
-        "conditions": {"ref_name": {"include": ["refs/heads/staging"]}},
-        "rules": [{"type": "update"}],
-    }
-)
+def values(frozen):
+    return json.dumps(
+        [
+            {"property_name": "team", "value": "devops"},
+            {"property_name": "staging_frozen", "value": frozen},
+        ]
+    )
 
 
 class TestIsFrozen:
-    def test_active_enforcement_is_frozen(self):
-        listing = json.dumps([{"id": 7, "name": "staging-freeze", "enforcement": "active"}])
-        assert freeze_state.is_frozen("o/r", "staging-freeze", runner=fake_runner([completed(listing)]))
+    def test_true_string_is_frozen(self):
+        assert freeze_state.is_frozen("o/r", "staging_frozen", runner=fake_runner([completed(values("true"))]))
 
-    def test_disabled_enforcement_is_not_frozen(self):
+    def test_false_string_is_not_frozen(self):
         assert not freeze_state.is_frozen(
-            "o/r", "staging-freeze", runner=fake_runner([completed(RULESET_LIST)])
+            "o/r", "staging_frozen", runner=fake_runner([completed(values("false"))])
         )
 
-    def test_matches_on_name_not_position(self):
-        """A repo carries several rulesets; only the named one decides the freeze."""
-        runner = fake_runner([completed(RULESET_LIST)])
-        assert freeze_state.is_frozen("o/r", "something-else", runner=runner)
+    def test_never_set_is_not_frozen(self):
+        """A repo the property was never written on comes back null, not absent."""
+        assert not freeze_state.is_frozen(
+            "o/r", "staging_frozen", runner=fake_runner([completed(values(None))])
+        )
 
-    def test_missing_ruleset_raises(self):
-        with pytest.raises(freeze_state.LookupError_, match="not found"):
-            freeze_state.is_frozen("o/r", "absent", runner=fake_runner([completed(RULESET_LIST)]))
+    def test_real_boolean_is_tolerated(self):
+        assert freeze_state.is_frozen("o/r", "staging_frozen", runner=fake_runner([completed(values(True))]))
+
+    def test_matches_on_name_not_position(self):
+        """A repo carries several properties; only the named one decides the freeze."""
+        listing = json.dumps(
+            [
+                {"property_name": "staging_frozen", "value": "false"},
+                {"property_name": "other_freeze", "value": "true"},
+            ]
+        )
+        assert freeze_state.is_frozen("o/r", "other_freeze", runner=fake_runner([completed(listing)]))
+
+    def test_undefined_property_raises(self):
+        """Absent from the listing means the org does not define it: drift, not thawed."""
+        with pytest.raises(freeze_state.LookupError_, match="not defined"):
+            freeze_state.is_frozen("o/r", "absent", runner=fake_runner([completed(values("true"))]))
 
     def test_api_failure_raises(self):
         runner = fake_runner([completed(stderr="HTTP 403", returncode=1)])
-        with pytest.raises(freeze_state.LookupError_, match="Could not read rulesets"):
-            freeze_state.is_frozen("o/r", "staging-freeze", runner=runner)
+        with pytest.raises(freeze_state.LookupError_, match="Could not read custom properties"):
+            freeze_state.is_frozen("o/r", "staging_frozen", runner=runner)
+
+    def test_non_json_listing_is_a_lookup_error_not_a_traceback(self):
+        runner = fake_runner([completed("<html>502</html>")])
+        with pytest.raises(freeze_state.LookupError_, match="was not JSON"):
+            freeze_state.is_frozen("o/r", "staging_frozen", runner=runner)
 
 
 class TestReadMode:
     """The alerting path. It must never fail the job and never under-report."""
 
     def test_reports_false_when_thawed(self, capsys):
-        code = freeze_state.main(
-            ["read", "--repo", "o/r"], runner=fake_runner([completed(RULESET_LIST)])
-        )
+        code = freeze_state.main(["read", "--repo", "o/r"], runner=fake_runner([completed(values("false"))]))
         assert code == 0
         assert "frozen=false" in capsys.readouterr().out
 
-    def test_unreadable_ruleset_escalates_to_frozen(self, capsys):
+    def test_reads_the_repo_property_values_endpoint(self):
+        runner = fake_runner([completed(values("false"))])
+        freeze_state.main(["read", "--repo", "o/r"], runner=runner)
+        assert runner.calls == [["gh", "api", "repos/o/r/properties/values"]]
+
+    def test_unreadable_property_escalates_to_frozen(self, capsys):
         """A lookup problem must not silence a real release-blocking failure."""
         runner = fake_runner([completed(stderr="HTTP 403", returncode=1)])
         code = freeze_state.main(["read", "--repo", "o/r"], runner=runner)
@@ -100,9 +111,9 @@ class TestReadMode:
         assert "frozen=true" in out
         assert "::warning::" in out
 
-    def test_missing_ruleset_escalates_to_frozen(self, capsys):
-        runner = fake_runner([completed(RULESET_LIST)])
-        code = freeze_state.main(["read", "--repo", "o/r", "--ruleset-name", "renamed"], runner=runner)
+    def test_undefined_property_escalates_to_frozen(self, capsys):
+        runner = fake_runner([completed(values("false"))])
+        code = freeze_state.main(["read", "--repo", "o/r", "--property-name", "renamed"], runner=runner)
         assert code == 0
         assert "frozen=true" in capsys.readouterr().out
 
@@ -113,71 +124,52 @@ class TestReadMode:
     def test_writes_github_output(self, tmp_path, monkeypatch):
         out = tmp_path / "gh-output"
         monkeypatch.setenv("GITHUB_OUTPUT", str(out))
-        freeze_state.main(["read", "--repo", "o/r"], runner=fake_runner([completed(RULESET_LIST)]))
+        freeze_state.main(["read", "--repo", "o/r"], runner=fake_runner([completed(values("false"))]))
         assert out.read_text().strip() == "frozen=false"
 
 
 class TestSetMode:
-    """The freeze/unfreeze path. It must preserve the ruleset and fail loudly."""
+    """The freeze/unfreeze path. It must write exactly the property and fail loudly."""
 
-    def test_put_preserves_bypass_actors_conditions_and_rules(self, tmp_path):
-        body = tmp_path / "ruleset.json"
-        runner = fake_runner([completed(RULESET_LIST), completed(RULESET_DETAIL), completed("{}")])
-        freeze_state.set_enforcement(
-            "o/r", "staging-freeze", "active", body_path=str(body), runner=runner
-        )
-        written = json.loads(body.read_text())
-        assert written["enforcement"] == "active"
-        assert written["bypass_actors"] == [{"actor_id": 1, "actor_type": "Integration"}]
-        assert written["rules"] == [{"type": "update"}]
-        assert written["conditions"]["ref_name"]["include"] == ["refs/heads/staging"]
+    def test_patches_the_property_as_a_string(self, tmp_path):
+        body = tmp_path / "prop.json"
+        runner = fake_runner([completed("")])
+        freeze_state.set_frozen("o/r", "staging_frozen", True, body_path=str(body), runner=runner)
+        assert json.loads(body.read_text()) == {
+            "properties": [{"property_name": "staging_frozen", "value": "true"}]
+        }
+        assert runner.calls == [
+            ["gh", "api", "--method", "PATCH", "repos/o/r/properties/values", "--input", str(body)]
+        ]
 
-    def test_reads_the_detail_endpoint_not_the_listing(self, tmp_path):
-        """The listing omits rules and bypass actors; PUTting it back drops them."""
-        runner = fake_runner([completed(RULESET_LIST), completed(RULESET_DETAIL), completed("{}")])
-        freeze_state.set_enforcement(
-            "o/r", "staging-freeze", "active", body_path=str(tmp_path / "b.json"), runner=runner
-        )
-        assert runner.calls[1] == ["gh", "api", "repos/o/r/rulesets/7"]
+    def test_unfreeze_writes_false_not_null(self, tmp_path):
+        """Null would read back as thawed too, but leaves no trace that a freeze ever ran."""
+        body = tmp_path / "prop.json"
+        freeze_state.set_frozen("o/r", "staging_frozen", False, body_path=str(body), runner=fake_runner([completed("")]))
+        assert json.loads(body.read_text())["properties"][0]["value"] == "false"
 
-    def test_failed_put_raises(self, tmp_path):
-        runner = fake_runner(
-            [completed(RULESET_LIST), completed(RULESET_DETAIL), completed(stderr="HTTP 422", returncode=1)]
-        )
-        with pytest.raises(freeze_state.LookupError_, match="Could not update"):
-            freeze_state.set_enforcement(
-                "o/r", "staging-freeze", "active", body_path=str(tmp_path / "b.json"), runner=runner
-            )
-
-    def test_a_non_json_detail_body_is_a_lookup_error_not_a_traceback(self, tmp_path):
-        """The one unguarded parse in the module. An operator paged by a stopped
-        release train reads `main()`'s "provisioning has drifted" annotation, not a
-        JSONDecodeError stack."""
-        runner = fake_runner([completed(RULESET_LIST), completed("<html>502</html>")])
-        with pytest.raises(freeze_state.LookupError_, match="was not JSON"):
-            freeze_state.set_enforcement(
-                "o/r", "staging-freeze", "active", body_path=str(tmp_path / "b.json"), runner=runner
-            )
+    def test_failed_patch_raises(self, tmp_path):
+        runner = fake_runner([completed(stderr="HTTP 422", returncode=1)])
+        with pytest.raises(freeze_state.LookupError_, match="Could not set"):
+            freeze_state.set_frozen("o/r", "staging_frozen", True, body_path=str(tmp_path / "b.json"), runner=runner)
 
     def test_an_error_body_on_stdout_still_reaches_the_message(self, tmp_path):
         """`gh` puts the API's error body on stdout and its own noise on stderr, so
         taking stderr alone can print an error with no cause in it."""
         runner = fake_runner(
-            [
-                completed(RULESET_LIST),
-                completed(RULESET_DETAIL),
-                completed(stdout='{"message":"Resource not accessible by integration"}', returncode=1),
-            ]
+            [completed(stdout='{"message":"Resource not accessible by integration"}', returncode=1)]
         )
         with pytest.raises(freeze_state.LookupError_, match="not accessible by integration"):
-            freeze_state.set_enforcement(
-                "o/r", "staging-freeze", "active", body_path=str(tmp_path / "b.json"), runner=runner
-            )
+            freeze_state.set_frozen("o/r", "staging_frozen", True, body_path=str(tmp_path / "b.json"), runner=runner)
 
-    def test_missing_ruleset_fails_the_job(self, tmp_path):
+    def test_failed_set_fails_the_job(self, tmp_path):
         """Never escalate here: a freeze that did not apply must stop the train."""
         code = freeze_state.main(
-            ["set", "--repo", "o/r", "--enforcement", "active", "--body-path", str(tmp_path / "b.json")],
-            runner=fake_runner([completed("[]")]),
+            ["set", "--repo", "o/r", "--frozen", "true", "--body-path", str(tmp_path / "b.json")],
+            runner=fake_runner([completed(stderr="HTTP 404", returncode=1)]),
         )
         assert code == 1
+
+    def test_set_requires_a_value(self, tmp_path):
+        with pytest.raises(SystemExit):
+            freeze_state.main(["set", "--repo", "o/r"], runner=fake_runner([]))
