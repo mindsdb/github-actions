@@ -85,7 +85,7 @@ on:
       allowlist:
         description: "Comma-separated logins exempt from signing. Bots only; see the header. Override only for a genuine one-off."
         type: string
-        default: 'dependabot[bot], mindsdb-release-train[bot]'
+        default: 'dependabot[bot], mindsdb-release-train[bot], snyk-bot[bot]'
       path-to-signatures:
         description: "Signature ledger path inside the calling repo"
         type: string
