@@ -536,10 +536,15 @@ an employment agreement was in place and covered the work.
 
 Bots stay, because a bot cannot sign. It cannot post the agreement sentence, so
 without an exemption its pull request is red forever, and `lightwood` alone has
-36 Dependabot pull requests in its last 100. Two are listed, `dependabot[bot]`
-and `mindsdb-release-train[bot]`, which are the only two that open pull requests
-anywhere in the fleet. `github-actions[bot]` needs no entry: the action already
-filters user id 41898282 in `graphql.ts`.
+36 Dependabot pull requests in its last 100. Three are listed, and the check
+reads committers rather than pull request authors. `dependabot[bot]` and
+`mindsdb-release-train[bot]` open their own pull requests and commit them.
+`snyk-bot` opens none: a human opens the Snyk upgrade pull request and
+`snyk-bot` is the committer inside it, so such a PR has two committers and the
+human still signs. `snyk-bot` is also the one entry with no `[bot]` suffix,
+because GitHub reserves that suffix for the account it mints alongside a GitHub
+App and Snyk commits from an ordinary account it owns. `github-actions[bot]`
+needs no entry: the action already filters user id 41898282 in `graphql.ts`.
 
 **Never put a `*` in that list.** The action compiles `bot*` to
 `new RegExp("bot.*")` and calls `.test()`, which is unanchored and searches

@@ -59,9 +59,20 @@
 # was a former colleague still exempt from signing.
 #
 # Bots stay, because a bot cannot sign: it cannot post the agreement sentence,
-# so with no exemption its pull request is red forever. Only the two that
-# actually open pull requests here are listed. `github-actions[bot]` needs no
-# entry, since the action filters user id 41898282 in `graphql.ts` itself.
+# so with no exemption its pull request is red forever. Three are listed, and
+# the check reads COMMITTERS rather than pull request authors.
+# `dependabot[bot]` and `mindsdb-release-train[bot]` open their own pull
+# requests and commit them. `snyk-bot` opens none: a human opens the Snyk
+# upgrade pull request and `snyk-bot` is the committer inside it, so such a PR
+# has two committers and the human still signs.
+#
+# `snyk-bot` is also the one entry with no `[bot]` suffix. GitHub reserves that
+# suffix for the account it mints alongside a GitHub App; Snyk commits from an
+# ordinary account it owns, which GitHub types "User". Listing it as
+# `snyk-bot[bot]` matched nobody, since matching is `pattern === committer`.
+#
+# `github-actions[bot]` needs no entry, since the action filters user id
+# 41898282 in `graphql.ts` itself.
 #
 # Add a bot by editing the default below, not by passing the input. Anything
 # passed per repo drifts, which is the whole reason this moved.
@@ -85,7 +96,7 @@ on:
       allowlist:
         description: "Comma-separated logins exempt from signing. Bots only; see the header. Override only for a genuine one-off."
         type: string
-        default: 'dependabot[bot], mindsdb-release-train[bot], snyk-bot[bot]'
+        default: 'dependabot[bot], mindsdb-release-train[bot], snyk-bot'
       path-to-signatures:
         description: "Signature ledger path inside the calling repo"
         type: string

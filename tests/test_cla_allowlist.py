@@ -27,6 +27,16 @@ _WORKFLOW = (
 # weight that reads like a decision.
 FILTERED_UPSTREAM = "github-actions[bot]"
 
+# `dependabot[bot]` and `mindsdb-release-train[bot]` are GitHub App identities,
+# where `[bot]` is part of the login and GitHub reserves it. Snyk instead opens
+# its upgrade PRs from an ordinary account it owns, which GitHub reports as type
+# "User" (`snyk-bot`, snyk-bot@snyk.io), so that login carries no suffix.
+#
+# The suffix therefore proves an entry is a bot, but its absence does not prove
+# the entry is a person. Every such machine account is named here so the check
+# below still fails on a human login that nobody named.
+MACHINE_USERS = frozenset({"snyk-bot"})
+
 
 def allowlist_default() -> str:
     spec = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
@@ -59,8 +69,14 @@ def test_every_entry_is_a_bot():
 
     Eleven of the twenty-five names in the old per-repo lists had already left
     the org and were still exempt.
+
+    An entry clears this either by carrying the reserved `[bot]` suffix or by
+    being named in `MACHINE_USERS`. Adding a person still means editing that
+    constant in front of a reviewer, rather than passing a suffix check.
     """
-    assert [e for e in entries() if not e.endswith("[bot]")] == []
+    assert [
+        e for e in entries() if not e.endswith("[bot]") and e not in MACHINE_USERS
+    ] == []
 
 
 def test_github_actions_bot_is_not_listed():
@@ -86,7 +102,14 @@ def test_the_default_does_not_exempt_a_lookalike(impostor):
     assert not any(action_matches(e, impostor) for e in entries())
 
 
-@pytest.mark.parametrize("bot", ["dependabot[bot]", "mindsdb-release-train[bot]"])
+@pytest.mark.parametrize(
+    "bot", ["dependabot[bot]", "mindsdb-release-train[bot]", "snyk-bot"]
+)
 def test_the_bots_that_actually_open_pull_requests_stay_exempt(bot):
-    """A bot cannot post the agreement sentence, so dropping it means a permanent red check."""
+    """A bot cannot post the agreement sentence, so dropping it means a permanent red check.
+
+    The exact login is the assertion. `snyk-bot` was listed as `snyk-bot[bot]`
+    for a while and exempted nobody, because the action compares
+    `pattern === committer` and the real committer login has no suffix.
+    """
     assert bot in entries()
