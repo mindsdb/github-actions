@@ -59,9 +59,11 @@
 # was a former colleague still exempt from signing.
 #
 # Bots stay, because a bot cannot sign: it cannot post the agreement sentence,
-# so with no exemption its pull request is red forever. Only the two that
-# actually open pull requests here are listed. `github-actions[bot]` needs no
-# entry, since the action filters user id 41898282 in `graphql.ts` itself.
+# so with no exemption its pull request is red forever. Only the three that
+# actually open pull requests here are listed (`snyk-bot` opens automated
+# dependency-upgrade PRs across many repos in the org). `github-actions[bot]`
+# needs no entry, since the action filters user id 41898282 in `graphql.ts`
+# itself.
 #
 # Add a bot by editing the default below, not by passing the input. Anything
 # passed per repo drifts, which is the whole reason this moved.
@@ -85,7 +87,7 @@ on:
       allowlist:
         description: "Comma-separated logins exempt from signing. Bots only; see the header. Override only for a genuine one-off."
         type: string
-        default: 'dependabot[bot], mindsdb-release-train[bot], snyk-bot[bot]'
+        default: 'dependabot[bot], mindsdb-release-train[bot], snyk-bot'
       path-to-signatures:
         description: "Signature ledger path inside the calling repo"
         type: string
