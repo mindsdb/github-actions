@@ -9,6 +9,10 @@
 #   - `Deploys: repo#staging` — no API lookup; pins that repo to the
 #     `staging` ECR image tag + `staging` git branch. Useful for testing
 #     the anchor PR against non-PR-branch versions of a sibling service.
+#   - `Deploys: mindshub_services#N` sets `revisions.mindshub_services` only.
+#     That repo ships a SAM stack, not an image: its pr-env-stacks workflow
+#     reads the revision off the parent Application and deploys it, so there
+#     is no ECR tag to check and no `tags.<repo>` to set.
 #   - `Deploys: argocd-envs#N` is special-cased. argocd-envs holds the PR
 #     env's own parent chart, so it has no image and no child Application.
 #     The link moves the PARENT Application's source.targetRevision onto
@@ -285,6 +289,10 @@ runs:
                 --helm-set "revisions.${repo}=staging"
               )
               ;;
+            revision-only)
+              # No image to pin or check; the revision is the whole deploy.
+              set_args+=(--helm-set "revisions.${repo}=${head_sha}")
+              ;;
             envs)
               # The parent chart itself. One source, so one branch: a second
               # link is a contradiction rather than something to merge.
@@ -373,6 +381,19 @@ runs:
                   echo "staging:${full}#staging:${full##*/}::"
                   continue
                 fi
+                # Repos without an image (mindshub_services deploys a SAM
+                # stack from the revision): head SHA only, no ECR lookup.
+                case "${full##*/}" in
+                  mindshub_services)
+                    head_sha="$(gh_api "/repos/$full/pulls/$num" | jq -r '.head.sha // ""')" || true
+                    if [ -n "${head_sha:-}" ]; then
+                      echo "revision-only:${full}#${num}:${full##*/}::${head_sha}"
+                    else
+                      echo "unresolved:${full}#${num}:${full##*/}::"
+                    fi
+                    continue
+                    ;;
+                esac
                 # One API call, both SHAs out. merge_commit_sha is null on
                 # unmergeable PRs; those become an unresolved marker (phase 2
                 # fails the job and comments on the anchor PR).
