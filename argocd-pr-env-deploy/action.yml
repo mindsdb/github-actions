@@ -115,6 +115,13 @@ inputs:
     description: ArgoCD CLI version installed when missing from the runner.
     required: false
     default: v2.13.1
+  stacks-dispatch-token:
+    description: >-
+      Token used to dispatch mindshub_services' pr-env-stacks.yml for this env
+      (needs `actions: write` there). Defaults to gh-token. The dispatch is
+      best-effort: on failure the reconciler's schedule picks the env up.
+    required: false
+    default: ""
   wait-timeout:
     description: >-
       Seconds to wait for the env to reach Synced+Healthy before failing.
@@ -133,6 +140,7 @@ runs:
         ARGOCD_AUTH_TOKEN: ${{ inputs.argocd-token }}
         ARGOCD_VERSION: ${{ inputs.argocd-version }}
         GH_TOKEN: ${{ inputs.gh-token }}
+        STACKS_DISPATCH_TOKEN: ${{ inputs.stacks-dispatch-token || inputs.gh-token }}
         WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
       run: |
         set -euo pipefail
@@ -561,6 +569,26 @@ runs:
               exit 1
               ;;
           esac
+        fi
+
+        # The env's mindshub_services SAM stack is not an ArgoCD child: the
+        # pr-env-stacks workflow in mindsdb/mindshub_services deploys it from
+        # revisions.mindshub_services (just set above). Dispatch it for this
+        # env now so the stack builds while the env rolls out, instead of on
+        # that workflow's next scheduled run. Best-effort: a refused dispatch
+        # (token without actions:write, or the workflow not yet on that
+        # repo's default branch) is a warning, and the schedule catches up.
+        # mindshub_services' own CI calls the workflow directly, so skip it.
+        if [ "$OWN_SHORT" != "mindshub_services" ]; then
+          if jq -n --arg only "$PARENT_APP" '{ref: "main", inputs: {only: $only}}' \
+              | curl -sfX POST -H "Authorization: Bearer $STACKS_DISPATCH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/mindsdb/mindshub_services/actions/workflows/pr-env-stacks.yml/dispatches" \
+                  --data @- >/dev/null; then
+            echo "Dispatched mindshub_services pr-env-stacks.yml for ${PARENT_APP}."
+          else
+            echo "::warning::Could not dispatch mindshub_services/pr-env-stacks.yml for ${PARENT_APP}; its schedule will deploy the stack within ~10 minutes."
+          fi
         fi
 
         # Block until the whole env reaches Synced+Healthy with no in-flight
