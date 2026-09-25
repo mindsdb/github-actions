@@ -246,15 +246,30 @@ runs:
         # job in this same run — no cross-PR race — but it still gets the
         # existence check so a failed/skipped build fails HERE, not as an
         # ImagePullBackOff in the env.
-        OWN_TAG="development-${OWN_MERGE_SHA}"
-        if ! ecr_tag_exists "$OWN_SHORT" "$OWN_TAG"; then
-          echo "::error::ECR image mindsdb-${OWN_SLUG}:${OWN_TAG} not found — did the build job in this run succeed?"
-          exit 1
+        # Repos that publish no image. Their deploy is the git revision alone:
+        # mindshub_services' pr-env-stacks workflow builds a SAM stack from
+        # revisions.mindshub_services. Applies to the anchor itself and to
+        # `Deploys:` links (the revision-only case below).
+        is_revision_only_repo() {
+          case "$1" in
+            mindshub_services) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        if is_revision_only_repo "$OWN_SHORT"; then
+          set_args=(--helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}")
+        else
+          OWN_TAG="development-${OWN_MERGE_SHA}"
+          if ! ecr_tag_exists "$OWN_SHORT" "$OWN_TAG"; then
+            echo "::error::ECR image mindsdb-${OWN_SLUG}:${OWN_TAG} not found — did the build job in this run succeed?"
+            exit 1
+          fi
+          set_args=(
+            --helm-set "tags.${OWN_SHORT}=${OWN_TAG}"
+            --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
+          )
         fi
-        set_args=(
-          --helm-set "tags.${OWN_SHORT}=${OWN_TAG}"
-          --helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}"
-        )
 
         # Linked PRs resolve in two phases. Phase 1 (inside the process
         # substitution): parse the body + hit the GitHub API, emitting one
@@ -381,19 +396,16 @@ runs:
                   echo "staging:${full}#staging:${full##*/}::"
                   continue
                 fi
-                # Repos without an image (mindshub_services deploys a SAM
-                # stack from the revision): head SHA only, no ECR lookup.
-                case "${full##*/}" in
-                  mindshub_services)
-                    head_sha="$(gh_api "/repos/$full/pulls/$num" | jq -r '.head.sha // ""')" || true
-                    if [ -n "${head_sha:-}" ]; then
-                      echo "revision-only:${full}#${num}:${full##*/}::${head_sha}"
-                    else
-                      echo "unresolved:${full}#${num}:${full##*/}::"
-                    fi
-                    continue
-                    ;;
-                esac
+                # Repos without an image: head SHA only, no ECR lookup.
+                if is_revision_only_repo "${full##*/}"; then
+                  head_sha="$(gh_api "/repos/$full/pulls/$num" | jq -r '.head.sha // ""')" || true
+                  if [ -n "${head_sha:-}" ]; then
+                    echo "revision-only:${full}#${num}:${full##*/}::${head_sha}"
+                  else
+                    echo "unresolved:${full}#${num}:${full##*/}::"
+                  fi
+                  continue
+                fi
                 # One API call, both SHAs out. merge_commit_sha is null on
                 # unmergeable PRs; those become an unresolved marker (phase 2
                 # fails the job and comments on the anchor PR).
