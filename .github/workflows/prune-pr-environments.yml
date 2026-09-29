@@ -1,0 +1,72 @@
+name: Prune PR environments
+
+# Deletes each anchor repo's pr-<repo>-<N> GitHub Environment once PR N is
+# closed or loses the `deploy` label. See scripts/prune_pr_environments.py.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        description: "List what would be deleted without deleting it"
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prune-pr-environments
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Must match the anchorRepo list in the PR-env ApplicationSet
+      # (Kubernetes-Foundational-Services pr-env-appset.yaml).
+      ANCHOR_REPOS: >-
+        auth,mindshub_frontend,mindshub_inference,cowork-server,cowork,mindshub_stafftools,mindshub_services
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Mint release-train App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ env.ANCHOR_REPOS }}
+          permission-actions: read
+          permission-environments: write
+          permission-pull-requests: read
+
+      - name: Delete stale PR environments
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          args=()
+          IFS=',' read -ra repos <<< "${ANCHOR_REPOS}"
+          for repo in "${repos[@]}"; do args+=(--repo "${OWNER}/${repo}"); done
+          if [ "${DRY_RUN}" = true ]; then args+=(--dry-run); fi
+          python3 scripts/prune_pr_environments.py "${args[@]}"
+
+  notify:
+    needs: [prune]
+    if: ${{ github.event_name == 'schedule' && !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      actions: read
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "PR environment prune"
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+    secrets: inherit
