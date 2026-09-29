@@ -42,7 +42,9 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ env.ANCHOR_REPOS }}
+          # Deleting an environment is refused with Environments write alone.
           permission-actions: read
+          permission-administration: write
           permission-environments: write
           permission-pull-requests: read
 
