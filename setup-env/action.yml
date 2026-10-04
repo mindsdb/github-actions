@@ -4,7 +4,7 @@ runs:
   using: "composite"
   steps:
     # Get clean environment variables via https://github.com/marketplace/actions/github-environment-variables-action
-    - uses: FranzDiebold/github-env-vars-action@v2
+    - uses: FranzDiebold/github-env-vars-action@e8118971bd6b60524ae66a2d870bc83088e3a3c9 # v2.9.0
     - shell: bash
       run: |
         echo "REF_SLUG=${CI_REF_NAME_SLUG:-$CI_HEAD_REF_SLUG}" >> $GITHUB_ENV # Use whichever env ref is supplied (push or merge).

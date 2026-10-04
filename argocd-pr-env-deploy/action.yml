@@ -2,7 +2,8 @@
 #
 # Resolves:
 #   - This PR (anchor) — own merge SHA (image built in this same run), repo
-#     short name from $GITHUB_REPOSITORY.
+#     short name from $GITHUB_REPOSITORY. A caller outside a pull_request run
+#     names the PR with inputs instead (see PR IDENTITY below).
 #   - Any `Deploys: repo#N` or `Deploys: org/repo#N` line in the anchor PR
 #     body (owner defaults to this repo's org) — looks up each linked PR's
 #     head + merge SHAs via the GitHub REST API.
@@ -35,11 +36,16 @@
 #      linked repo's pipeline), instead of pinning a phantom tag and leaving
 #      the env in ImagePullBackOff silently.
 # Every pinned tag — the anchor's own included — is existence-checked
-# against ECR (`aws ecr describe-images`; GitHub short name maps to the
-# `mindsdb-<name-with-hyphens>` ECR repo). Only Image/RepositoryNotFound
-# count as absent; if the aws CLI is missing or errors for infra reasons
-# (auth, throttle, network) the checks are skipped with one warning rather
-# than blocking a deploy that would have worked.
+# against ECR (`aws ecr describe-images`), in the one ECR repository that holds
+# the repo's PR images. A repo with a dev tier pushes its PR images to
+# `mindsdb-<name-with-hyphens>-dev` and nowhere else, so when that repository
+# exists its tags are checked there alone. Otherwise they are checked in
+# `mindsdb-<name-with-hyphens>`. Whether the dev-tier repository exists
+# decides it, never whether it holds a given tag, so a tag missing from one
+# repository is never looked up in the other. Only Image/RepositoryNotFound
+# count as absent; if the aws CLI is missing or errors for infra reasons (auth,
+# throttle, network) the checks are skipped with one warning rather than
+# blocking a deploy that would have worked.
 #
 # `Deploys:`-looking body lines that don't match the accepted forms (e.g. a
 # pasted PR URL) emit a ::warning:: instead of being silently ignored.
@@ -56,8 +62,13 @@
 # block (native GH Deployment). The PR sidebar pill is `in_progress` while
 # the job runs and flips to `success`/`failure` on the job's exit code.
 #
-# Must run from a `pull_request` event; PR number and head SHA are read from
-# $GITHUB_EVENT_PATH so callers don't have to pass them.
+# PR IDENTITY. A `pull_request` run takes the repository, PR number and head
+# SHA from the event, so its callers pass nothing. Any other caller, such as a
+# scheduled sync of open PRs, passes `repository`, `pr-number` and `head-sha`.
+# The action refuses values that are not owner/name, a number and a
+# 40-character SHA. Such a run built no image, so the anchor's tag is
+# `development-head-<head-sha>`, which build-push-ecr pushes for every PR head,
+# instead of `development-<GITHUB_SHA>`.
 #
 # ENDPOINT. The action talks to the in-cluster Service
 # (`argo-cd-argocd-server.argocd.svc.cluster.local`) by default, not to
@@ -129,6 +140,24 @@ inputs:
       know this repo's envs come up faster.
     required: false
     default: "1800"
+  repository:
+    description: >-
+      owner/name of the PR's repository. Defaults to the repository the workflow
+      runs in. A caller outside a `pull_request` event passes this, `pr-number`
+      and `head-sha`.
+    required: false
+    default: ${{ github.repository }}
+  pr-number:
+    description: The PR to deploy. Defaults to the `pull_request` event's PR.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  head-sha:
+    description: >-
+      The PR's head commit, used as the chart revision. Defaults to the
+      `pull_request` event's head SHA. Outside that event it also picks the
+      PR's image, `development-head-<head-sha>`.
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
 
 runs:
   using: composite
@@ -142,6 +171,9 @@ runs:
         GH_TOKEN: ${{ inputs.gh-token }}
         STACKS_DISPATCH_TOKEN: ${{ inputs.stacks-dispatch-token || inputs.gh-token }}
         WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        PR_REPOSITORY: ${{ inputs.repository }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_HEAD_SHA: ${{ inputs.head-sha }}
       run: |
         set -euo pipefail
 
@@ -150,7 +182,27 @@ runs:
         : "${ARGOCD_AUTH_TOKEN:?ARGOCD_AUTH_TOKEN is empty — check the org/repo secret is set and visible to this repo}"
         : "${GH_TOKEN:?GH_TOKEN is empty — pass GH_PRIVATE_ACCESS_TOKEN via the gh-token input}"
 
-        OWN_REPO="$GITHUB_REPOSITORY"
+        # The repository, PR number and head SHA end up in GitHub API paths,
+        # argocd arguments and Application names. Outside a pull_request run
+        # the caller supplies them, so accept only the shapes GitHub produces.
+        # The values are not echoed: a caller may have copied them from a PR.
+        # An owner is letters, digits and hyphens. A repository name may also
+        # hold `_` and `.`, but `.` and `..` are path segments, not names.
+        if ! [[ "$PR_REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]] \
+          || [ "${PR_REPOSITORY#*/}" = . ] || [ "${PR_REPOSITORY#*/}" = .. ]; then
+          echo "::error::repository must be owner/name."
+          exit 1
+        fi
+        if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+          echo "::error::pr-number must be a PR number. Outside a pull_request event, pass repository, pr-number and head-sha."
+          exit 1
+        fi
+        if ! [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::head-sha must be a full 40-character commit SHA."
+          exit 1
+        fi
+
+        OWN_REPO="$PR_REPOSITORY"
         OWN_SHORT="${OWN_REPO##*/}"
         # Slugified form for K8s resource names + labels. RFC 1123 forbids
         # underscores in Application names / Namespaces / hostnames, but
@@ -158,21 +210,21 @@ runs:
         # underscored everywhere it identifies the repo (helm parameter
         # keys, the `Deploys:` regex, ECR image tags).
         OWN_SLUG="${OWN_SHORT//_/-}"
-        PR_NUMBER="$(jq -r .pull_request.number "$GITHUB_EVENT_PATH")"
 
         # Two SHAs, used for two different things:
         #   $GITHUB_SHA              = merge SHA (PR head merged into base, a
         #                              synthetic commit only reachable via
         #                              refs/pull/N/merge). build-push-ecr tags
         #                              images as `development-${GITHUB_SHA}`,
-        #                              so the image-tag override uses this.
-        #   .pull_request.head.sha   = PR branch tip — the commit ArgoCD's
+        #                              so a pull_request run's image-tag
+        #                              override uses this.
+        #   head-sha                 = PR branch tip, the commit ArgoCD's
         #                              repo-server can actually fetch as a
         #                              `targetRevision`. Used for the chart
         #                              revision so chart changes on the PR
         #                              branch deploy with the PR.
         OWN_MERGE_SHA="$GITHUB_SHA"
-        OWN_HEAD_SHA="$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
+        OWN_HEAD_SHA="$PR_HEAD_SHA"
         PARENT_APP="pr-${OWN_SLUG}-${PR_NUMBER}"
 
         # GitHub REST helper — auth + sensible headers in one place. No `gh`
@@ -183,26 +235,17 @@ runs:
                "https://api.github.com$1"
         }
 
-        # ECR image-existence guard. Maps a GitHub repo short name to its
-        # ECR repository (`mindsdb-` + short name, underscores to hyphens)
-        # and asks ECR whether <tag> exists. Returns 0 = present, 1 = absent.
-        # Only ImageNotFoundException / RepositoryNotFoundException count as
-        # absent; any other failure (no aws CLI, auth, throttle, network)
-        # must never brick a deploy that would have worked — warn ONCE,
-        # remember ECR is unusable, and report every tag as present from
-        # then on.
+        # ECR image-existence guard, in two parts.
+        #
+        # ecr_describe runs `aws ecr describe-images` with its arguments and
+        # returns 0 = found, 1 = not found. Only ImageNotFoundException /
+        # RepositoryNotFoundException count as not found. Any other failure
+        # (auth, throttle, network) must never brick a deploy that would have
+        # worked, so it warns ONCE, remembers ECR is unusable, and returns 0.
         ECR_CHECKS=on
-        ecr_tag_exists() {
-          local ecr_repo="mindsdb-${1//_/-}" tag="$2" err
-          [ "$ECR_CHECKS" = on ] || return 0
-          if ! command -v aws >/dev/null 2>&1; then
-            ECR_CHECKS=off
-            echo "::warning::aws CLI not found on this runner — ECR image-existence checks skipped, tags assumed present."
-            return 0
-          fi
-          if err="$(aws ecr describe-images \
-                      --repository-name "$ecr_repo" \
-                      --image-ids "imageTag=${tag}" \
+        ecr_describe() {
+          local err
+          if err="$(aws ecr describe-images "$@" \
                       --region "${AWS_REGION:-us-east-1}" 2>&1 >/dev/null)"; then
             return 0
           fi
@@ -210,12 +253,36 @@ runs:
             *ImageNotFoundException*|*RepositoryNotFoundException*)
               return 1
               ;;
-            *)
-              ECR_CHECKS=off
-              echo "::warning::ECR describe-images failed (${err//$'\n'/ }) — image-existence checks skipped, tags assumed present."
-              return 0
-              ;;
           esac
+          ECR_CHECKS=off
+          echo "::warning::ECR describe-images failed (${err//$'\n'/ }) — image-existence checks skipped, tags assumed present."
+          return 0
+        }
+
+        # ecr_tag_exists <GitHub short name> <tag> returns 0 = present,
+        # 1 = absent, and every tag counts as present once ECR is unusable.
+        # It first picks the repository that holds the short name's PR images
+        # (`mindsdb-` + short name, underscores to hyphens, plus `-dev` when
+        # that repository exists; see the header), then checks the tag there
+        # only. Asking describe-images about the repository, with no tag,
+        # keeps the action on the one ECR permission it already needs. The
+        # repository it checked stays in PR_IMAGE_REPO for error messages.
+        PR_IMAGE_REPO=""
+        ecr_tag_exists() {
+          local image="mindsdb-${1//_/-}" tag="$2"
+          [ "$ECR_CHECKS" = on ] || return 0
+          if ! command -v aws >/dev/null 2>&1; then
+            ECR_CHECKS=off
+            echo "::warning::aws CLI not found on this runner — ECR image-existence checks skipped, tags assumed present."
+            return 0
+          fi
+          if ecr_describe --repository-name "${image}-dev" --max-items 1; then
+            PR_IMAGE_REPO="${image}-dev"
+          else
+            PR_IMAGE_REPO="$image"
+          fi
+          [ "$ECR_CHECKS" = on ] || return 0
+          ecr_describe --repository-name "$PR_IMAGE_REPO" --image-ids "imageTag=${tag}"
         }
 
         # Fetch the PR body ONCE — the strict `Deploys:` extraction and the
@@ -250,10 +317,6 @@ runs:
         # (missing/closed/unmergeable PR) fails the job and comments on the
         # anchor PR rather than silently deploying from the default branch.
         #
-        # The anchor's own image is tagged from the merge SHA by the build
-        # job in this same run — no cross-PR race — but it still gets the
-        # existence check so a failed/skipped build fails HERE, not as an
-        # ImagePullBackOff in the env.
         # Repos that publish no image. Their deploy is the git revision alone:
         # mindshub_services' pr-env-stacks workflow builds a SAM stack from
         # revisions.mindshub_services. Applies to the anchor itself and to
@@ -268,9 +331,19 @@ runs:
         if is_revision_only_repo "$OWN_SHORT"; then
           set_args=(--helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}")
         else
-          OWN_TAG="development-${OWN_MERGE_SHA}"
+          # A pull_request run built this image earlier in the same run and
+          # tagged it with the merge SHA, so no other PR's build can race it.
+          # Any other run has no build of its own, so it deploys the tag
+          # build-push-ecr pushed for the PR head. Either tag still gets the
+          # existence check, so a failed or skipped build fails here, not as
+          # an ImagePullBackOff in the env.
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            OWN_TAG="development-${OWN_MERGE_SHA}"
+          else
+            OWN_TAG="development-head-${OWN_HEAD_SHA}"
+          fi
           if ! ecr_tag_exists "$OWN_SHORT" "$OWN_TAG"; then
-            echo "::error::ECR image mindsdb-${OWN_SLUG}:${OWN_TAG} not found — did the build job in this run succeed?"
+            echo "::error::ECR image ${PR_IMAGE_REPO}:${OWN_TAG} not found. Check that the PR's build job succeeded and pushed it."
             exit 1
           fi
           set_args=(
@@ -356,7 +429,7 @@ runs:
               if [ "$ECR_CHECKS" = on ] && ecr_tag_exists "$repo" "$head_tag" && [ "$ECR_CHECKS" = on ]; then
                 tag="$head_tag"
               elif [ "$ECR_CHECKS" = on ] && ! ecr_tag_exists "$repo" "$merge_tag"; then
-                echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in mindsdb-${repo//_/-}. The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
+                echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in ${PR_IMAGE_REPO}. The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
                 exit 1
               fi
               set_args+=(

@@ -6,6 +6,21 @@
 # new hash, identical content — whenever the PR's base or head moves, so
 # it's not a stable handle. The head SHA is immutable, making the extra
 # tag the one deploy-time consumers can pin race-free.
+#
+# The `builder` input picks where the image is built. Tags, build args and the
+# `image` output are the same either way.
+#   remote (default)  The in-cluster BuildKit service. Only an `mdb-dev` runner
+#                     pod can reach it, and that pod's own AWS identity pushes.
+#                     The action creates the ECR repository and sets
+#                     shared-ecr-policy.json on it the first time.
+#   local             The docker-container builder that setup-buildx-action
+#                     starts on the runner, on a pinned BuildKit image, with the
+#                     GitHub Actions cache scoped to `module-name`. For
+#                     GitHub-hosted runners. It never creates a repository or
+#                     touches its policy, so the repository must already exist.
+#                     The caller job grants `id-token: write` and runs
+#                     aws-actions/configure-aws-credentials with `role-to-assume`
+#                     before this action.
 
 outputs:
   image:
@@ -28,20 +43,46 @@ inputs:
   image-ref:
     description: "The version number or sha used in creating image tag"
     required: false
+  builder:
+    description: >-
+      Where to build: `remote` (default) uses the in-cluster BuildKit service
+      and only works on an `mdb-dev` runner. `local` builds on the runner itself
+      with the GitHub Actions cache, for GitHub-hosted runners, and needs AWS
+      credentials configured earlier in the job.
+    required: false
+    default: remote
 
 
 runs:
   using: 'composite'
   steps:
-    - uses: FranzDiebold/github-env-vars-action@v2
+    - uses: FranzDiebold/github-env-vars-action@e8118971bd6b60524ae66a2d870bc83088e3a3c9 # v2.9.0
     # https://github.com/aws-actions/amazon-ecr-login
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v4
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      with:
+        # In `local` mode the BuildKit container this step starts builds the
+        # image, and it holds the ECR registry credentials while it pushes. So
+        # it runs one moby/buildkit release, pinned to its multi-arch index
+        # digest, instead of buildx's moving `buildx-stable-1` default.
+        # Nothing bumps this pin: change the version and the digest together
+        # by hand (see the README). `remote` builds on the in-cluster service,
+        # so it keeps the default.
+        driver-opts: ${{ inputs.builder == 'local' && 'image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea' || '' }}
     - name: Login to Amazon ECR
       id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
+      uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+    # `docker buildx` reads the cache service's URL and token from ACTIONS_*
+    # variables, which the runner gives to actions but not to `run:` steps.
+    # This step exports them for the rest of the job, so the build step below
+    # can use `type=gha`.
+    - name: Expose the GitHub Actions cache to docker buildx
+      if: inputs.builder == 'local'
+      uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
     - shell: bash
       id: build
+      env:
+        BUILDER: ${{ inputs.builder }}
       run: |
         # Env var parsing
 
@@ -65,17 +106,34 @@ runs:
           HEAD_TAG="-t $REPO_IMAGE:$ENVIRONMENT-head-$PR_HEAD_SHA"
         fi
 
-        # Create repo if needed
-        aws ecr create-repository --repository-name $IMAGE_NAME && \
-        aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
-        true # Just let this fail if the repo already exists
+        # CACHE_ARGS is expanded unquoted on the build line, like HEAD_TAG, so
+        # the remote builder's empty value contributes zero args.
+        CACHE_ARGS=""
+        case "$BUILDER" in
+          remote)
+            # Create repo if needed
+            aws ecr create-repository --repository-name $IMAGE_NAME && \
+            aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
+            true # Just let this fail if the repo already exists
 
-        docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
+            docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
+            ;;
+          local)
+            # setup-buildx-action's docker-container builder is already the
+            # current one. The repository and its policy must exist already,
+            # because a role scoped to pushing can create or change neither.
+            CACHE_ARGS="--cache-from type=gha,scope=$IMAGE_NAME --cache-to type=gha,scope=$IMAGE_NAME,mode=max"
+            ;;
+          *)
+            echo "::error::builder must be 'remote' or 'local', got '$BUILDER'."
+            exit 1
+            ;;
+        esac
 
         cd $SRC_PATH
         BUILD_ARGS="--build-arg BUILD_FOR_ENVIRONMENT=$ENVIRONMENT --build-arg IMAGE_TAG=$IMAGE_TAG"
 
         # Finally, build our runner container
-        docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS $HEAD_TAG -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:$ENVIRONMENT -t $REPO_IMAGE:latest --push .
+        docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS $CACHE_ARGS $HEAD_TAG -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:$ENVIRONMENT -t $REPO_IMAGE:latest --push .
         
         echo "image=$REPO_IMAGE:$IMAGE_TAG" >> $GITHUB_OUTPUT
