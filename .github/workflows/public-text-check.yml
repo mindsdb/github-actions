@@ -1,0 +1,36 @@
+name: Public text reusable
+
+on:
+  workflow_call:
+    secrets:
+      PUBLIC_TEXT_DENYLIST:
+        description: Private regular expression for restricted public text
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the trusted scanner
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: mindsdb/github-actions
+          ref: ${{ job.workflow_sha }}
+          path: .ci-shared
+          persist-credentials: false
+          sparse-checkout: scripts/public_text_check.py
+          sparse-checkout-cone-mode: false
+      - name: Scan current public text
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_TEXT_DENYLIST: ${{ secrets.PUBLIC_TEXT_DENYLIST }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: python3 -I .ci-shared/scripts/public_text_check.py

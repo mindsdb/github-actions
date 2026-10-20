@@ -742,3 +742,9 @@ jobs:
     uses: mindsdb/github-actions/.github/workflows/release-pr.yml@main
     secrets: inherit
 ```
+
+## Public text guard
+
+[`public-text-check.yml`](.github/workflows/public-text-check.yml) checks PR text, commit messages, current added content and supported issue/comment/review text against a private regular expression. It checks only API data, runs the trusted script at the reusable workflow's commit, and never prints matching text or paths. Separate PR and audit callers prevent a comment's result from satisfying the merge check.
+
+See [coverage, exceptions and rollout](docs/public-text.md) before enabling the required check. Missing configuration and incomplete scans fail; fork events carry an explicit unscanned exception. The guard runs after publication and cannot remove history. The implementation and this repository's callers must merge before application callers use it.
