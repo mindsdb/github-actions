@@ -7,23 +7,46 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
+import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 import public_text_check as ptc
 
 RX = re.compile("zqcanary7731", re.I)
 PR_PATH = "repos/o/r/pulls/7"
 SHA = "a" * 40
+BASE = "b" * 40
+MERGED = "e" * 40
 
 
 def pr():
     return {
         "title": "fix", "body": "", "number": 7, "commits": 1, "changed_files": 1,
         "head": {"ref": "topic", "sha": SHA, "repo": {"full_name": "o/r"}},
-        "base": {"sha": "b" * 40, "repo": {"full_name": "o/r"}},
+        "base": {"sha": BASE, "ref": "main", "repo": {"full_name": "o/r"}},
     }
+
+
+def merged_path(branch="topic"):
+    return f"repos/o/r/pulls?state=closed&base=main&head={quote('o:' + branch, safe='')}&per_page=100"
+
+
+def compare_path(base, head=SHA):
+    return f"repos/o/r/compare/{base}...{head}?per_page=100"
+
+
+def compare_pages(commits, merge_base):
+    chunks = [commits[i:i + 100] for i in range(0, len(commits), 100)] or [[]]
+    return [{"total_commits": len(commits), "merge_base_commit": {"sha": merge_base}, "commits": chunk}
+            for chunk in chunks]
+
+
+def commit(n, message="clean"):
+    return {"sha": f"{n:040x}", "commit": {"message": message}}
 
 
 def responses():
@@ -36,11 +59,13 @@ def responses():
             {"filename": "file.txt", "status": "added", "additions": 1, "deletions": 0,
              "sha": "c" * 40, "patch": "@@ -0,0 +1 @@\n+clean"}
         ],
+        merged_path(): [],
     }
 
 
 def mock_api(monkeypatch, data):
     monkeypatch.setattr(ptc, "gh_api", lambda path: copy.deepcopy(data[path]))
+    monkeypatch.setattr(ptc, "gh_pages", lambda path: copy.deepcopy(data[path]))
 
 
 def run_main(monkeypatch, tmp_path, event_name="pull_request", event=None, pattern="zqcanary7731"):
@@ -62,6 +87,7 @@ def test_release_train_scans_commits(monkeypatch):
     data = responses()
     data[PR_PATH]["head"]["ref"] = "staging"
     data[PR_PATH + "/commits?per_page=100"][0]["commit"]["message"] = "zqcanary7731"
+    data[merged_path("staging")] = []
     mock_api(monkeypatch, data)
     assert any("message" in f.where for f in ptc.check_pr(RX, repo="o/r", number=7))
 
@@ -73,9 +99,110 @@ def test_missing_text_patch_never_passes(monkeypatch, tmp_path):
     assert run_main(monkeypatch, tmp_path) == 2
 
 
-def test_commit_cap_never_passes(monkeypatch, tmp_path):
+def train(data, carried_message, new_message, merge_base=MERGED):
+    """A staging train whose first commit an earlier merged train already carried."""
+    data[PR_PATH]["head"]["ref"] = "staging"
+    data[PR_PATH]["commits"] = 2
+    carried, new = commit(1, carried_message), commit(2, new_message)
+    data[PR_PATH + "/commits?per_page=100"] = [carried, new]
+    data[merged_path("staging")] = [
+        {"number": 5, "merged_at": "2026-10-19T08:00:00Z", "head": {"sha": MERGED, "repo": {"full_name": "o/r"}}},
+    ]
+    # Compare from the merged head also lists base-branch commits merged back
+    # into the train, which are outside the PR and must never be scanned.
+    data[compare_path(MERGED)] = compare_pages([new, commit(3, "zqcanary7731")], merge_base)
+
+
+def test_train_skips_commits_an_earlier_merged_train_carried(monkeypatch, tmp_path):
     data = responses()
-    data[PR_PATH]["commits"] = 251
+    train(data, carried_message="zqcanary7731", new_message="clean")
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 0
+
+
+def test_train_scans_commits_no_earlier_train_carried(monkeypatch):
+    data = responses()
+    train(data, carried_message="clean", new_message="zqcanary7731")
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["commit 2 message, line 1"]
+
+
+def test_train_that_left_the_merged_head_scans_every_commit(monkeypatch):
+    data = responses()
+    train(data, carried_message="zqcanary7731", new_message="clean", merge_base="d" * 40)
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["commit 1 message, line 1"]
+
+
+def test_newest_merged_train_decides_what_was_carried(monkeypatch, tmp_path):
+    data = responses()
+    train(data, carried_message="zqcanary7731", new_message="clean")
+    data[merged_path("staging")].insert(0, {
+        "number": 4, "merged_at": "2026-10-12T08:00:00Z", "head": {"sha": "d" * 40, "repo": {"full_name": "o/r"}},
+    })
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 0
+
+
+@pytest.mark.parametrize("change", ["unmerged", "fork", "deleted fork", "same PR"])
+def test_only_this_repository_s_other_merged_prs_count_as_carried(monkeypatch, change):
+    data = responses()
+    train(data, carried_message="zqcanary7731", new_message="clean")
+    pull = data[merged_path("staging")][0]
+    if change == "unmerged":
+        pull["merged_at"] = None
+    elif change == "fork":
+        pull["head"]["repo"] = {"full_name": "outside/r"}
+    elif change == "deleted fork":
+        pull["head"]["repo"] = None
+    else:
+        pull["number"] = 7
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["commit 1 message, line 1"]
+
+
+def test_merged_pr_lookup_failure_fails(monkeypatch, tmp_path):
+    data = responses()
+    train(data, carried_message="clean", new_message="clean")
+    del data[merged_path("staging")]
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 2
+
+
+def big_train(data, total=251):
+    """A PR past the PR endpoint's 250-commit limit, which lists only the newest 250."""
+    commits = [commit(n) for n in range(1, total + 1)]
+    data[PR_PATH]["commits"] = total
+    data[PR_PATH + "/commits?per_page=100"] = commits[-250:]
+    data[compare_path(BASE)] = compare_pages(commits, BASE)
+    return commits
+
+
+def test_commits_past_250_are_listed_through_compare(monkeypatch):
+    data = responses()
+    commits = big_train(data)
+    commits[0]["commit"]["message"] = "zqcanary7731"
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["commit 1 message, line 1"]
+
+
+@pytest.mark.parametrize("damage", ["missing page", "page total", "merge base", "list pages", "foreign commit", "no compare"])
+def test_commits_past_250_without_a_complete_comparison_fail(monkeypatch, tmp_path, damage):
+    data = responses()
+    big_train(data)
+    pages = data[compare_path(BASE)]
+    if damage == "missing page":
+        pages.pop()
+    elif damage == "page total":
+        pages[0]["total_commits"] = 252
+    elif damage == "merge base":
+        pages[1]["merge_base_commit"]["sha"] = "d" * 40
+    elif damage == "list pages":
+        data[compare_path(BASE)] = [page["commits"] for page in pages]
+    elif damage == "foreign commit":
+        data[PR_PATH + "/commits?per_page=100"][0] = commit(999)
+    else:
+        del data[compare_path(BASE)]
     mock_api(monkeypatch, data)
     assert run_main(monkeypatch, tmp_path) == 2
 
@@ -113,6 +240,7 @@ def test_all_pr_fields_fail_without_echoing_text(monkeypatch, tmp_path, capsys, 
         data[PR_PATH][field] = "zqcanary7731"
     elif field == "branch":
         data[PR_PATH]["head"]["ref"] = "fix/zqcanary7731"
+        data[merged_path("fix/zqcanary7731")] = []
     elif field == "commit":
         data[PR_PATH + "/commits?per_page=100"][0]["commit"]["message"] = "zqcanary7731"
     elif field == "path":
@@ -200,7 +328,7 @@ def blob(data, content):
         "size": len(content), "encoding": "base64",
         "content": base64.b64encode(content).decode(),
     }
-    data[PR_PATH + "/files?per_page=100"][0].pop("patch")
+    data[PR_PATH + "/files?per_page=100"][0].pop("patch", None)
 
 
 def test_binary_content_is_excluded_but_path_is_checked(monkeypatch, tmp_path):
@@ -212,11 +340,38 @@ def test_binary_content_is_excluded_but_path_is_checked(monkeypatch, tmp_path):
     assert run_main(monkeypatch, tmp_path) == 1
 
 
-def test_text_with_binary_extension_is_not_exempt(monkeypatch, tmp_path):
+def test_text_with_binary_extension_is_checked_as_text(monkeypatch, tmp_path):
     data = responses()
     blob(data, b"zqcanary7731")
     data[PR_PATH + "/files?per_page=100"][0]["filename"] = "logo.png"
     mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 1
+
+
+def test_new_file_without_patch_or_nul_is_checked_whole(monkeypatch, tmp_path):
+    # GitHub shows small PDFs as binary although they carry no NUL byte.
+    data = responses()
+    blob(data, b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nzqcanary7731\n%%EOF\n")
+    data[PR_PATH + "/files?per_page=100"][0].update(filename="report.pdf", additions=0)
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["file 1, added line 3"]
+    blob(data, b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nclean\n%%EOF\n")
+    assert run_main(monkeypatch, tmp_path) == 0
+
+
+def test_new_text_over_1_mib_without_patch_fails(monkeypatch, tmp_path):
+    data = responses()
+    blob(data, b"a" * (1_048_576 + 1))
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 2
+
+
+def test_binary_up_to_10_mib_passes_and_larger_blobs_fail(monkeypatch, tmp_path):
+    data = responses()
+    blob(data, b"\x1f\x8b\x08\0" + b"a" * (2 * 1_048_576))
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 0
+    blob(data, b"\x1f\x8b\x08\0" + b"a" * (10 * 1_048_576))
     assert run_main(monkeypatch, tmp_path) == 2
 
 
@@ -344,7 +499,7 @@ def test_zero_counts_do_not_exempt_new_text_classified_as_binary(monkeypatch, tm
     blob(data, b"zqcanary7731")
     data[PR_PATH + "/files?per_page=100"][0].update(additions=0, deletions=0)
     mock_api(monkeypatch, data)
-    assert run_main(monkeypatch, tmp_path) == 2
+    assert run_main(monkeypatch, tmp_path) == 1
 
 
 def test_zero_counts_with_changed_blob_fail(monkeypatch, tmp_path):
@@ -354,3 +509,18 @@ def test_zero_counts_with_changed_blob_fail(monkeypatch, tmp_path):
     data["repos/o/r/contents/file.txt?ref=" + "b" * 40] = {"type": "file", "sha": "d" * 40}
     mock_api(monkeypatch, data)
     assert run_main(monkeypatch, tmp_path) == 2
+
+
+def workflow(name):
+    return yaml.safe_load((ROOT / ".github" / "workflows" / name).read_text())
+
+
+def test_pr_gate_and_audit_never_share_a_check_or_queue():
+    gate, audit = workflow("public-text.yml"), workflow("public-text-audit.yml")
+    # PyYAML reads the bare `on` key as True.
+    assert set(gate[True]) == {"pull_request"}
+    assert "pull_request" not in audit[True]
+    assert gate["name"] != audit["name"]
+    assert set(gate["jobs"]).isdisjoint(audit["jobs"])
+    gate_group, audit_group = (wf["concurrency"]["group"].split("${{")[0] for wf in (gate, audit))
+    assert not gate_group.startswith(audit_group) and not audit_group.startswith(gate_group)

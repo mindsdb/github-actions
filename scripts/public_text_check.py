@@ -31,6 +31,7 @@ class PullRequest:
     branch: str
     head: str
     base: str
+    base_branch: str
     head_repo: str
     commits: int
     files: int
@@ -39,10 +40,16 @@ class PullRequest:
     def read(cls, value: dict) -> PullRequest:
         return cls(
             text(value["title"]), text(value.get("body")), text(value["head"]["ref"]),
-            sha(value["head"]["sha"]), sha(value["base"]["sha"]),
+            sha(value["head"]["sha"]), sha(value["base"]["sha"]), text(value["base"]["ref"]),
             text(value["head"]["repo"]["full_name"]),
             count(value["commits"]), count(value["changed_files"]),
         )
+
+
+@dataclass(frozen=True)
+class Comparison:
+    merge_base: str
+    commits: tuple[dict, ...]
 
 
 def text(value: object) -> str:
@@ -71,7 +78,7 @@ def sha(value: object) -> str:
     return value
 
 
-def gh_api(path: str) -> list | dict:
+def gh_pages(path: str) -> list:
     result = subprocess.run(
         ["gh", "api", "--paginate", "--slurp", path],
         check=True, capture_output=True, text=True, timeout=90,
@@ -79,6 +86,11 @@ def gh_api(path: str) -> list | dict:
     pages = json.loads(result.stdout)
     if not isinstance(pages, list) or not pages:
         raise ScanError("empty response")
+    return pages
+
+
+def gh_api(path: str) -> list | dict:
+    pages = gh_pages(path)
     if all(isinstance(page, list) for page in pages):
         return [item for page in pages for item in page]
     if len(pages) == 1 and isinstance(pages[0], dict):
@@ -131,19 +143,6 @@ def added_lines(patch: str) -> list[tuple[int, str]]:
     return added
 
 
-def missing_patch_is_empty_or_binary(repo: str, file: dict) -> bool:
-    # Never trust the extension. NUL in the first 8 KiB follows Git's binary
-    # heuristic; other missing patches fail closed. Large blobs need human review.
-    blob = gh_api(f"repos/{repo}/git/blobs/{sha(file['sha'])}")
-    size = count(blob["size"])
-    if size > 1_048_576 or blob["encoding"] != "base64":
-        return False
-    content = base64.b64decode("".join(text(blob["content"]).split()), validate=True)
-    if len(content) != size:
-        return False
-    return (not content and count(file["additions"]) == 0) or b"\0" in content[:8000]
-
-
 def check_added(rx: re.Pattern[str], lines: list[tuple[int, str]], ordinal: int) -> list[Finding]:
     blocks: list[list[tuple[int, str]]] = []
     for line in lines:
@@ -156,6 +155,93 @@ def check_added(rx: re.Pattern[str], lines: list[tuple[int, str]], ordinal: int)
         numbers = {block[0][0] + content.count("\n", 0, match.start()) for match in rx.finditer(content)}
         findings.extend(Finding(f"file {ordinal}, added line {line}") for line in sorted(numbers))
     return findings
+
+
+def check_patchless(rx: re.Pattern[str], repo: str, file: dict, ordinal: int) -> list[Finding]:
+    """Check a file GitHub lists without a patch, or raise when its new text cannot be read whole."""
+    # Never trust the extension. NUL in the first 8 KiB follows Git's binary
+    # heuristic. Larger blobs need human review.
+    blob = gh_api(f"repos/{repo}/git/blobs/{sha(file['sha'])}")
+    size = count(blob["size"])
+    if size > 10 * 1_048_576 or blob["encoding"] != "base64":
+        raise ScanError("blob too large")
+    content = base64.b64decode("".join(text(blob["content"]).split()), validate=True)
+    if len(content) != size:
+        raise ScanError("incomplete blob")
+    if b"\0" in content[:8000] or (not content and count(file["additions"]) == 0):
+        return []
+    # GitHub also omits patches for files it renders as binary, such as small
+    # PDFs with no NUL byte. A new file's whole content is its added text.
+    if file["status"] != "added" or size > 1_048_576:
+        raise ScanError("missing text patch")
+    lines = content.decode("utf-8", errors="replace").split("\n")
+    return check_added(rx, list(enumerate(lines, 1)), ordinal)
+
+
+def compare(repo: str, base: str, head: str) -> Comparison:
+    # Unlike the PR commits endpoint, compare pages past 250 commits. Every
+    # page repeats the total, which proves that no page went missing.
+    pages = gh_pages(f"repos/{repo}/compare/{sha(base)}...{sha(head)}?per_page=100")
+    if not all(isinstance(page, dict) for page in pages):
+        raise ScanError("invalid pagination")
+    totals = {count(page["total_commits"]) for page in pages}
+    merge_bases = {sha(page["merge_base_commit"]["sha"]) for page in pages}
+    commits = tuple(commit for page in pages for commit in page["commits"])
+    if len(totals) != 1 or len(merge_bases) != 1 or len(commits) != totals.pop():
+        raise ScanError("incomplete commits")
+    return Comparison(merge_bases.pop(), commits)
+
+
+def pr_commits(repo: str, endpoint: str, pr: PullRequest) -> list[dict]:
+    listed = gh_api(endpoint + "/commits?per_page=100")
+    if not isinstance(listed, list):
+        raise ScanError("incomplete commits")
+    commits = listed
+    if pr.commits > 250:
+        # The PR endpoint stops at 250 commits. Compare lists the same range
+        # in full, and must contain every commit the PR endpoint did list.
+        commits = list(compare(repo, pr.base, pr.head).commits)
+        if not {sha(c["sha"]) for c in listed} <= {sha(c["sha"]) for c in commits}:
+            raise ScanError("inconsistent commits")
+    if len(commits) != pr.commits:
+        raise ScanError("incomplete commits")
+    if len({sha(commit["sha"]) for commit in commits}) != len(commits):
+        raise ScanError("duplicate commits")
+    return commits
+
+
+def merged_head(repo: str, number: int, pr: PullRequest) -> str | None:
+    """Head commit of the newest other merged PR from this branch into the same base."""
+    head = quote(f"{repo.split('/')[0]}:{pr.branch}", safe="")
+    pulls = gh_api(f"repos/{repo}/pulls?state=closed&base={quote(pr.base_branch, safe='')}"
+                   f"&head={head}&per_page=100")
+    if not isinstance(pulls, list):
+        raise ScanError("invalid pull list")
+    merged = [pull for pull in pulls
+              if pull["merged_at"] and identifier(pull["number"]) != number
+              and (pull["head"]["repo"] or {}).get("full_name") == repo]
+    if not merged:
+        return None
+    return sha(max(merged, key=lambda pull: text(pull["merged_at"]))["head"]["sha"])
+
+
+def carried_commits(repo: str, number: int, pr: PullRequest, commits: list[dict]) -> set[str]:
+    """SHAs of this PR's commits that an earlier merged PR from the same branch already carried.
+
+    A squash merge never makes the branch's commits part of the base, so a
+    release train's next PR lists every earlier train's commits again. Those
+    messages merged once and stay in the branch's public history; rescanning
+    them would fail every later train on text nobody can change.
+    """
+    previous = merged_head(repo, number, pr)
+    if previous is None:
+        return set()
+    since = compare(repo, previous, pr.head)
+    if since.merge_base != previous:
+        # The branch no longer descends from the merged head: scan everything.
+        return set()
+    new = {sha(commit["sha"]) for commit in since.commits}
+    return {sha(commit["sha"]) for commit in commits} - new
 
 
 def content_unchanged(repo: str, base: str, file: dict) -> bool:
@@ -172,23 +258,22 @@ def check_pr(rx: re.Pattern[str], *, repo: str, number: int, expected_head: str 
     before = PullRequest.read(gh_api(endpoint))
     if before.head_repo != repo or (expected_head and before.head != expected_head):
         raise ScanError("superseded or foreign head")
-    # REST caps these collections even when pagination follows every page.
-    if before.commits > 250 or before.files > 3000:
+    # REST caps the files collection even when pagination follows every page.
+    if before.files > 3000:
         raise ScanError("collection cap")
     findings = check_text(rx, label="PR title", text=before.title)
     findings += check_text(rx, label="PR description", text=before.body)
     findings += check_text(rx, label="head branch name", text=before.branch)
-    commits = gh_api(endpoint + "/commits?per_page=100")
+    commits = pr_commits(repo, endpoint, before)
+    carried = carried_commits(repo, number, before, commits)
     files = gh_api(endpoint + "/files?per_page=100")
-    if not isinstance(commits, list) or len(commits) != before.commits:
-        raise ScanError("incomplete commits")
     if not isinstance(files, list) or len(files) != before.files:
         raise ScanError("incomplete files")
-    if len({sha(commit["sha"]) for commit in commits}) != len(commits):
-        raise ScanError("duplicate commits")
     if len({text(file["filename"]) for file in files}) != len(files):
         raise ScanError("duplicate files")
     for i, commit in enumerate(commits, 1):
+        if sha(commit["sha"]) in carried:
+            continue
         findings += check_text(rx, label=f"commit {i} message", text=text(commit["commit"]["message"]))
     for i, file in enumerate(files, 1):
         if file["status"] == "removed":
@@ -198,11 +283,9 @@ def check_pr(rx: re.Pattern[str], *, repo: str, number: int, expected_head: str 
         findings += check_text(rx, label=f"file {i} path", text=text(file["filename"]))
         patch = file.get("patch")
         if not patch:
-            if content_unchanged(repo, before.base, file):
-                continue
-            if missing_patch_is_empty_or_binary(repo, file):
-                continue
-            raise ScanError("missing text patch")
+            if not content_unchanged(repo, before.base, file):
+                findings += check_patchless(rx, repo, file, i)
+            continue
         lines = added_lines(text(patch))
         if len(lines) != count(file["additions"]):
             raise ScanError("incomplete added lines")
