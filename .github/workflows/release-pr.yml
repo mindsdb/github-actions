@@ -143,7 +143,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          COMMITS=$(git log --oneline --no-merges "origin/${BASE}..origin/${STAGING}")
+          # A squash merge never makes the staging commits part of the base, so
+          # BASE..STAGING still lists every train that already shipped. List only
+          # what the newest merged train did not carry: the same commits the
+          # public text check reads. Fall back to the whole range when staging
+          # no longer descends from that train's head.
+          RANGE=("origin/${BASE}..origin/${STAGING}")
+          SINCE_LINE=""
+          LAST=$(gh api --method GET --paginate --slurp "repos/${REPO}/pulls" \
+              -f state=closed -f base="${BASE}" -f head="${REPO%%/*}:${STAGING}" -f per_page=100 \
+            | jq -r --arg repo "${REPO}" \
+              '[.[][] | select(.merged_at and .head.repo.full_name == $repo)] | max_by(.merged_at) // empty | "\(.number) \(.head.sha)"') \
+            || LAST=""
+          if [ -n "$LAST" ] && git merge-base --is-ancestor "${LAST#* }" "origin/${STAGING}" 2>/dev/null; then
+            RANGE=("origin/${STAGING}" "^${LAST#* }" "^origin/${BASE}")
+            SINCE_LINE="Commits since #${LAST%% *}, the last merged release. Earlier ones already shipped."
+          fi
+          COMMITS=$(git log --oneline --no-merges "${RANGE[@]}")
           CONTRIBUTORS=$(git log --format='%an' "origin/${BASE}..origin/${STAGING}" | sort -u | sed 's/^/- /')
 
           # Find the PR before writing about it. The body describes whether this is
@@ -182,6 +198,7 @@ jobs:
           **${AHEAD} commit(s)** queued for the next production release.
 
           ### Changes
+          ${SINCE_LINE}
           \`\`\`
           ${COMMITS}
           \`\`\`
