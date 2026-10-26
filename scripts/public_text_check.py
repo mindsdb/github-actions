@@ -157,6 +157,23 @@ def check_added(rx: re.Pattern[str], lines: list[tuple[int, str]], ordinal: int)
     return findings
 
 
+def decode_patchless(content: bytes) -> str:
+    """Decode text without losing bytes; only a PDF binary marker may use Latin-1."""
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        # A PDF header may be followed by a binary marker comment. Preserve and
+        # scan its high bytes one-to-one; everything else still requires UTF-8.
+        marker = re.match(rb"(%PDF-(?:1\.[0-7]|2\.0)\r?\n)(%[\x80-\xff]{4,})(\r?\n)", content)
+        if marker:
+            try:
+                return (marker[1].decode("ascii") + marker[2].decode("latin-1")
+                        + content[marker.end(2):].decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+        raise ScanError("unsupported text encoding") from None
+
+
 def check_patchless(rx: re.Pattern[str], repo: str, file: dict, ordinal: int) -> list[Finding]:
     """Check a file GitHub lists without a patch, or raise when its new text cannot be read whole."""
     # Never trust the extension. NUL in the first 8 KiB follows Git's binary
@@ -174,7 +191,7 @@ def check_patchless(rx: re.Pattern[str], repo: str, file: dict, ordinal: int) ->
     # PDFs with no NUL byte. A new file's whole content is its added text.
     if file["status"] != "added" or size > 1_048_576:
         raise ScanError("missing text patch")
-    lines = content.decode("utf-8", errors="replace").split("\n")
+    lines = decode_patchless(content).split("\n")
     return check_added(rx, list(enumerate(lines, 1)), ordinal)
 
 

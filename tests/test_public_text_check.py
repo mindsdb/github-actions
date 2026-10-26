@@ -399,6 +399,57 @@ def test_new_file_without_patch_or_nul_is_checked_whole(monkeypatch, tmp_path):
     assert run_main(monkeypatch, tmp_path) == 0
 
 
+@pytest.mark.parametrize("content,pattern", [
+    (b'# coding: latin-1\nname = "zqcaf\xe97731"\n', "zqcafé7731"),
+    (b"zqcanary\xa07731\n", r"zqcanary\s+7731"),
+    (b"clean\n\xe2\x82", "zqcanary7731"),
+])
+def test_patchless_text_with_unknown_encoding_fails_without_echo(monkeypatch, tmp_path, capsys, content, pattern):
+    data = responses()
+    blob(data, content)
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path, pattern=pattern) == 2
+    output = capsys.readouterr()
+    assert "incomplete" in output.out
+    assert "zqcanary" not in output.out + output.err
+    assert "zqcaf" not in output.out + output.err
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_pdf_marker_fallback_preserves_bytes_and_line_numbers(monkeypatch, newline):
+    data = responses()
+    blob(data, newline.join([b"%PDF-1.7", b"%\xe2\xe3\xcf\xd3\xff", b"zqcanary7731", b"%%EOF"]))
+    mock_api(monkeypatch, data)
+    pattern = re.compile("âãÏÓÿ|zqcanary7731")
+    assert [f.where for f in ptc.check_pr(pattern, repo="o/r", number=7)] == [
+        "file 1, added line 2", "file 1, added line 3",
+    ]
+
+
+def test_valid_utf8_pdf_marker_keeps_its_text(monkeypatch):
+    data = responses()
+    blob(data, "%PDF-2.0\n%éééé\nclean\n%%EOF".encode())
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(re.compile("éééé"), repo="o/r", number=7)] == [
+        "file 1, added line 2",
+    ]
+
+
+@pytest.mark.parametrize("content", [
+    b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nzqcaf\xe97731\n%%EOF\n",
+    b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nzqcanary\xa07731\n%%EOF\n",
+    b"%PDF-1.4\n%\xe2\xe3\xcf\xd3zqcanary\xa07731\n%%EOF\n",
+    b"%PDF-1.4\n%\xe2\xe3\xcf\nclean\n%%EOF\n",
+    b"%PDF-1.4\nclean\n%\xe2\xe3\xcf\xd3\n%%EOF\n",
+    b"not PDF\n%\xe2\xe3\xcf\xd3\nclean\n",
+])
+def test_pdf_marker_does_not_exempt_other_undecodable_text(monkeypatch, tmp_path, content):
+    data = responses()
+    blob(data, content)
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 2
+
+
 def test_whole_file_check_reads_past_the_binary_probe(monkeypatch):
     data = responses()
     blob(data, b"a" * 9000 + b"\nzqcanary7731\n")

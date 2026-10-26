@@ -153,8 +153,7 @@ jobs:
           LAST=$(gh api --method GET --paginate --slurp "repos/${REPO}/pulls" \
               -f state=closed -f base="${BASE}" -f head="${REPO%%/*}:${STAGING}" -f per_page=100 \
             | jq -r --arg repo "${REPO}" \
-              '[.[][] | select(.merged_at and .head.repo.full_name == $repo)] | max_by(.merged_at) // empty | "\(.number) \(.head.sha)"') \
-            || LAST=""
+              '[.[][] | select(.merged_at and .head.repo.full_name == $repo)] | max_by(.merged_at) // empty | "\(.number) \(.head.sha)"')
           if [ -n "$LAST" ] && git merge-base --is-ancestor "${LAST#* }" "origin/${STAGING}" 2>/dev/null; then
             RANGE=("origin/${STAGING}" "^${LAST#* }" "^origin/${BASE}")
             SINCE_LINE="Commits since #${LAST%% *}, the last merged release. Earlier ones already shipped."
