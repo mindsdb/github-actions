@@ -92,9 +92,12 @@ def test_release_train_scans_commits(monkeypatch):
     assert any("message" in f.where for f in ptc.check_pr(RX, repo="o/r", number=7))
 
 
-def test_missing_text_patch_never_passes(monkeypatch, tmp_path):
+def test_changed_text_without_patch_never_passes(monkeypatch, tmp_path):
+    # GitHub omits the patch of a large text diff; the new blob alone cannot
+    # tell which of its lines the PR added.
     data = responses()
-    del data[PR_PATH + "/files?per_page=100"][0]["patch"]
+    blob(data, b"clean\n")
+    data[PR_PATH + "/files?per_page=100"][0]["status"] = "modified"
     mock_api(monkeypatch, data)
     assert run_main(monkeypatch, tmp_path) == 2
 
@@ -134,14 +137,51 @@ def test_train_that_left_the_merged_head_scans_every_commit(monkeypatch):
     assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["commit 1 message, line 1"]
 
 
-def test_newest_merged_train_decides_what_was_carried(monkeypatch, tmp_path):
+@pytest.mark.parametrize("position", [0, 1])
+def test_newest_merged_train_decides_what_was_carried(monkeypatch, tmp_path, position):
     data = responses()
     train(data, carried_message="zqcanary7731", new_message="clean")
-    data[merged_path("staging")].insert(0, {
+    data[merged_path("staging")].insert(position, {
         "number": 4, "merged_at": "2026-10-12T08:00:00Z", "head": {"sha": "d" * 40, "repo": {"full_name": "o/r"}},
     })
     mock_api(monkeypatch, data)
     assert run_main(monkeypatch, tmp_path) == 0
+
+
+def long_train(data):
+    """150 train commits, 140 of them new since the merged train: two compare pages."""
+    commits = [commit(n) for n in range(1, 151)]
+    commits[-1]["commit"]["message"] = "zqcanary7731"
+    data[PR_PATH]["head"]["ref"] = "staging"
+    data[PR_PATH]["commits"] = len(commits)
+    data[PR_PATH + "/commits?per_page=100"] = commits
+    data[merged_path("staging")] = [
+        {"number": 5, "merged_at": "2026-10-19T08:00:00Z", "head": {"sha": MERGED, "repo": {"full_name": "o/r"}}},
+    ]
+    data[compare_path(MERGED)] = compare_pages(commits[10:], MERGED)
+
+
+def test_new_train_commits_on_a_later_compare_page_are_checked(monkeypatch):
+    data = responses()
+    long_train(data)
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["commit 150 message, line 1"]
+
+
+@pytest.mark.parametrize("damage", ["missing page", "page total", "duplicate"])
+def test_incomplete_comparison_never_marks_new_commits_carried(monkeypatch, tmp_path, damage):
+    data = responses()
+    long_train(data)
+    pages = data[compare_path(MERGED)]
+    if damage == "missing page":
+        pages.pop()
+    elif damage == "page total":
+        for page in pages:
+            page["total_commits"] = 141
+    else:
+        pages[1]["commits"][-1] = pages[0]["commits"][0]
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 2
 
 
 @pytest.mark.parametrize("change", ["unmerged", "fork", "deleted fork", "same PR"])
@@ -356,6 +396,32 @@ def test_new_file_without_patch_or_nul_is_checked_whole(monkeypatch, tmp_path):
     mock_api(monkeypatch, data)
     assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["file 1, added line 3"]
     blob(data, b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nclean\n%%EOF\n")
+    assert run_main(monkeypatch, tmp_path) == 0
+
+
+def test_whole_file_check_reads_past_the_binary_probe(monkeypatch):
+    data = responses()
+    blob(data, b"a" * 9000 + b"\nzqcanary7731\n")
+    mock_api(monkeypatch, data)
+    assert [f.where for f in ptc.check_pr(RX, repo="o/r", number=7)] == ["file 1, added line 2"]
+
+
+def test_nul_after_the_first_8000_bytes_is_still_text(monkeypatch, tmp_path):
+    data = responses()
+    blob(data, b"zqcanary7731\n" + b"a" * 9000 + b"\0")
+    mock_api(monkeypatch, data)
+    assert run_main(monkeypatch, tmp_path) == 1
+
+
+@pytest.mark.parametrize("status", ["modified", "renamed"])
+def test_changed_binary_without_patch_checks_only_its_path(monkeypatch, tmp_path, status):
+    data = responses()
+    blob(data, b"\x89PNG\r\n\x1a\n\0zqcanary7731")
+    file = data[PR_PATH + "/files?per_page=100"][0]
+    file.update(status=status, additions=0, deletions=0, previous_filename="old.png")
+    data["repos/o/r/contents/old.png?ref=" + BASE] = {"type": "file", "sha": "d" * 40}
+    data["repos/o/r/contents/file.txt?ref=" + BASE] = {"type": "file", "sha": "d" * 40}
+    mock_api(monkeypatch, data)
     assert run_main(monkeypatch, tmp_path) == 0
 
 

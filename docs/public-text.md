@@ -6,7 +6,7 @@ The guard fails a PR or text-audit run when current public text matches the priv
 
 | Event | Text read from the API | Result context |
 | --- | --- | --- |
-| PR opened, edited, synchronized or reopened | Current title, description, head branch, all commit messages, current added lines and paths | `public-text / check` (verify on the first live run) |
+| PR opened, edited, synchronized or reopened | Current title, description, head branch, commit messages an earlier merged PR from the branch did not carry, current added lines and paths | `public-text / check` (verify on the first live run) |
 | Issue opened or edited | Current title and description | `public-text-audit / check` |
 | Discussion comment created or edited | Current comment body | `public-text-audit / check` |
 | Review submitted or edited | Current review summary | `public-text-audit / check` |
@@ -18,9 +18,9 @@ Release trains receive the same scan as any other PR. The scanner compares pagin
 
 A squash merge never makes the head branch's commits part of the base, so a release train's next PR lists every earlier train's commits again. The scanner skips commits that the newest earlier merged PR from the same branch into the same base already carried, when the current head still descends from that PR's head. Those messages merged once and stay in the branch's public history; failing on them would block every later train on text nobody can change. Every other commit message is checked. If the head no longer descends from the merged head, every commit is checked.
 
-Removed paths are excluded so a cleanup can remove a disclosure. Renames check only the new path and added content. A zero-addition, zero-deletion change can omit its patch only when the scanner verifies that its blob equals the base file's blob, or verifies empty/binary content. This permits mode-only changes and unchanged renames without trusting line counts alone. A missing base path fails conservatively.
+Removed paths are excluded so a cleanup can remove a disclosure. Renames check only the new path and added content. A modified or renamed file with zero additions and zero deletions can omit its patch only when the scanner verifies that its blob equals the base file's blob, or verifies empty/binary content. This permits mode-only changes and unchanged renames without trusting line counts alone. A missing base path fails conservatively.
 
-For other missing patches, the scanner reads the blob as data. It accepts an empty file, and treats a blob of up to 10 MiB with a NUL byte within the first 8,000 bytes as binary, checking only its path. GitHub also omits patches for files it renders as binary without a NUL byte, such as small PDFs. For an added file of up to 1 MiB with no NUL byte, the whole content is its added text, so the scanner checks all of it. Any other missing patch fails and needs maintainer review: a larger blob, or a modified file whose new content has no patch.
+For other missing patches, the scanner reads the blob as data. It accepts an empty file, and treats a blob of up to 10 MiB with a NUL byte within the first 8,000 bytes as binary, checking only its path. GitHub also omits patches for files it renders as binary without a NUL byte, such as small PDFs. For an added file of up to 1 MiB with no NUL byte, the whole content is its added text, so the scanner checks all of it. Any other missing patch fails and needs maintainer review: a larger blob, or a modified file whose new content has no patch. Text stored with NUL bytes, such as UTF-16, counts as binary.
 
 Added text is checked in contiguous blocks so a wrapped phrase can match. The scanner does not join additions across intervening unchanged lines.
 

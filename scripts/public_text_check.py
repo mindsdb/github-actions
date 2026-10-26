@@ -189,6 +189,8 @@ def compare(repo: str, base: str, head: str) -> Comparison:
     commits = tuple(commit for page in pages for commit in page["commits"])
     if len(totals) != 1 or len(merge_bases) != 1 or len(commits) != totals.pop():
         raise ScanError("incomplete commits")
+    if len({sha(commit["sha"]) for commit in commits}) != len(commits):
+        raise ScanError("duplicate commits")
     return Comparison(merge_bases.pop(), commits)
 
 
