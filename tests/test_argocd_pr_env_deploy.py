@@ -39,6 +39,11 @@ LINKED_HEAD_SHA = "c" * 40
 LINKED_MERGE_SHA = "d" * 40
 AWS_REGION = "us-east-1"
 
+
+def own_pr(repository: str, body: str = "") -> dict:
+    """The deployed PR as the API returns it: a branch of `repository` itself."""
+    return {"body": body, "head": {"repo": {"full_name": repository}}}
+
 CURL = """
 url=""; post=0
 for arg in "$@"; do
@@ -138,7 +143,7 @@ def run_deploy(
             "PR_HEAD_SHA": head_sha,
             "GITHUB_EVENT_NAME": event,
             "GITHUB_SHA": MERGE_SHA,
-            "GITHUB_REPOSITORY": "mindsdb/deployer" if event != "pull_request" else repository,
+            "GITHUB_REPOSITORY": "mindsdb/example-caller" if event != "pull_request" else repository,
             "RUNNER_TEMP": str(tmp_path),
             "AWS_REGION": AWS_REGION,
         },
@@ -198,7 +203,7 @@ class TestAPullRequestRunIsUnchanged:
         result = run_deploy(
             stubs, tmp_path,
             event="pull_request", repository="mindsdb/auth", pr_number="7", head_sha=HEAD_SHA,
-            prs={"repos/mindsdb/auth/pulls/7": {"body": "No links."}},
+            prs={"repos/mindsdb/auth/pulls/7": own_pr("mindsdb/auth", "No links.")},
             ecr_repos=("mindsdb-auth",),
             ecr_images=(f"mindsdb-auth:development-{MERGE_SHA}",),
         )
@@ -224,7 +229,7 @@ class TestARunWithInputsDeploysTheNamedPr:
         result = run_deploy(
             stubs, tmp_path,
             event=event, repository="mindsdb/cowork", pr_number="12", head_sha=HEAD_SHA,
-            prs={"repos/mindsdb/cowork/pulls/12": {"body": ""}},
+            prs={"repos/mindsdb/cowork/pulls/12": own_pr("mindsdb/cowork")},
             ecr_repos=("mindsdb-cowork-dev", "mindsdb-cowork"),
             ecr_images=(f"mindsdb-cowork-dev:development-head-{HEAD_SHA}",),
         )
@@ -239,9 +244,32 @@ class TestARunWithInputsDeploysTheNamedPr:
         gets = [argv[-1] for argv in stubs.calls("curl") if "POST" not in argv]
         assert gets == ["https://api.github.com/repos/mindsdb/cowork/pulls/12"]
 
+    @pytest.mark.parametrize(
+        "head_repo",
+        [{"full_name": "someone/cowork"}, None],
+        ids=["fork", "deleted-fork"],
+    )
+    def test_a_pr_from_a_fork_is_refused_before_any_ecr_or_argocd_call(self, stubs, tmp_path, head_repo):
+        """The caller names the PR, so the script checks where its branch lives.
+        A fork's branch would otherwise pick the chart revision ArgoCD renders."""
+        result = run_deploy(
+            stubs, tmp_path,
+            event="schedule", repository="mindsdb/cowork", pr_number="12", head_sha=HEAD_SHA,
+            prs={"repos/mindsdb/cowork/pulls/12": {"body": "", "head": {"repo": head_repo}}},
+            ecr_repos=("mindsdb-cowork-dev",),
+            ecr_images=(f"mindsdb-cowork-dev:development-head-{HEAD_SHA}",),
+        )
+
+        assert result.returncode == 1
+        assert (
+            "::error::PR #12 comes from a fork; only PRs from mindsdb/cowork's own branches deploy.\n"
+        ) in result.stdout
+        assert stubs.calls("aws") == []
+        assert stubs.calls("argocd") == []
+
 
 LINKS_COWORK_5 = {
-    "repos/mindsdb/auth/pulls/7": {"body": "Deploys: cowork#5"},
+    "repos/mindsdb/auth/pulls/7": own_pr("mindsdb/auth", "Deploys: cowork#5"),
     "repos/mindsdb/cowork/pulls/5": {"merge_commit_sha": LINKED_MERGE_SHA, "head": {"sha": LINKED_HEAD_SHA}},
 }
 
@@ -259,7 +287,7 @@ class TestEachTagIsCheckedInOneRepository:
         result = run_deploy(
             stubs, tmp_path,
             event="schedule", repository="mindsdb/cowork", pr_number="12", head_sha=HEAD_SHA,
-            prs={"repos/mindsdb/cowork/pulls/12": {"body": ""}},
+            prs={"repos/mindsdb/cowork/pulls/12": own_pr("mindsdb/cowork")},
             ecr_repos=("mindsdb-cowork-dev", "mindsdb-cowork"),
             ecr_images=(f"mindsdb-cowork:development-head-{HEAD_SHA}",),
         )
@@ -276,7 +304,7 @@ class TestEachTagIsCheckedInOneRepository:
         result = run_deploy(
             stubs, tmp_path,
             event="schedule", repository="mindsdb/mindshub_inference", pr_number="3", head_sha=HEAD_SHA,
-            prs={"repos/mindsdb/mindshub_inference/pulls/3": {"body": ""}},
+            prs={"repos/mindsdb/mindshub_inference/pulls/3": own_pr("mindsdb/mindshub_inference")},
             ecr_repos=("mindsdb-mindshub-inference",),
             ecr_images=(f"mindsdb-mindshub-inference:development-head-{HEAD_SHA}",),
         )
@@ -344,7 +372,7 @@ class TestEachTagIsCheckedInOneRepository:
         result = run_deploy(
             stubs, tmp_path,
             event="schedule", repository="mindsdb/cowork", pr_number="12", head_sha=HEAD_SHA,
-            prs={"repos/mindsdb/cowork/pulls/12": {"body": ""}},
+            prs={"repos/mindsdb/cowork/pulls/12": own_pr("mindsdb/cowork")},
             ecr_repos=("mindsdb-cowork-dev", "mindsdb-cowork"),
             ecr_denied=("mindsdb-cowork-dev",),
         )
@@ -397,7 +425,7 @@ class TestInputThatIsNotAPrIsRefused:
         """Outside a pull_request event the defaults resolve to empty strings."""
         result = run_deploy(
             stubs, tmp_path,
-            event="workflow_dispatch", repository="mindsdb/deployer", pr_number="", head_sha="",
+            event="workflow_dispatch", repository="mindsdb/example-caller", pr_number="", head_sha="",
         )
 
         assert result.returncode == 1

@@ -491,7 +491,7 @@ instead of both being set by hand.
 The `ci-pr-envs` token is a JWT the server validates itself, so it works
 unchanged over either endpoint.
 
-In a `pull_request` run the action takes the repository, PR number and head SHA from the event. A workflow that deploys PRs from any other event, such as a schedule that syncs every open PR labelled `deploy`, passes them as inputs. The action accepts only an owner/name, a number and a 40-character SHA. That run built no image, so it deploys `development-head-<head-sha>`, the tag `build-push-ecr` pushes for every PR head.
+In a `pull_request` run the action takes the repository, PR number and head SHA from the event. A workflow that deploys PRs from any other event, such as a schedule that syncs every open PR labelled `deploy`, passes them as inputs. The action accepts only an owner/name, a number and a 40-character SHA, and it refuses a PR whose branch lives in a fork, because that branch would pick the chart revision. That run built no image, so it deploys `development-head-<head-sha>`, the tag `build-push-ecr` pushes for every PR head.
 
 ```yaml
       - uses: mindsdb/github-actions/argocd-pr-env-deploy@main

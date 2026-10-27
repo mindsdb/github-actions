@@ -285,14 +285,22 @@ runs:
           ecr_describe --repository-name "$PR_IMAGE_REPO" --image-ids "imageTag=${tag}"
         }
 
-        # Fetch the PR body ONCE — the strict `Deploys:` extraction and the
-        # lint below both reuse it. Strip \r so CRLF bodies don't trip the
-        # line-anchored lint pattern. Fail with a diagnosable message rather
-        # than letting `set -e` kill the step mutely on an API blip.
-        PR_BODY="$(gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" | jq -r '.body // ""' | tr -d '\r')" || {
+        # Fetch the PR ONCE — the strict `Deploys:` extraction and the
+        # lint below both reuse its body. Strip \r so CRLF bodies don't trip
+        # the line-anchored lint pattern. Fail with a diagnosable message
+        # rather than letting `set -e` kill the step mutely on an API blip.
+        PR_JSON="$(gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER")" || {
           echo "::error::Could not fetch PR #${PR_NUMBER} body from the GitHub API (needed to resolve Deploys: links) — transient API failure or bad GH_TOKEN. Re-run the job."
           exit 1
         }
+        # Only a branch of the repository itself deploys. A fork's PR would
+        # pick the chart revision, and outside a pull_request run the caller,
+        # not GitHub, names the PR. A deleted fork has no head repo at all.
+        if [ "$(jq -r '.head.repo.full_name // ""' <<<"$PR_JSON")" != "$OWN_REPO" ]; then
+          echo "::error::PR #${PR_NUMBER} comes from a fork; only PRs from ${OWN_REPO}'s own branches deploy."
+          exit 1
+        fi
+        PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON" | tr -d '\r')"
 
         # Lint: `Deploys:`-looking lines that don't match the strict form
         # would otherwise be silently ignored and the env would quietly run
