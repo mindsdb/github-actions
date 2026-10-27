@@ -407,14 +407,55 @@ There is no blanket answer, and "prefer Kubernetes because it is the source of t
 | The value is | Source | Why |
 | --- | --- | --- |
 | Ephemeral and namespace-local (a per-PR environment's own credentials) | **Kubernetes**, via `k8s-secret` | No GitHub Environment can exist for `pr-<repo>-204`, so a copy is impossible; the namespace is the only source there is |
-| A permanent environment's real credential (prod/staging DB, Stripe live, prod vendor tokens) | **GitHub Environment** | A job can only read it by declaring `environment: prod`, and that environment requires a reviewer. A k8s Secret has no such gate — *any* job on a runner with cluster read can fetch it, unreviewed |
+| A permanent environment's real credential (prod/staging DB, Stripe live, prod vendor tokens) | **GitHub Environment** | A job can only read it by declaring `environment: prod`, and the environment's deployment branch policy can limit which branches may declare it. A k8s Secret has no such gate: *any* job on a runner with cluster read can fetch it |
 | Needed to reach the cluster, or used on a GitHub-hosted runner | **GitHub secret** | Package-install tokens, the ArgoCD token that creates the namespace, Snyk, Slack. Reading these from the cluster is circular |
 
-The middle row is the one worth being explicit about, because the intuition points the wrong way. Moving prod credentials out of a GitHub Environment and into a cluster read would *remove* the required-reviewer gate standing in front of them today, and it would force the jobs that use them onto `mdb-prod` (nothing else can reach newprod), which means granting *more* jobs prod cluster access. Both are the wrong direction.
+The middle row is the one worth being explicit about, because the intuition points the wrong way. Moving prod credentials out of a GitHub Environment and into a cluster read would *remove* the gate an environment can put in front of them. A job reads an environment secret only by naming the environment. The environment's deployment branch policy can limit which branches may name it, and without one any branch can. A cluster read has no such gate. The move would also force the jobs that use them onto `mdb-prod` (nothing else can reach newprod), which means granting *more* jobs prod cluster access. Both are the wrong direction.
 
 What actually goes wrong with a GitHub secret is different and has a cheaper fix: a reference to a secret that does not exist resolves to the **empty string** rather than failing, so a rename reaches the vendor as no credential and comes back as an unexplained 401. The fix for that is to assert the value is non-empty and name it in the error, not to migrate its storage.
 
 `k8s-secret` is also not a containment boundary. The ability to read Secrets belongs to the self-hosted runner, which holds cluster credentials because it deploys. What bounds *that* is who can trigger a run on such a runner — hence a `pull_request`-triggered job on a public repo needs `if: github.event.pull_request.head.repo.full_name == github.repository` — and the runner ServiceAccount's RBAC.
+
+## Building an image into ECR
+
+`build-push-ecr` builds a Docker image and pushes it to ECR as `<environment>-<ref>`, `<environment>` and `latest`. On a `pull_request` event it also pushes `<environment>-head-<PR head SHA>`. The `image` output names the `<environment>-<ref>` tag.
+
+The `builder` input decides where the build runs. Tags, build arguments and the output are the same in both modes.
+
+| `builder` | Runs on | AWS credentials | ECR repository |
+| --- | --- | --- | --- |
+| `remote` (default) | `mdb-dev` only, because it builds on the in-cluster BuildKit service | The runner pod's own role | The action creates it, with `shared-ecr-policy.json`, the first time it pushes there |
+| `local` | GitHub-hosted runners, with layers cached in the GitHub Actions cache under `module-name` | A role the caller job assumes through GitHub OIDC | Must exist already. The action never creates a repository or changes its policy |
+
+Use `local` in a public repository. GitHub [recommends GitHub-hosted runners for public repositories](https://docs.github.com/en/actions/reference/security/secure-use#hardening-for-self-hosted-runners), because anyone can open a pull request there. Give the role it assumes push access to that repository's ECR repositories and nothing else. The caller job grants `id-token: write` and configures the credentials before the build:
+
+```yaml
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write                   # lets configure-aws-credentials request an OIDC token
+    steps:
+      - uses: actions/checkout@<sha> # v5
+      - uses: aws-actions/configure-aws-credentials@<sha> # v6
+        with:
+          role-to-assume: arn:aws:iam::<account-id>:role/<ecr-writer-role>
+          aws-region: us-east-1
+      - id: build
+        uses: mindsdb/github-actions/build-push-ecr@main
+        with:
+          builder: local
+          module-name: <ecr-repository>
+          build-for-environment: development
+```
+
+`docker buildx` finds the GitHub Actions cache through `ACTIONS_*` variables that the runner gives to actions but not to `run:` steps. In `local` mode the action runs `crazy-max/ghaction-github-runtime`, which exports them to the job's environment, so later steps in the caller job can read them too.
+
+`snyk-docker-scan` logs in to ECR with whatever credentials the job has. A scan job on a GitHub-hosted runner therefore runs `configure-aws-credentials` first, with a role that can pull the image.
+
+Every third-party action inside `build-push-ecr`, `snyk-docker-scan` and `setup-env` is pinned to a full commit SHA, with its version in a comment. `setup-env` is on that list because it runs in the same build job, and any step in a job that grants `id-token: write` can request the job's OIDC token. `snyk-docker-scan` also pins the Snyk CLI release it installs, because the CLI runs with the job's AWS credentials in its environment. In `local` mode, the BuildKit container that builds and pushes the image runs one `moby/buildkit` release, pinned to its multi-arch index digest, because that container holds the ECR registry credentials while it pushes. So a moved tag or a new upstream release cannot change that code until someone bumps a pin here.
+
+The BuildKit pin needs manual bumps, because nothing in this repository updates it. To bump it, take the newest plain `vX.Y.Z` tag from [moby/buildkit releases](https://github.com/moby/buildkit/releases). Release candidates and `dockerfile/` releases do not count. Read that version's index digest from the `Digest:` line of `docker buildx imagetools inspect moby/buildkit:<version>`. Then change the version and the digest together in the `driver-opts` line of `build-push-ecr/action.yml`. `tests/test_third_party_pins.py` fails if the pin loses its version or its digest.
 
 ## PR environment rollout
 
@@ -449,6 +490,20 @@ instead of both being set by hand.
 
 The `ci-pr-envs` token is a JWT the server validates itself, so it works
 unchanged over either endpoint.
+
+In a `pull_request` run the action takes the repository, PR number and head SHA from the event. A workflow that deploys PRs from any other event, such as a schedule that syncs every open PR labelled `deploy`, passes them as inputs. The action accepts only an owner/name, a number and a 40-character SHA, and it refuses a PR whose branch lives in a fork, because that branch would pick the chart revision. That run built no image, so it deploys `development-head-<head-sha>`, the tag `build-push-ecr` pushes for every PR head.
+
+```yaml
+      - uses: mindsdb/github-actions/argocd-pr-env-deploy@main
+        with:
+          argocd-token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          gh-token: ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}
+          repository: ${{ matrix.repository }}   # owner/name
+          pr-number: ${{ matrix.pr-number }}
+          head-sha: ${{ matrix.head-sha }}
+```
+
+Before it pins a tag, the action checks that the tag exists in the ECR repository that holds that repo's PR images. A repo with a dev tier pushes its PR images to `mindsdb-<repo>-dev` and nowhere else. So when that repository exists, the action checks there and only there. Otherwise it checks `mindsdb-<repo>`. A tag missing from one repository is never looked up in the other. Underscores in the repo name become hyphens. The action also learns whether `mindsdb-<repo>-dev` exists from `ecr:DescribeImages`, so that is the only ECR permission it needs.
 
 ## PR environment comments
 

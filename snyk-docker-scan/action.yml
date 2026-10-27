@@ -7,6 +7,10 @@
 #
 # If input allow-vulns is set (any non-empty value), the scan may exit 0 even when Snyk reports
 # issues (`|| true`). Callers typically pass `allow-vulns: ${{ vars.ALLOW_SNYK_VULNS }}`.
+#
+# AWS: the ECR login uses whatever credentials the job already has. On an `mdb-dev` runner that is
+# the pod's own identity. On a GitHub-hosted runner, run aws-actions/configure-aws-credentials with a
+# role that can pull the image before this action.
 
 inputs:
   image:
@@ -36,9 +40,14 @@ runs:
   using: "composite"
   steps:
     - name: Install Snyk CLI
-      uses: snyk/actions/setup@master
+      uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
+      with:
+        # Without this, setup installs whatever release Snyk last published.
+        # The CLI runs with the job's AWS credentials in its environment, so it
+        # changes only when this line does.
+        snyk-version: v1.1307.4
     - name: Login to Amazon ECR
-      uses: aws-actions/amazon-ecr-login@v2
+      uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
     - name: Run Snyk container test
       shell: bash
       env:

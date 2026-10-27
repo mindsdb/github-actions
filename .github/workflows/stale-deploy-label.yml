@@ -24,7 +24,9 @@ on:
 
 jobs:
   prune:
-    runs-on: mdb-dev
+    # GitHub-hosted: the job needs only `gh` and the caller's token, and one
+    # caller is a public repository, which must not reach the self-hosted runners.
+    runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
       TARGET_REPO: ${{ inputs.target-repo }}
@@ -34,9 +36,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Cross-platform `date` cutoff. Self-hosted mdb-dev runners are Linux —
-          # `date -u -d` is GNU coreutils. If this workflow ever moves to macOS
-          # runners, swap to `date -u -v-${STALE_DAYS}d -Iseconds`.
+          # Cross-platform `date` cutoff. ubuntu-latest is Linux, so `date -u -d`
+          # is GNU coreutils. If this workflow ever moves to macOS runners, swap
+          # to `date -u -v-${STALE_DAYS}d -Iseconds`.
           THRESHOLD_ISO="$(date -u -d "${STALE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
           echo "Threshold: ${THRESHOLD_ISO} (PRs older than this lose the label)"
 
