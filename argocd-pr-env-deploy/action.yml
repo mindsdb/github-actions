@@ -532,26 +532,24 @@ runs:
         # ARGOCD_AUTH_TOKEN env vars set above are picked up by every
         # subsequent argocd command directly.
 
-        # The `customer:` label is read only when the env is created. If it
-        # now disagrees with the hostBase the parent was created with, refuse.
-        # A parent that does not exist yet is skipped: the ApplicationSet
-        # creates it from the labels and the `app set` retry below waits for it.
+        # The `customer:` label is read only when the env is created. A parent
+        # that is absent or being deleted has nothing to compare: skip, and the
+        # `app set` retry below waits for the ApplicationSet to create it.
         PARENT_JSON=""
-        for i in $(seq 1 30); do
-          if get_err="$("$ARGOCD_BIN" app get "$PARENT_APP" "${ARGOCD_FLAGS[@]}" -o json 2>&1)"; then
-            PARENT_JSON="$get_err"
-            break
-          fi
+        if get_err="$("$ARGOCD_BIN" app get "$PARENT_APP" "${ARGOCD_FLAGS[@]}" -o json 2>&1)"; then
+          PARENT_JSON="$get_err"
+        else
           case "$get_err" in
-            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*) ;;
+            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*|*"being deleted"*)
+              echo "Application ${PARENT_APP} not found or being deleted; skipping the customer label check."
+              ;;
             *)
               echo "argocd app get ${PARENT_APP} failed unexpectedly:" >&2
               echo "$get_err" >&2
               exit 1
               ;;
           esac
-          [ "$i" -eq 30 ] || sleep 10
-        done
+        fi
         if [ -n "$PARENT_JSON" ]; then
           PARENT_HOST="$(jq -r '[.spec.source.helm.parameters[]? | select(.name=="hostBase") | .value] | first // ""' <<<"$PARENT_JSON")"
           if [ "$LABEL_HOST" != "$PARENT_HOST" ]; then
