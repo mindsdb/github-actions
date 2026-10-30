@@ -72,7 +72,7 @@ def customer_reminders(repo: str, runner: Runner = _run, *, dry_run: bool) -> bo
     ok = True
     for line in _lines(closed):
         number, label = line.split(" ", 1)
-        comments = runner(["gh", "api", f"repos/{repo}/issues/{number}/comments", "--jq", ".[].body"])
+        comments = runner(["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments", "--jq", ".[].body"])
         if comments.returncode != 0:
             print(f"::error title={repo}::could not read comments on #{number}: {_error(comments)}", flush=True)
             ok = False

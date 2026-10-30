@@ -54,7 +54,9 @@ class FakeGh:
             return completed("\n".join(lines) + "\n")
         if "/comments" in path:
             number = int(path.split("/issues/")[1].split("/")[0])
-            return completed("\n".join(self.comments.get((repo, number), [])) + "\n")
+            # Page 1 holds no marker; later pages are only reached with --paginate.
+            bodies = self.comments.get((repo, number), []) if "--paginate" in argv else []
+            return completed("\n".join(bodies) + "\n")
         if repo in self.fail_prs:
             return completed(stderr="HTTP 502", returncode=1)
         return completed("\n".join(str(n) for n in self.prs.get(repo, [])) + "\n")
