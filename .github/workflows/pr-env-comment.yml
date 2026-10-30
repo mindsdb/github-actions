@@ -145,6 +145,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           ENV_NAME: ${{ inputs.env-name }}
           LINKS: ${{ inputs.links }}
           STANDARD: ${{ inputs.standard-links }}
@@ -202,11 +203,12 @@ jobs:
             # stack. Derived from the env name rather than passed in, because it
             # is identical for every anchor repo.
             ALL="${LINKS:-[]}"
-            # A `customer:<hostBase>` label moves the hostnames to <hostBase>;
-            # the namespace stays ${ENV_NAME}.
-            HOST_BASE="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" --jq '[.[].name | select(startswith("customer:")) | ltrimstr("customer:")] | first // empty')"
-            HOST="${HOST_BASE:-$ENV_NAME}"
             if [ "$STANDARD" = "true" ]; then
+              # A `customer:<hostBase>` label moves the hostnames to <hostBase>;
+              # the namespace stays ${ENV_NAME}. Labels come from the event
+              # payload, so no extra API call can fail this redirect group.
+              HOST_BASE="$(jq -r '[.[] | select(startswith("customer:")) | ltrimstr("customer:")] | first // empty' <<< "${PR_LABELS:-[]}")"
+              HOST="${HOST_BASE:-$ENV_NAME}"
               ALL="$(jq -cn --arg e "$ENV_NAME" --arg h "$HOST" --arg d "$HOST_SUFFIX" --argjson extra "${LINKS:-[]}" '
                 [ {label: "Console",   url: "https://\($h).\($d)"},
                   {label: "Auth API",        url: "https://auth-\($h).\($d)"},

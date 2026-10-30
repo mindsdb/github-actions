@@ -9,8 +9,10 @@ whose PR fails that test is stale and is deleted here.
 Environments are listed before PRs, so an environment created mid-run is left
 for the next run. A repo whose PR list cannot be read is skipped entirely.
 
-A closed PR labelled ``customer:<hostBase>`` leaves data behind that nothing
-deletes, so each one gets a single comment listing it (see ``REMINDER``).
+A closed PR labelled ``deploy`` and ``customer:<hostBase>`` had a customer env
+whose data nothing deletes, so each one gets a single comment listing it (see
+``REMINDER``). Every closed PR is scanned, so a PR missed while the job was
+failing is still reminded once it recovers.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ CUSTOMER_PREFIX = "customer:"
 MARKER = "<!-- customer-env-close-reminder -->"
 REMINDER = MARKER + """
 This customer env is gone, but its data is not. Delete by hand when the engagement is over:
-- Files: `s3://mindshub-files-dev/customer-envs/{host_base}/`
+- Files: the `customer-envs/{host_base}/` prefix in the bucket named by `filesBucket` in argocd-envs `parent/values.yaml`
 - Cowork workspaces: the `pr-{slug}-{number}` directory on the cowork EFS
 - Postgres: the retained PersistentVolume for `data-postgres-postgresql-0` in namespace `pr-{slug}-{number}` (`kubectl get pv | grep pr-{slug}-{number}`) and its AWS Backup recovery points
 """
@@ -59,11 +61,12 @@ def _error(result: "subprocess.CompletedProcess[str]") -> str:
 
 
 def customer_reminders(repo: str, runner: Runner = _run, *, dry_run: bool) -> bool:
-    """Comment once on each recently closed customer PR in ``repo``; False if a gh call failed."""
+    """Comment once on each closed PR in ``repo`` that had a customer env; False if a gh call failed."""
     slug = repo.split("/", 1)[1].replace("_", "-")
     closed = runner([
-        "gh", "api", f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100",
-        "--jq", f'.[] | select(any(.labels[]; .name | startswith("{CUSTOMER_PREFIX}"))) | '
+        "gh", "api", "--paginate", f"repos/{repo}/pulls?state=closed&per_page=100",
+        "--jq", f'.[] | select(any(.labels[]; .name == "{DEPLOY_LABEL}")) | '
+                f'select(any(.labels[]; .name | startswith("{CUSTOMER_PREFIX}"))) | '
                 f'"\\(.number) \\([.labels[].name | select(startswith("{CUSTOMER_PREFIX}"))][0])"',
     ])
     if closed.returncode != 0:

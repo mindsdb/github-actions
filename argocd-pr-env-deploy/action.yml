@@ -9,7 +9,7 @@
 #   - `Deploys: repo#staging` — no API lookup; pins that repo to the
 #     `staging` ECR image tag + `staging` git branch. Useful for testing
 #     the anchor PR against non-PR-branch versions of a sibling service.
-#   - `Deploys: repo#main` — same, pinned to the `production` ECR image tag
+#   - `Deploys: repo#main`: same, pinned to the `production` ECR image tag
 #     + `main` git branch.
 #   - `Deploys: mindshub_services#N` sets `revisions.mindshub_services` only.
 #     That repo ships a SAM stack, not an image: its pr-env-stacks workflow
@@ -233,7 +233,7 @@ runs:
         # lint below both reuse it. Strip \r so CRLF bodies don't trip the
         # line-anchored lint pattern. Fail with a diagnosable message rather
         # than letting `set -e` kill the step mutely on an API blip.
-        PR_JSON="$(gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER")" || {
+        PR_JSON="$(gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER")" && jq -e 'type == "object"' <<<"$PR_JSON" >/dev/null || {
           echo "::error::Could not fetch PR #${PR_NUMBER} body from the GitHub API (needed to resolve Deploys: links) — transient API failure or bad GH_TOKEN. Re-run the job."
           exit 1
         }
@@ -283,7 +283,7 @@ runs:
         else
           OWN_TAG="development-${OWN_MERGE_SHA}"
           if ! ecr_tag_exists "$OWN_SHORT" "$OWN_TAG"; then
-            echo "::error::ECR image $(ecr_repo_name "$OWN_SHORT"):${OWN_TAG} not found — did the build job in this run succeed?"
+            echo "::error::ECR image $(ecr_repo_name "$OWN_SHORT"):${OWN_TAG} not found. Did the build job in this run succeed?"
             exit 1
           fi
           set_args=(
@@ -321,24 +321,26 @@ runs:
               ;;
             line)
               # `repo#staging` / `repo#main`: the branch field carries which.
+              # Repos without an image take the chart branch alone.
+              if is_revision_only_repo "$repo"; then
+                set_args+=(--helm-set "revisions.${repo}=${branch}")
+                continue
+              fi
               case "$branch" in
-                staging)
-                  set_args+=(
-                    --helm-set "tags.${repo}=staging"
-                    --helm-set "revisions.${repo}=staging"
-                  )
-                  ;;
-                main)
-                  if is_revision_only_repo "$repo"; then
-                    set_args+=(--helm-set "revisions.${repo}=main")
-                  else
-                    set_args+=(
-                      --helm-set "tags.${repo}=production"
-                      --helm-set "revisions.${repo}=main"
-                    )
-                  fi
-                  ;;
+                staging) tag=staging ;;
+                main)    tag=production ;;
               esac
+              # Not every repo publishes both moving tags (cowork has no
+              # `production`), so check before pinning: an absent tag leaves
+              # the child in ImagePullBackOff until wait-timeout expires.
+              if [ "$ECR_CHECKS" = on ] && ! ecr_tag_exists "$repo" "$tag"; then
+                echo "::error::No ECR image $(ecr_repo_name "$repo"):${tag} for ${link}. That repo does not publish a '${tag}' tag; link a PR number or the other branch instead."
+                exit 1
+              fi
+              set_args+=(
+                --helm-set "tags.${repo}=${tag}"
+                --helm-set "revisions.${repo}=${branch}"
+              )
               ;;
             revision-only)
               # No image to pin or check; the revision is the whole deploy.
@@ -403,6 +405,17 @@ runs:
                   *)   full="${OWN_REPO%%/*}/$full" ;;
                 esac
                 [ "$full" = "$OWN_REPO" ] && continue
+                # `#staging` / `#main`: reuse the linked repo's release
+                # pipeline outputs, moving ECR image tag + git branch. For
+                # argocd-envs the branch is the parent chart revision itself.
+                if [ "$num" = "staging" ] || [ "$num" = "main" ]; then
+                  if [ "${full##*/}" = "argocd-envs" ]; then
+                    echo "envs:${full}#${num}:${full##*/}:::${num}"
+                  else
+                    echo "line:${full}#${num}:${full##*/}:::${num}"
+                  fi
+                  continue
+                fi
                 # argocd-envs is the env's own parent chart, not a workload:
                 # no image to tag and no child Application to revision. Emit
                 # the head BRANCH so phase 2 can move the parent Application's
@@ -424,12 +437,6 @@ runs:
                   else
                     echo "envs:${full}#${num}:${full##*/}:::${head_ref}"
                   fi
-                  continue
-                fi
-                # `#staging` / `#main` — reuse the linked repo's release
-                # pipeline outputs: moving ECR image tag + git branch.
-                if [ "$num" = "staging" ] || [ "$num" = "main" ]; then
-                  echo "line:${full}#${num}:${full##*/}:::${num}"
                   continue
                 fi
                 # Repos without an image: head SHA only, no ECR lookup.
