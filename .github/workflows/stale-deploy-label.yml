@@ -4,6 +4,8 @@
 # generator filter — removing the label causes ArgoCD to delete the generated
 # Applications and prune the namespace.
 #
+# PRs carrying a `customer:` label are never stripped; they live until the PR closes.
+#
 # Called as a reusable workflow by per-repo scheduled wrappers. See e.g.
 #   auth/.github/workflows/stale-deploy.yml
 #   mindshub_frontend/.github/workflows/stale-deploy.yml
@@ -42,8 +44,8 @@ jobs:
 
           mapfile -t STALE_PRS < <(
             gh pr list --repo "${TARGET_REPO}" --label deploy --state open \
-              --json number,updatedAt,title \
-              --jq ".[] | select(.updatedAt < \"${THRESHOLD_ISO}\") | .number"
+              --json number,updatedAt,title,labels \
+              --jq ".[] | select(.updatedAt < \"${THRESHOLD_ISO}\") | select(any(.labels[]?.name; startswith(\"customer:\")) | not) | .number"
           )
 
           if [[ ${#STALE_PRS[@]} -eq 0 ]]; then

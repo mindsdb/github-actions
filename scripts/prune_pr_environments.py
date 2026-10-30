@@ -8,6 +8,11 @@ whose PR fails that test is stale and is deleted here.
 
 Environments are listed before PRs, so an environment created mid-run is left
 for the next run. A repo whose PR list cannot be read is skipped entirely.
+
+A closed PR labelled ``deploy`` and ``customer:<hostBase>`` had a customer env
+whose data nothing deletes, so each one gets a single comment listing it (see
+``REMINDER``). Every closed PR is scanned, so a PR missed while the job was
+failing is still reminded once it recovers.
 """
 
 from __future__ import annotations
@@ -21,6 +26,14 @@ from typing import Callable, Iterable, Sequence
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 DEPLOY_LABEL = "deploy"
+CUSTOMER_PREFIX = "customer:"
+MARKER = "<!-- customer-env-close-reminder -->"
+REMINDER = MARKER + """
+This customer env is gone, but its data is not. Delete by hand when the engagement is over:
+- Files: the `customer-envs/{host_base}/` prefix in the bucket named by `filesBucket` in argocd-envs `parent/values.yaml`
+- Cowork workspaces: the `pr-{slug}-{number}` directory on the cowork EFS
+- Postgres: the retained PersistentVolume for `data-postgres-postgresql-0` in namespace `pr-{slug}-{number}` (`kubectl get pv | grep pr-{slug}-{number}`) and its AWS Backup recovery points
+"""
 
 
 def _run(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
@@ -45,6 +58,41 @@ def _lines(result: "subprocess.CompletedProcess[str]") -> list[str]:
 
 def _error(result: "subprocess.CompletedProcess[str]") -> str:
     return result.stderr.strip() or result.stdout.strip()
+
+
+def customer_reminders(repo: str, runner: Runner = _run, *, dry_run: bool) -> bool:
+    """Comment once on each closed PR in ``repo`` that had a customer env; False if a gh call failed."""
+    slug = repo.split("/", 1)[1].replace("_", "-")
+    closed = runner([
+        "gh", "api", "--paginate", f"repos/{repo}/pulls?state=closed&per_page=100",
+        "--jq", f'.[] | select(any(.labels[]; .name == "{DEPLOY_LABEL}")) | '
+                f'select(any(.labels[]; .name | startswith("{CUSTOMER_PREFIX}"))) | '
+                f'"\\(.number) \\([.labels[].name | select(startswith("{CUSTOMER_PREFIX}"))][0])"',
+    ])
+    if closed.returncode != 0:
+        print(f"::error title={repo}::could not list closed PRs: {_error(closed)}", flush=True)
+        return False
+    ok = True
+    for line in _lines(closed):
+        number, label = line.split(" ", 1)
+        comments = runner(["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments", "--jq", ".[].body"])
+        if comments.returncode != 0:
+            print(f"::error title={repo}::could not read comments on #{number}: {_error(comments)}", flush=True)
+            ok = False
+            continue
+        if MARKER in comments.stdout:
+            continue
+        if dry_run:
+            print(f"  would remind on {repo}#{number}", flush=True)
+            continue
+        body = REMINDER.format(host_base=label.removeprefix(CUSTOMER_PREFIX), slug=slug, number=number)
+        res = runner(["gh", "api", "-X", "POST", f"repos/{repo}/issues/{number}/comments", "-f", f"body={body}"])
+        if res.returncode != 0:
+            print(f"::error title={repo}::could not comment on #{number}: {_error(res)}", flush=True)
+            ok = False
+        else:
+            print(f"  reminded {repo}#{number}", flush=True)
+    return ok
 
 
 def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run) -> int:
@@ -75,6 +123,8 @@ def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run) -> int:
                 failed = True
             else:
                 print(f"  deleted {name}", flush=True)
+        if not customer_reminders(repo, runner, dry_run=dry_run):
+            failed = True
     return 1 if failed else 0
 
 

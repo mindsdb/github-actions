@@ -22,30 +22,63 @@ def completed(stdout="", stderr="", returncode=0):
 class FakeGh:
     """Answers `gh api` calls from per-repo tables and records every call."""
 
-    def __init__(self, envs, prs, fail_prs=(), fail_delete=()):
+    def __init__(self, envs, prs, fail_prs=(), fail_delete=(), closed=None, comments=None, fail_closed=(), fail_comments=()):
         self.envs, self.prs = envs, prs
         self.fail_prs, self.fail_delete = set(fail_prs), set(fail_delete)
+        self.closed, self.comments = closed or {}, comments or {}
+        self.fail_closed, self.fail_comments = set(fail_closed), set(fail_comments)
         self.calls = []
 
     def __call__(self, argv):
         argv = list(argv)
         self.calls.append(argv)
+        path = next(a for a in argv if a.startswith("repos/"))
+        repo = "/".join(path.split("/")[1:3])
         if "-X" in argv:
-            path = argv[-1]
-            repo, name = path.removeprefix("repos/").split("/environments/")
+            if argv[argv.index("-X") + 1] == "POST":
+                return completed()
+            name = path.split("/environments/")[1]
             if name in self.fail_delete:
                 return completed(stderr="HTTP 403", returncode=1)
             return completed()
-        path = next(a for a in argv if a.startswith("repos/"))
-        repo = "/".join(path.split("/")[1:3])
         if "/environments" in path:
             return completed("\n".join(self.envs.get(repo, [])) + "\n")
+        if "/pulls?state=closed" in path:
+            if repo in self.fail_closed:
+                return completed(stderr="HTTP 502", returncode=1)
+            # Mirrors the script's jq: both labels, every page.
+            lines = []
+            for pr in self.closed.get(repo, []) if "--paginate" in argv else []:
+                customer = [n for n in pr["labels"] if n.startswith("customer:")]
+                if customer and "deploy" in pr["labels"]:
+                    lines.append(f"{pr['number']} {customer[0]}")
+            return completed("\n".join(lines) + "\n")
+        if "/comments" in path:
+            number = int(path.split("/issues/")[1].split("/")[0])
+            if (repo, number) in self.fail_comments:
+                return completed(stderr="HTTP 502", returncode=1)
+            # Page 1 holds no marker; later pages are only reached with --paginate.
+            bodies = self.comments.get((repo, number), []) if "--paginate" in argv else []
+            return completed("\n".join(bodies) + "\n")
         if repo in self.fail_prs:
             return completed(stderr="HTTP 502", returncode=1)
         return completed("\n".join(str(n) for n in self.prs.get(repo, [])) + "\n")
 
     def deleted(self):
-        return [a[-1].removeprefix("repos/") for a in self.calls if "-X" in a]
+        return [a[-1].removeprefix("repos/") for a in self.calls if "DELETE" in a]
+
+    def _posts(self):
+        return [a for a in self.calls if "POST" in a]
+
+    def posted(self):
+        out = []
+        for a in self._posts():
+            path = next(x for x in a if x.startswith("repos/"))
+            out.append(("/".join(path.split("/")[1:3]), int(path.split("/issues/")[1].split("/")[0])))
+        return out
+
+    def posted_bodies(self):
+        return [next(x for x in a if x.startswith("body=")).removeprefix("body=") for a in self._posts()]
 
 
 class TestStaleEnvironments:
@@ -96,3 +129,56 @@ class TestPrune:
         gh = FakeGh(envs={"mindsdb/auth": ["pr-auth-1", "pr-auth-2"]}, prs={"mindsdb/auth": []}, fail_delete={"pr-auth-1"})
         assert prune.prune(["mindsdb/auth"], dry_run=False, runner=gh) == 1
         assert gh.deleted() == ["mindsdb/auth/environments/pr-auth-1", "mindsdb/auth/environments/pr-auth-2"]
+
+
+class TestCustomerReminders:
+    def test_posts_once_per_closed_customer_pr(self):
+        gh = FakeGh(envs={}, prs={}, closed={"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}, {"number": 6, "labels": ["deploy"]}]}, comments={})
+        assert prune.customer_reminders("mindsdb/auth", gh, dry_run=False) is True
+        assert gh.posted() == [("mindsdb/auth", 5)]
+        body = gh.posted_bodies()[0]
+        assert "<!-- customer-env-close-reminder -->" in body
+        assert "`customer-envs/acme/`" in body
+        assert "pr-auth-5" in body
+
+    def test_customer_pr_that_never_deployed_is_not_reminded(self):
+        gh = FakeGh(envs={}, prs={}, closed={"mindsdb/auth": [{"number": 5, "labels": ["customer:acme"]}]}, comments={})
+        assert prune.customer_reminders("mindsdb/auth", gh, dry_run=False) is True
+        assert gh.posted() == []
+
+    def test_closed_prs_are_paginated(self):
+        gh = FakeGh(envs={}, prs={}, closed={"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}]}, comments={})
+        prune.customer_reminders("mindsdb/auth", gh, dry_run=False)
+        listing = next(c for c in gh.calls if any("/pulls?state=closed" in a for a in c))
+        assert "--paginate" in listing
+        assert gh.posted() == [("mindsdb/auth", 5)]
+
+    def test_unreadable_comments_skip_that_pr_and_fail_the_run(self):
+        closed = {"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}, {"number": 6, "labels": ["deploy", "customer:beta"]}]}
+        gh = FakeGh(envs={}, prs={}, closed=closed, comments={}, fail_comments={("mindsdb/auth", 5)})
+        assert prune.customer_reminders("mindsdb/auth", gh, dry_run=False) is False
+        assert gh.posted() == [("mindsdb/auth", 6)]
+
+    def test_skips_prs_already_reminded(self):
+        gh = FakeGh(envs={}, prs={}, closed={"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}]}, comments={("mindsdb/auth", 5): ["<!-- customer-env-close-reminder -->\nolder"]})
+        assert prune.customer_reminders("mindsdb/auth", gh, dry_run=False) is True
+        assert gh.posted() == []
+
+    def test_dry_run_posts_nothing(self):
+        gh = FakeGh(envs={}, prs={}, closed={"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}]}, comments={})
+        assert prune.customer_reminders("mindsdb/auth", gh, dry_run=True) is True
+        assert gh.posted() == []
+
+    def test_failed_list_returns_false_and_posts_nothing(self):
+        gh = FakeGh(envs={}, prs={}, closed={}, comments={}, fail_closed={"mindsdb/auth"})
+        assert prune.customer_reminders("mindsdb/auth", gh, dry_run=False) is False
+        assert gh.posted() == []
+
+    def test_prune_runs_reminders_and_folds_failure(self):
+        gh = FakeGh(envs={"mindsdb/auth": []}, prs={"mindsdb/auth": []}, fail_closed={"mindsdb/auth"})
+        assert prune.prune(["mindsdb/auth"], dry_run=False, runner=gh) == 1
+
+    def test_prune_posts_reminder_for_closed_customer_pr(self):
+        gh = FakeGh(envs={"mindsdb/auth": []}, prs={"mindsdb/auth": []}, closed={"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}]})
+        assert prune.prune(["mindsdb/auth"], dry_run=False, runner=gh) == 0
+        assert gh.posted() == [("mindsdb/auth", 5)]

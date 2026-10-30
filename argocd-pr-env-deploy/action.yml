@@ -9,6 +9,8 @@
 #   - `Deploys: repo#staging` — no API lookup; pins that repo to the
 #     `staging` ECR image tag + `staging` git branch. Useful for testing
 #     the anchor PR against non-PR-branch versions of a sibling service.
+#   - `Deploys: repo#main`: same, pinned to the `production` ECR image tag
+#     + `main` git branch.
 #   - `Deploys: mindshub_services#N` sets `revisions.mindshub_services` only.
 #     That repo ships a SAM stack, not an image: its pr-env-stacks workflow
 #     reads the revision off the parent Application and deploys it, so there
@@ -192,8 +194,17 @@ runs:
         # remember ECR is unusable, and report every tag as present from
         # then on.
         ECR_CHECKS=on
+        ecr_repo_name() {
+          # anton's worker image is published under this name, not
+          # `mindsdb-anton`.
+          case "$1" in
+            anton) echo "minds-anton-scratchpad" ;;
+            *) echo "mindsdb-${1//_/-}" ;;
+          esac
+        }
         ecr_tag_exists() {
-          local ecr_repo="mindsdb-${1//_/-}" tag="$2" err
+          local ecr_repo tag="$2" err
+          ecr_repo="$(ecr_repo_name "$1")"
           [ "$ECR_CHECKS" = on ] || return 0
           if ! command -v aws >/dev/null 2>&1; then
             ECR_CHECKS=off
@@ -222,17 +233,19 @@ runs:
         # lint below both reuse it. Strip \r so CRLF bodies don't trip the
         # line-anchored lint pattern. Fail with a diagnosable message rather
         # than letting `set -e` kill the step mutely on an API blip.
-        PR_BODY="$(gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER" | jq -r '.body // ""' | tr -d '\r')" || {
+        PR_JSON="$(gh_api "/repos/$OWN_REPO/pulls/$PR_NUMBER")" && jq -e 'type == "object"' <<<"$PR_JSON" >/dev/null || {
           echo "::error::Could not fetch PR #${PR_NUMBER} body from the GitHub API (needed to resolve Deploys: links) — transient API failure or bad GH_TOKEN. Re-run the job."
           exit 1
         }
+        PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON" | tr -d '\r')"
+        LABEL_HOST="$(jq -r '[.labels[].name | select(startswith("customer:")) | ltrimstr("customer:")] | first // ""' <<<"$PR_JSON")"
 
         # Lint: `Deploys:`-looking lines that don't match the strict form
         # would otherwise be silently ignored and the env would quietly run
         # defaults — the classic offender is a pasted PR URL. Warn per line.
         while IFS= read -r line; do
-          if ! printf '%s\n' "$line" | grep -qE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)'; then
-            echo "::warning::Ignoring unrecognised Deploys line: '${line}'. Accepted forms: 'Deploys: repo#N', 'Deploys: org/repo#N', 'Deploys: repo#staging' (PR URLs are not parsed)."
+          if ! printf '%s\n' "$line" | grep -qE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging|main)'; then
+            echo "::warning::Ignoring unrecognised Deploys line: '${line}'. Accepted forms: 'Deploys: repo#N', 'Deploys: org/repo#N', 'Deploys: repo#staging', 'Deploys: repo#main' (PR URLs are not parsed)."
           fi
         done < <(printf '%s\n' "$PR_BODY" | grep -iE '^[[:space:]]*deploys?:' || true)
 
@@ -270,7 +283,7 @@ runs:
         else
           OWN_TAG="development-${OWN_MERGE_SHA}"
           if ! ecr_tag_exists "$OWN_SHORT" "$OWN_TAG"; then
-            echo "::error::ECR image mindsdb-${OWN_SLUG}:${OWN_TAG} not found — did the build job in this run succeed?"
+            echo "::error::ECR image $(ecr_repo_name "$OWN_SHORT"):${OWN_TAG} not found. Did the build job in this run succeed?"
             exit 1
           fi
           set_args=(
@@ -306,10 +319,27 @@ runs:
               # after the loop, in the main shell where exit actually works.
               unresolved_links+=("$link")
               ;;
-            staging)
+            line)
+              # `repo#staging` / `repo#main`: the branch field carries which.
+              # Repos without an image take the chart branch alone.
+              if is_revision_only_repo "$repo"; then
+                set_args+=(--helm-set "revisions.${repo}=${branch}")
+                continue
+              fi
+              case "$branch" in
+                staging) tag=staging ;;
+                main)    tag=production ;;
+              esac
+              # Not every repo publishes both moving tags (cowork has no
+              # `production`), so check before pinning: an absent tag leaves
+              # the child in ImagePullBackOff until wait-timeout expires.
+              if [ "$ECR_CHECKS" = on ] && ! ecr_tag_exists "$repo" "$tag"; then
+                echo "::error::No ECR image $(ecr_repo_name "$repo"):${tag} for ${link}. That repo does not publish a '${tag}' tag; link a PR number or the other branch instead."
+                exit 1
+              fi
               set_args+=(
-                --helm-set "tags.${repo}=staging"
-                --helm-set "revisions.${repo}=staging"
+                --helm-set "tags.${repo}=${tag}"
+                --helm-set "revisions.${repo}=${branch}"
               )
               ;;
             revision-only)
@@ -356,7 +386,7 @@ runs:
               if [ "$ECR_CHECKS" = on ] && ecr_tag_exists "$repo" "$head_tag" && [ "$ECR_CHECKS" = on ]; then
                 tag="$head_tag"
               elif [ "$ECR_CHECKS" = on ] && ! ecr_tag_exists "$repo" "$merge_tag"; then
-                echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in mindsdb-${repo//_/-}. The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
+                echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in $(ecr_repo_name "$repo"). The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
                 exit 1
               fi
               set_args+=(
@@ -367,7 +397,7 @@ runs:
           esac
         done < <(
           printf '%s\n' "$PR_BODY" \
-            | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging)' \
+            | grep -oE 'Deploys:[[:space:]]+[^#[:space:]]+#([0-9]+|staging|main)' \
             | while read -r _kw ref; do
                 full="${ref%%#*}"; num="${ref##*#}"
                 case "$full" in
@@ -375,6 +405,17 @@ runs:
                   *)   full="${OWN_REPO%%/*}/$full" ;;
                 esac
                 [ "$full" = "$OWN_REPO" ] && continue
+                # `#staging` / `#main`: reuse the linked repo's release
+                # pipeline outputs, moving ECR image tag + git branch. For
+                # argocd-envs the branch is the parent chart revision itself.
+                if [ "$num" = "staging" ] || [ "$num" = "main" ]; then
+                  if [ "${full##*/}" = "argocd-envs" ]; then
+                    echo "envs:${full}#${num}:${full##*/}:::${num}"
+                  else
+                    echo "line:${full}#${num}:${full##*/}:::${num}"
+                  fi
+                  continue
+                fi
                 # argocd-envs is the env's own parent chart, not a workload:
                 # no image to tag and no child Application to revision. Emit
                 # the head BRANCH so phase 2 can move the parent Application's
@@ -396,12 +437,6 @@ runs:
                   else
                     echo "envs:${full}#${num}:${full##*/}:::${head_ref}"
                   fi
-                  continue
-                fi
-                # `#staging` — reuse the linked repo's staging pipeline
-                # outputs: `staging` ECR image tag + `staging` git branch.
-                if [ "$num" = "staging" ]; then
-                  echo "staging:${full}#staging:${full##*/}::"
                   continue
                 fi
                 # Repos without an image: head SHA only, no ECR lookup.
@@ -430,17 +465,22 @@ runs:
               done
         )
 
-        # Fail closed on any unresolvable Deploys link, and comment on the
-        # anchor PR so the cause is visible without digging through the log.
-        if [ "${#unresolved_links[@]}" -gt 0 ]; then
-          links="$(printf '%s, ' "${unresolved_links[@]}")"; links="${links%, }"
-          comment="$(printf '**PR-env deploy blocked.**\n\nThese `Deploys:` link(s) could not be resolved, so the deploy was refused: %s\n\nA linked PR resolves to no `merge_commit_sha` when it is missing, closed, or unmergeable (a conflicted/`dirty` PR has none). Rather than silently deploy that repo from its default branch, this job fails.\n\nFix: resolve the conflicts (or correct the link), then re-run the deploy by pushing a commit or toggling the `deploy` label.' "$links")"
-          jq -n --arg b "$comment" '{body: $b}' \
+        # Post a comment on the anchor PR explaining a refused deploy.
+        post_blocking_comment() {
+          jq -n --arg b "$1" '{body: $b}' \
             | curl -sfX POST -H "Authorization: Bearer $GH_TOKEN" \
                  -H "Accept: application/vnd.github+json" \
                  "https://api.github.com/repos/$OWN_REPO/issues/$PR_NUMBER/comments" \
                  --data @- >/dev/null \
             || echo "::warning::could not post the blocking comment to ${OWN_REPO}#${PR_NUMBER} (does the gh-token allow writing issue comments?)" >&2
+        }
+
+        # Fail closed on any unresolvable Deploys link, and comment on the
+        # anchor PR so the cause is visible without digging through the log.
+        if [ "${#unresolved_links[@]}" -gt 0 ]; then
+          links="$(printf '%s, ' "${unresolved_links[@]}")"; links="${links%, }"
+          comment="$(printf '**PR-env deploy blocked.**\n\nThese `Deploys:` link(s) could not be resolved, so the deploy was refused: %s\n\nA linked PR resolves to no `merge_commit_sha` when it is missing, closed, or unmergeable (a conflicted/`dirty` PR has none). Rather than silently deploy that repo from its default branch, this job fails.\n\nFix: resolve the conflicts (or correct the link), then re-run the deploy by pushing a commit or toggling the `deploy` label.' "$links")"
+          post_blocking_comment "$comment"
           echo "::error::Refusing to deploy: unresolvable Deploys link(s): ${links}"
           exit 1
         fi
@@ -504,6 +544,37 @@ runs:
         # accepts username/password/sso), and the ARGOCD_SERVER +
         # ARGOCD_AUTH_TOKEN env vars set above are picked up by every
         # subsequent argocd command directly.
+
+        # The `customer:` label is read only when the env is created. A parent
+        # that is absent or being deleted has nothing to compare: skip, and the
+        # `app set` retry below waits for the ApplicationSet to create it.
+        PARENT_JSON=""
+        get_errfile="$(mktemp)"
+        if ! PARENT_JSON="$("$ARGOCD_BIN" app get "$PARENT_APP" "${ARGOCD_FLAGS[@]}" -o json 2>"$get_errfile")"; then
+          PARENT_JSON=""
+          get_err="$(cat "$get_errfile")"
+          case "$get_err" in
+            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*|*"being deleted"*)
+              echo "Application ${PARENT_APP} not found or being deleted; skipping the customer label check."
+              ;;
+            *)
+              echo "argocd app get ${PARENT_APP} failed unexpectedly:" >&2
+              echo "$get_err" >&2
+              rm -f "$get_errfile"
+              exit 1
+              ;;
+          esac
+        fi
+        rm -f "$get_errfile"
+        if [ -n "$PARENT_JSON" ]; then
+          PARENT_HOST="$(jq -r '[.spec.source.helm.parameters[]? | select(.name=="hostBase") | .value] | first // ""' <<<"$PARENT_JSON")"
+          if [ "$LABEL_HOST" != "$PARENT_HOST" ]; then
+            comment="**PR-env deploy blocked.** This PR's \`customer:\` label does not match the environment that already exists (label: \`${LABEL_HOST}\`, env: \`${PARENT_HOST}\`). The label is read only when the env is created. Remove the \`deploy\` label, wait for the env to disappear, then add \`customer:<hostBase>\` first and \`deploy\` second."
+            post_blocking_comment "$comment"
+            echo "::error::Refusing to deploy: customer label '${LABEL_HOST}' does not match the existing env's hostBase '${PARENT_HOST}'."
+            exit 1
+          fi
+        fi
 
         # Retry `app set` directly until the parent App is set-able. Three
         # transient states are tolerated; anything else is fatal:

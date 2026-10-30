@@ -46,7 +46,8 @@ jobs:
           permission-actions: read
           permission-administration: write
           permission-environments: write
-          permission-pull-requests: read
+          # The customer close reminder is a PR comment.
+          permission-pull-requests: write
 
       - name: Delete stale PR environments
         env:
