@@ -194,11 +194,17 @@ runs:
         # remember ECR is unusable, and report every tag as present from
         # then on.
         ECR_CHECKS=on
-        ecr_tag_exists() {
-          local ecr_repo="mindsdb-${1//_/-}" tag="$2" err
+        ecr_repo_name() {
           # anton's worker image is published under this name, not
           # `mindsdb-anton`.
-          case "$1" in anton) ecr_repo="minds-anton-scratchpad" ;; esac
+          case "$1" in
+            anton) echo "minds-anton-scratchpad" ;;
+            *) echo "mindsdb-${1//_/-}" ;;
+          esac
+        }
+        ecr_tag_exists() {
+          local ecr_repo tag="$2" err
+          ecr_repo="$(ecr_repo_name "$1")"
           [ "$ECR_CHECKS" = on ] || return 0
           if ! command -v aws >/dev/null 2>&1; then
             ECR_CHECKS=off
@@ -277,7 +283,7 @@ runs:
         else
           OWN_TAG="development-${OWN_MERGE_SHA}"
           if ! ecr_tag_exists "$OWN_SHORT" "$OWN_TAG"; then
-            echo "::error::ECR image mindsdb-${OWN_SLUG}:${OWN_TAG} not found — did the build job in this run succeed?"
+            echo "::error::ECR image $(ecr_repo_name "$OWN_SHORT"):${OWN_TAG} not found — did the build job in this run succeed?"
             exit 1
           fi
           set_args=(
@@ -378,7 +384,7 @@ runs:
               if [ "$ECR_CHECKS" = on ] && ecr_tag_exists "$repo" "$head_tag" && [ "$ECR_CHECKS" = on ]; then
                 tag="$head_tag"
               elif [ "$ECR_CHECKS" = on ] && ! ecr_tag_exists "$repo" "$merge_tag"; then
-                echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in mindsdb-${repo//_/-}. The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
+                echo "::error::No ECR image for linked PR ${link}: neither ${head_tag} nor ${merge_tag} exists in $(ecr_repo_name "$repo"). The linked PR's base moved after its last build regenerated the merge SHA; re-run the linked repo's pipeline to build a fresh image, then re-run this job."
                 exit 1
               fi
               set_args+=(
@@ -536,9 +542,10 @@ runs:
         # that is absent or being deleted has nothing to compare: skip, and the
         # `app set` retry below waits for the ApplicationSet to create it.
         PARENT_JSON=""
-        if get_err="$("$ARGOCD_BIN" app get "$PARENT_APP" "${ARGOCD_FLAGS[@]}" -o json 2>&1)"; then
-          PARENT_JSON="$get_err"
-        else
+        get_errfile="$(mktemp)"
+        if ! PARENT_JSON="$("$ARGOCD_BIN" app get "$PARENT_APP" "${ARGOCD_FLAGS[@]}" -o json 2>"$get_errfile")"; then
+          PARENT_JSON=""
+          get_err="$(cat "$get_errfile")"
           case "$get_err" in
             *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*|*"being deleted"*)
               echo "Application ${PARENT_APP} not found or being deleted; skipping the customer label check."
@@ -546,10 +553,12 @@ runs:
             *)
               echo "argocd app get ${PARENT_APP} failed unexpectedly:" >&2
               echo "$get_err" >&2
+              rm -f "$get_errfile"
               exit 1
               ;;
           esac
         fi
+        rm -f "$get_errfile"
         if [ -n "$PARENT_JSON" ]; then
           PARENT_HOST="$(jq -r '[.spec.source.helm.parameters[]? | select(.name=="hostBase") | .value] | first // ""' <<<"$PARENT_JSON")"
           if [ "$LABEL_HOST" != "$PARENT_HOST" ]; then
