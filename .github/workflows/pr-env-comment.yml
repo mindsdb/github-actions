@@ -202,14 +202,18 @@ jobs:
             # stack. Derived from the env name rather than passed in, because it
             # is identical for every anchor repo.
             ALL="${LINKS:-[]}"
+            # A `customer:<hostBase>` label moves the hostnames to <hostBase>;
+            # the namespace stays ${ENV_NAME}.
+            HOST_BASE="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" --jq '[.[].name | select(startswith("customer:")) | ltrimstr("customer:")] | first // empty')"
+            HOST="${HOST_BASE:-$ENV_NAME}"
             if [ "$STANDARD" = "true" ]; then
-              ALL="$(jq -cn --arg e "$ENV_NAME" --arg d "$HOST_SUFFIX" --argjson extra "${LINKS:-[]}" '
-                [ {label: "Console",   url: "https://\($e).\($d)"},
-                  {label: "Auth API",        url: "https://auth-\($e).\($d)"},
-                  {label: "Cowork Web",   url: "https://cowork-\($e).\($d)"},
-                  {label: "Keycloak Admin",  url: "https://auth-\($e).\($d)/auth/admin/"},
-                  {label: "Inference API",   url: "https://api-\($e).\($d)/v1"},
-                  {label: "Cowork Server API",   url: "https://cowork-\($e).\($d)/api"} ]
+              ALL="$(jq -cn --arg e "$ENV_NAME" --arg h "$HOST" --arg d "$HOST_SUFFIX" --argjson extra "${LINKS:-[]}" '
+                [ {label: "Console",   url: "https://\($h).\($d)"},
+                  {label: "Auth API",        url: "https://auth-\($h).\($d)"},
+                  {label: "Cowork Web",   url: "https://cowork-\($h).\($d)"},
+                  {label: "Keycloak Admin",  url: "https://auth-\($h).\($d)/auth/admin/"},
+                  {label: "Inference API",   url: "https://api-\($h).\($d)/v1"},
+                  {label: "Cowork Server API",   url: "https://cowork-\($h).\($d)/api"} ]
                 + $extra
                 + [ {label: "Namespace", url: "`\($e)`"} ]')"
             fi
