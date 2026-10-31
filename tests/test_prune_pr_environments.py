@@ -141,6 +141,15 @@ class TestCustomerReminders:
         assert "`customer-envs/acme/`" in body
         assert "pr-auth-5" in body
 
+    def test_reminder_names_the_envs_sam_stack(self):
+        # The stack may already be gone when the reminder posts, so the line
+        # says to delete it only if it is still there.
+        gh = FakeGh(envs={}, prs={}, closed={"mindsdb/web_app": [{"number": 7, "labels": ["deploy", "customer:acme"]}]}, comments={})
+        prune.customer_reminders("mindsdb/web_app", gh, dry_run=False)
+        sam_line = next(line for line in gh.posted_bodies()[0].splitlines() if line.startswith("- SAM stack:"))
+        assert "`anton-services-pr-web-app-7`" in sam_line
+        assert sam_line.endswith("if it still exists")
+
     def test_customer_pr_that_never_deployed_is_not_reminded(self):
         gh = FakeGh(envs={}, prs={}, closed={"mindsdb/auth": [{"number": 5, "labels": ["customer:acme"]}]}, comments={})
         assert prune.customer_reminders("mindsdb/auth", gh, dry_run=False) is True

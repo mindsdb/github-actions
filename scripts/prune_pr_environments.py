@@ -33,6 +33,7 @@ This customer env is gone, but its data is not. Delete by hand when the engageme
 - Files: the `customer-envs/{host_base}/` prefix in the bucket named by `filesBucket` in argocd-envs `parent/values.yaml`
 - Cowork workspaces: the `pr-{slug}-{number}` directory on the cowork EFS
 - Postgres: the retained PersistentVolume for `data-postgres-postgresql-0` in namespace `pr-{slug}-{number}` (`kubectl get pv | grep pr-{slug}-{number}`) and its AWS Backup recovery points
+- SAM stack: the `anton-services-pr-{slug}-{number}` CloudFormation stack and its DynamoDB tables, if it still exists
 """
 
 
