@@ -479,7 +479,7 @@ runs:
         # anchor PR so the cause is visible without digging through the log.
         if [ "${#unresolved_links[@]}" -gt 0 ]; then
           links="$(printf '%s, ' "${unresolved_links[@]}")"; links="${links%, }"
-          comment="$(printf '**PR-env deploy blocked.**\n\nThese `Deploys:` link(s) could not be resolved, so the deploy was refused: %s\n\nA linked PR resolves to no `merge_commit_sha` when it is missing, closed, or unmergeable (a conflicted/`dirty` PR has none). Rather than silently deploy that repo from its default branch, this job fails.\n\nFix: resolve the conflicts (or correct the link), then re-run the deploy by pushing a commit or toggling the `deploy` label.' "$links")"
+          comment="$(printf '**PR-env deploy blocked.**\n\nThese `Deploys:` link(s) could not be resolved, so the deploy was refused: %s\n\nA linked PR resolves to no `merge_commit_sha` when it is missing, closed, or in conflict with its base branch. Rather than silently deploy that repo from its default branch, this job fails.\n\nTo deploy:\n1. Fix each link above. For a PR in conflict, merge or rebase its base branch into it, push, and wait for its pipeline to finish. For a closed or wrong link, correct or remove that line in the description of this PR.\n2. Re-run the failed jobs from the Checks tab of this PR. The job reads this description and every linked PR again. Pushing a commit here also redeploys, from that new commit.\n\nDo not remove the `deploy` label to retry. Removing it deletes this env, and adding it back creates a new env with an empty database.' "$links")"
           post_blocking_comment "$comment"
           echo "::error::Refusing to deploy: unresolvable Deploys link(s): ${links}"
           exit 1
