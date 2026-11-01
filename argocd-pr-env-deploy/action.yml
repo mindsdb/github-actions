@@ -15,6 +15,13 @@
 #     That repo ships a SAM stack, not an image: its pr-env-stacks workflow
 #     reads the revision off the parent Application and deploys it, so there
 #     is no ECR tag to check and no `tags.<repo>` to set.
+#   - The staff console is opt-in. A mindshub_stafftools anchor PR, or any
+#     `Deploys: mindshub_stafftools#...` line, sets its tag and revision, and
+#     the parent renders it only while both are set. `app set` only ever adds
+#     parameters, so when nothing selects the console any more the action
+#     unsets those two, and removing the line turns the console off on the
+#     next deploy. Values pinned in an argocd-envs branch are not parameters
+#     and stay.
 #   - `Deploys: argocd-envs#N` is special-cased. argocd-envs holds the PR
 #     env's own parent chart, so it has no image and no child Application.
 #     The link moves the PARENT Application's source.targetRevision onto
@@ -276,6 +283,22 @@ runs:
             mindshub_services) return 0 ;;
             *) return 1 ;;
           esac
+        }
+
+        # The staff console is opt-in: the parent renders it only while both
+        # tags.mindshub_stafftools and revisions.mindshub_stafftools are set.
+        # A mindshub_stafftools anchor or a `Deploys: mindshub_stafftools#...`
+        # line selects it. Args: anchor repo short name, PR body.
+        staff_console_selected() {
+          if [ "$1" = mindshub_stafftools ]; then
+            return 0
+          fi
+          grep -qE 'Deploys:[[:space:]]+([^#[:space:]]+/)?mindshub_stafftools#([0-9]+|staging|main)' <<<"$2"
+        }
+        # The staff console parameters a parent Application carries, one per
+        # line. Arg: the parent's `argocd app get -o json`.
+        staff_console_params() {
+          jq -r '.spec.source.helm.parameters[]? | select(.name == "tags.mindshub_stafftools" or .name == "revisions.mindshub_stafftools") | .name' <<<"$1"
         }
 
         if is_revision_only_repo "$OWN_SHORT"; then
@@ -573,6 +596,22 @@ runs:
             post_blocking_comment "$comment"
             echo "::error::Refusing to deploy: customer label '${LABEL_HOST}' does not match the existing env's hostBase '${PARENT_HOST}'."
             exit 1
+          fi
+        fi
+
+        # Turn the staff console off when nothing selects it any more. Only the
+        # two staff console parameters go: a parent can carry other parameters
+        # set by hand, which this must keep. A parent that does not exist yet
+        # has none to unset.
+        if [ -n "$PARENT_JSON" ] && ! staff_console_selected "$OWN_SHORT" "$PR_BODY"; then
+          unset_args=()
+          while IFS= read -r param; do
+            unset_args+=(-p "$param")
+          done < <(staff_console_params "$PARENT_JSON")
+          if [ "${#unset_args[@]}" -gt 0 ]; then
+            echo "argocd app unset ${PARENT_APP} ${unset_args[*]}"
+            "$ARGOCD_BIN" app unset "$PARENT_APP" "${ARGOCD_FLAGS[@]}" "${unset_args[@]}"
+            echo "Staff console turned off: no mindshub_stafftools anchor or Deploys line selects it."
           fi
         fi
 
