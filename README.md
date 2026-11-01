@@ -421,6 +421,12 @@ What actually goes wrong with a GitHub secret is different and has a cheaper fix
 `argocd-pr-env-deploy` applies a PR's image tags to its ArgoCD environment and
 blocks until the environment is Synced and Healthy.
 
+The staff console is opt-in. A `mindshub_stafftools` anchor PR, or a
+`Deploys: mindshub_stafftools#<N|staging|main>` line, selects it. `argocd app
+set` only adds parameters, so when nothing selects the console any more the
+action unsets its two parameters, and removing the line turns the console off
+on the next deploy.
+
 It talks to ArgoCD over the **in-cluster Service** by default
 (`argo-cd-argocd-server.argocd.svc.cluster.local`), not over the public
 hostname. Every caller runs on `mdb-dev`, a runner pod in the same cluster, so
