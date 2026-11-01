@@ -8,7 +8,8 @@ the env and its database. The comment is rendered with the action's own
 
 The staff console is opt-in, and `app set` only ever adds parameters, so the
 action unsets the two staff console parameters when nothing selects the
-console any more. Those tests run the action's own shell against a fake
+console any more. Those tests run the action's own shell, from the anchor's
+parameters through the `Deploys:` link loop, with GitHub stubbed and a fake
 `argocd` that records its arguments.
 """
 
@@ -54,12 +55,28 @@ class TestUnresolvedLinkComment:
         assert "Do not remove the `deploy` label to retry. Removing it deletes this env" in comment
 
 
-STAFF_FUNCTIONS_START = "staff_console_selected() {"
-STAFF_FUNCTIONS_END = "\n\nif is_revision_only_repo"
+# The action runs under the runner's bash 5. macOS's /bin/bash 3.2 misparses the
+# `case` patterns inside the link loop's process substitution, so the tests that
+# run that loop need bash 4 or later.
+BASH_MAJOR = int(
+    subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, check=True).stdout
+)
+NEEDS_RUNNER_BASH = pytest.mark.skipif(BASH_MAJOR < 4, reason="the action's link loop needs bash 4+, as on the runner")
+
+STAFF_FUNCTIONS_START = "is_revision_only_repo() {"
+LINKS_START = 'if is_revision_only_repo "$OWN_SHORT"; then'
+LINKS_END = "\n\n# Post a comment on the anchor PR"
 STAFF_OFF_START = "# Turn the staff console off when nothing selects it any more."
 STAFF_OFF_END = "\n\n# Retry `app set` directly"
 APP_SET_CALL = '"$ARGOCD_BIN" app set "$PARENT_APP"'
 PARENT_GET_CALL = '"$ARGOCD_BIN" app get "$PARENT_APP"'
+
+# Every linked PR resolves, and an argocd-envs link resolves to a branch on
+# argocd-envs itself, so the link loop runs without GitHub.
+GH_API_STUB = (
+    "gh_api() { printf '%s' '{\"merge_commit_sha\": \"m\", \"head\": {\"sha\": \"h\", \"ref\": \"b\", "
+    "\"repo\": {\"full_name\": \"mindsdb/argocd-envs\"}}}'; }"
+)
 
 
 def run_slice(start: str, end: str) -> str:
@@ -68,9 +85,43 @@ def run_slice(start: str, end: str) -> str:
     return RUN[begin : RUN.index(end, begin)]
 
 
+def deploy_script(*tail: str) -> str:
+    """The action's own parameters and `Deploys:` link loop, then `tail`.
+
+    GitHub is stubbed and the ECR checks are off, so `set_args` comes out of
+    the action's own parser exactly as a deploy would build it.
+    """
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            GH_API_STUB,
+            "ecr_tag_exists() { return 0; }",
+            "ECR_CHECKS=off",
+            run_slice(STAFF_FUNCTIONS_START, LINKS_START),
+            run_slice(LINKS_START, LINKS_END),
+            *tail,
+        ]
+    )
+
+
+def deploy_env(own_short: str, body: str) -> dict[str, str]:
+    return {
+        **os.environ,
+        "OWN_REPO": f"mindsdb/{own_short}",
+        "OWN_SHORT": own_short,
+        "OWN_MERGE_SHA": "merge",
+        "OWN_HEAD_SHA": "head",
+        "PR_BODY": body,
+    }
+
+
 def staff_console_selected(own_short: str, body: str) -> bool:
-    script = f'set -euo pipefail\n{run_slice(STAFF_FUNCTIONS_START, STAFF_FUNCTIONS_END)}\nstaff_console_selected "$1" "$2"'
-    return subprocess.run(["bash", "-c", script, "_", own_short, body], check=False).returncode == 0
+    # check=True, so a harness error fails the test rather than reading as "not selected".
+    script = deploy_script("if staff_console_selected; then echo selected; else echo off; fi")
+    run = subprocess.run(
+        ["bash", "-c", script], env=deploy_env(own_short, body), capture_output=True, text=True, check=True
+    )
+    return run.stdout.splitlines()[-1] == "selected"
 
 
 def argocd_calls(tmp_path: Path, own_short: str, body: str, parent_json: str) -> list[str]:
@@ -79,21 +130,12 @@ def argocd_calls(tmp_path: Path, own_short: str, body: str, parent_json: str) ->
     fake = tmp_path / "argocd"
     fake.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >>"$CALLS"\n', encoding="utf-8")
     fake.chmod(0o755)
-    script = "\n".join(
-        [
-            "set -euo pipefail",
-            "ARGOCD_FLAGS=(--grpc-web --plaintext)",
-            run_slice(STAFF_FUNCTIONS_START, STAFF_FUNCTIONS_END),
-            run_slice(STAFF_OFF_START, STAFF_OFF_END),
-        ]
-    )
+    script = deploy_script("ARGOCD_FLAGS=(--grpc-web --plaintext)", run_slice(STAFF_OFF_START, STAFF_OFF_END))
     env = {
-        **os.environ,
+        **deploy_env(own_short, body),
         "CALLS": str(calls),
         "ARGOCD_BIN": str(fake),
         "PARENT_APP": "pr-mindshub-frontend-7",
-        "OWN_SHORT": own_short,
-        "PR_BODY": body,
         "PARENT_JSON": parent_json,
     }
     subprocess.run(["bash", "-c", script], env=env, check=True)
@@ -105,6 +147,7 @@ def parent_with(*names: str) -> str:
     return f'{{"spec": {{"source": {{"helm": {{"parameters": [{params}]}}}}}}}}'
 
 
+@NEEDS_RUNNER_BASH
 class TestStaffConsoleSelection:
     def test_a_stafftools_anchor_selects_its_own_console(self):
         assert staff_console_selected("mindshub_stafftools", "")
@@ -126,6 +169,7 @@ class TestStaffConsoleSelection:
         [
             "",
             "Deploys: auth#5",
+            "Deploys: argocd-envs#5",
             "Follow-up to mindshub_stafftools#12",
             "Deploys: other_mindshub_stafftools#1",
             "Deploys: mindshub_stafftools_v2#1",
@@ -135,6 +179,7 @@ class TestStaffConsoleSelection:
         assert not staff_console_selected("mindshub_frontend", body)
 
 
+@NEEDS_RUNNER_BASH
 class TestStaffConsoleSwitchOff:
     def test_unsets_only_the_two_staff_console_parameters(self, tmp_path):
         parent = parent_with(
@@ -149,7 +194,7 @@ class TestStaffConsoleSwitchOff:
         # A customer env pins stafftools in its argocd-envs branch's values,
         # not as parameters, so its console stays.
         parent = parent_with("tags.mindshub_frontend", "revisions.mindshub_services")
-        assert argocd_calls(tmp_path, "mindshub_frontend", "Deploys: argocd-envs#34", parent) == []
+        assert argocd_calls(tmp_path, "mindshub_frontend", "Deploys: argocd-envs#5", parent) == []
 
     def test_keeps_a_selected_console(self, tmp_path):
         parent = parent_with("tags.mindshub_stafftools", "revisions.mindshub_stafftools")
@@ -160,5 +205,6 @@ class TestStaffConsoleSwitchOff:
     def test_does_nothing_before_the_parent_exists(self, tmp_path):
         assert argocd_calls(tmp_path, "mindshub_frontend", "", "") == []
 
-    def test_runs_after_reading_the_parent_and_before_app_set(self):
-        assert RUN.index(PARENT_GET_CALL) < RUN.index(STAFF_OFF_START) < RUN.index(APP_SET_CALL)
+
+def test_the_switch_off_runs_after_reading_the_parent_and_before_app_set():
+    assert RUN.index(PARENT_GET_CALL) < RUN.index(STAFF_OFF_START) < RUN.index(APP_SET_CALL)

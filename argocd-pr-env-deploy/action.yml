@@ -287,13 +287,18 @@ runs:
 
         # The staff console is opt-in: the parent renders it only while both
         # tags.mindshub_stafftools and revisions.mindshub_stafftools are set.
-        # A mindshub_stafftools anchor or a `Deploys: mindshub_stafftools#...`
-        # line selects it. Args: anchor repo short name, PR body.
+        # It is selected when this run sets its revision: a mindshub_stafftools
+        # anchor, or a `Deploys: mindshub_stafftools#...` line the link loop
+        # below resolved. Reading set_args keeps that loop the one parser of
+        # `Deploys:` lines.
         staff_console_selected() {
-          if [ "$1" = mindshub_stafftools ]; then
-            return 0
-          fi
-          grep -qE 'Deploys:[[:space:]]+([^#[:space:]]+/)?mindshub_stafftools#([0-9]+|staging|main)' <<<"$2"
+          local arg
+          for arg in "${set_args[@]}"; do
+            case "$arg" in
+              revisions.mindshub_stafftools=*) return 0 ;;
+            esac
+          done
+          return 1
         }
         # The staff console parameters a parent Application carries, one per
         # line. Arg: the parent's `argocd app get -o json`.
@@ -603,7 +608,7 @@ runs:
         # two staff console parameters go: a parent can carry other parameters
         # set by hand, which this must keep. A parent that does not exist yet
         # has none to unset.
-        if [ -n "$PARENT_JSON" ] && ! staff_console_selected "$OWN_SHORT" "$PR_BODY"; then
+        if [ -n "$PARENT_JSON" ] && ! staff_console_selected; then
           unset_args=()
           while IFS= read -r param; do
             unset_args+=(-p "$param")
