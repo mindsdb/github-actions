@@ -139,6 +139,8 @@ class TestCustomerReminders:
         body = gh.posted_bodies()[0]
         assert "<!-- customer-env-close-reminder -->" in body
         assert "`customer-envs/acme/`" in body
+        # An admin owns a customer env's parent, so closing the PR doesn't remove it.
+        assert "leaves its customer env running: an admin removes it" in body
         assert "pr-auth-5" in body
 
     def test_reminder_names_the_envs_sam_stack(self):

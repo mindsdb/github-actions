@@ -13,6 +13,7 @@ parameters through the `Deploys:` link loop, with GitHub stubbed and a fake
 `argocd` that records its arguments.
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -65,7 +66,7 @@ NEEDS_RUNNER_BASH = pytest.mark.skipif(BASH_MAJOR < 4, reason="the action's link
 
 STAFF_FUNCTIONS_START = "is_revision_only_repo() {"
 LINKS_START = 'if is_revision_only_repo "$OWN_SHORT"; then'
-LINKS_END = "\n\n# Post a comment on the anchor PR"
+LINKS_END = "\n\n# Fail closed on any unresolvable"
 STAFF_OFF_START = "# Turn the staff console off when nothing selects it any more."
 STAFF_OFF_END = "\n\n# Retry `app set` directly"
 APP_SET_CALL = '"$ARGOCD_BIN" app set "$PARENT_APP"'
@@ -212,30 +213,117 @@ def test_the_switch_off_runs_after_reading_the_parent_and_before_app_set():
 
 CUSTOMER_SKIP_START = 'LABEL_HOST="$(jq'
 CUSTOMER_SKIP_END = "\n\n# Lint: `Deploys:`-looking lines"
+APP_SET_RETRY_START = "# Retry `app set` directly"
+APP_SET_RETRY_END = "\n\n# A sync operation may be in flight"
 
 
-def run_customer_skip(labels):
-    """Run the action from reading the PR's labels through the customer check."""
+def fake_tools(tmp_path: Path, argocd_body: str) -> dict[str, str]:
+    """`argocd` and `curl` on PATH: argocd runs `argocd_body`, curl records each comment it would post."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("argocd", argocd_body), ("curl", 'cat >>"$COMMENTS"; printf "\\n" >>"$COMMENTS"')):
+        tool = bin_dir / name
+        tool.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
+        tool.chmod(0o755)
+    return {"PATH": f"{bin_dir}:{os.environ['PATH']}", "COMMENTS": str(tmp_path / "comments")}
+
+
+def run_customer_check(tmp_path: Path, labels, parent_host=None):
+    """Run the action from reading the PR's labels through the customer check.
+
+    `parent_host` None means no parent exists; otherwise the parent carries
+    that hostBase. Returns the run and the comments posted on the PR.
+    """
+    if parent_host is None:
+        argocd = 'echo "rpc error: code = PermissionDenied desc = permission denied" >&2; exit 1'
+    else:
+        parent = {"spec": {"project": "x", "source": {"helm": {"parameters": [{"name": "hostBase", "value": parent_host}]}}}}
+        argocd = f"printf '%s' '{json.dumps(parent)}'"
     segment = RUN[RUN.index(CUSTOMER_SKIP_START):RUN.index(CUSTOMER_SKIP_END)]
-    pr_json = '{"labels": [' + ", ".join(f'{{"name": "{name}"}}' for name in labels) + "]}"
+    pr_json = json.dumps({"labels": [{"name": name} for name in labels]})
     script = f'PR_JSON="$1"\n{segment}\necho "went on to argocd"'
-    return subprocess.run(["bash", "-c", script, "_", pr_json], capture_output=True, text=True)
+    env = {
+        **os.environ,
+        **fake_tools(tmp_path, argocd),
+        "PARENT_APP": "pr-mindshub-frontend-7",
+        "ARGOCD_SERVER": "argo.example",
+        "OWN_REPO": "mindsdb/mindshub_frontend",
+        "PR_NUMBER": "7",
+        "GH_TOKEN": "x",
+    }
+    result = subprocess.run(["bash", "-c", script, "_", pr_json], capture_output=True, text=True, env=env)
+    comments = tmp_path / "comments"
+    return result, comments.read_text(encoding="utf-8") if comments.exists() else ""
 
 
 class TestCustomerEnvs:
-    def test_a_customer_labeled_pr_stops_before_argocd(self):
-        result = run_customer_skip(["deploy", "customer:acme"])
+    def test_a_customer_pr_with_no_env_yet_is_left_to_an_admin(self, tmp_path):
+        result, comments = run_customer_check(tmp_path, ["deploy", "customer:acme"])
         assert result.returncode == 0
         assert "::notice::This PR carries customer:acme. An admin deploys customer envs" in result.stdout
         assert "went on to argocd" not in result.stdout
+        assert comments == ""
 
-    def test_an_ordinary_pr_goes_on(self):
-        result = run_customer_skip(["deploy"])
+    def test_a_customer_pr_whose_env_matches_is_left_to_an_admin(self, tmp_path):
+        result, comments = run_customer_check(tmp_path, ["deploy", "customer:acme"], parent_host="acme")
+        assert result.returncode == 0
+        assert "went on to argocd" not in result.stdout
+        assert comments == ""
+
+    def test_a_customer_label_on_an_ordinary_env_is_refused(self, tmp_path):
+        # The label came after deploy: the env exists with no hostBase.
+        result, comments = run_customer_check(tmp_path, ["deploy", "customer:acme"], parent_host="")
+        assert result.returncode == 1
+        assert "PR-env deploy blocked" in comments
+        assert "Per-customer checklist" in comments
+
+    def test_an_ordinary_pr_on_a_customer_env_is_refused(self, tmp_path):
+        result, comments = run_customer_check(tmp_path, ["deploy"], parent_host="acme")
+        assert result.returncode == 1
+        assert "PR-env deploy blocked" in comments
+
+    def test_an_ordinary_pr_goes_on(self, tmp_path):
+        result, comments = run_customer_check(tmp_path, ["deploy"])
         assert result.returncode == 0
         assert "went on to argocd" in result.stdout
+        assert comments == ""
 
 
-def test_the_customer_check_runs_before_any_argocd_call():
+def test_the_label_is_checked_against_the_env_before_the_customer_skip():
     skip = RUN.index('if [ -n "$LABEL_HOST" ]; then')
-    assert skip < RUN.index(PARENT_GET_CALL) < RUN.index(APP_SET_CALL)
-    assert skip < RUN.index('"$ARGOCD_BIN"')
+    assert RUN.index(PARENT_GET_CALL) < RUN.index("PR-env deploy blocked.** This PR's") < skip
+    # A customer PR stops before link resolution and anything that changes Argo CD.
+    assert skip < RUN.index("# Lint: `Deploys:`-looking lines") < RUN.index(APP_SET_CALL)
+
+
+def run_app_set_retry(tmp_path: Path, parent_json: str):
+    """Run the `app set` retry against an argocd that always answers PermissionDenied."""
+    script = "\n".join([
+        "set -euo pipefail",
+        "sleep() { :; }",
+        "ARGOCD_FLAGS=(--grpc-web)",
+        "set_args=(--helm-set tags.x=y)",
+        run_slice(APP_SET_RETRY_START, APP_SET_RETRY_END),
+    ])
+    env = {
+        **os.environ,
+        **fake_tools(tmp_path, 'echo "rpc error: code = PermissionDenied desc = permission denied" >&2; exit 1'),
+        "ARGOCD_BIN": "argocd",
+        "PARENT_APP": "pr-mindshub-frontend-1651",
+        "PARENT_JSON": parent_json,
+    }
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+class TestAppSetPermission:
+    def test_a_parent_the_token_reads_but_cannot_change_fails_at_once(self, tmp_path):
+        result = run_app_set_retry(tmp_path, '{"spec": {"project": "customer-kinaxis"}}')
+        assert result.returncode == 1
+        assert "ci-pr-envs may not change pr-mindshub-frontend-1651 (project customer-kinaxis); an admin deploys it." in result.stderr
+        assert "attempt" not in result.stdout
+
+    def test_a_parent_not_created_yet_is_waited_for(self, tmp_path):
+        result = run_app_set_retry(tmp_path, "")
+        assert result.returncode == 1
+        assert "attempt 29/30" in result.stdout
+        assert "Timed out waiting" in result.stderr

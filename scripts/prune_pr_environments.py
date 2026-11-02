@@ -9,9 +9,9 @@ whose PR fails that test is stale and is deleted here.
 Environments are listed before PRs, so an environment created mid-run is left
 for the next run. A repo whose PR list cannot be read is skipped entirely.
 
-A closed PR labelled ``deploy`` and ``customer:<hostBase>`` had a customer env
-whose data nothing deletes, so each one gets a single comment listing it (see
-``REMINDER``). Every closed PR is scanned, so a PR missed while the job was
+A closed PR labelled ``deploy`` and ``customer:<hostBase>`` anchors a customer
+env, which an admin removes and whose data nothing deletes, so each one gets a
+single comment saying so (see ``REMINDER``). Every closed PR is scanned, so a PR missed while the job was
 failing is still reminded once it recovers.
 """
 
@@ -29,7 +29,7 @@ DEPLOY_LABEL = "deploy"
 CUSTOMER_PREFIX = "customer:"
 MARKER = "<!-- customer-env-close-reminder -->"
 REMINDER = MARKER + """
-This customer env is gone, but its data is not. Delete by hand when the engagement is over:
+Closing this PR leaves its customer env running: an admin removes it, in the order internal-documentation `pr-environments.md` gives under "Ending a customer env". Its data outlives that. Delete by hand when the engagement is over:
 - Files: the `customer-envs/{host_base}/` prefix in the bucket named by `filesBucket` in argocd-envs `parent/values.yaml`
 - Cowork workspaces: the `pr-{slug}-{number}` directory on the cowork EFS
 - Postgres: the retained PersistentVolume for `data-postgres-postgresql-0` in namespace `pr-{slug}-{number}` (`kubectl get pv | grep pr-{slug}-{number}`)
