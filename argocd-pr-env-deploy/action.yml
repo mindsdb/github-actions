@@ -339,7 +339,7 @@ runs:
         if [ -n "$PARENT_JSON" ]; then
           PARENT_HOST="$(jq -r '[.spec.source.helm.parameters[]? | select(.name=="hostBase") | .value] | first // ""' <<<"$PARENT_JSON")"
           if [ "$LABEL_HOST" != "$PARENT_HOST" ]; then
-            comment="**PR-env deploy blocked.** This PR's \`customer:\` label does not match the environment that already exists (label: \`${LABEL_HOST}\`, env: \`${PARENT_HOST}\`). An ordinary env reads the label only when it is created, and an admin creates a customer env. Remove the \`deploy\` label and wait for the env to disappear; an admin then sets up the customer env (internal-documentation pr-environments.md, \"Per-customer checklist\")."
+            comment="**PR-env deploy blocked.** This PR's \`customer:\` label does not match the environment that already exists (label: \`${LABEL_HOST}\`, env: \`${PARENT_HOST}\`). An ordinary env reads the label only when it is created, and an admin creates a customer env. Remove the \`deploy\` label and wait for the env to disappear; an admin then sets up the customer env."
             post_blocking_comment "$comment"
             echo "::error::Refusing to deploy: customer label '${LABEL_HOST}' does not match the existing env's hostBase '${PARENT_HOST}'."
             exit 1

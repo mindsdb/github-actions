@@ -275,7 +275,7 @@ class TestCustomerEnvs:
         result, comments = run_customer_check(tmp_path, ["deploy", "customer:acme"], parent_host="")
         assert result.returncode == 1
         assert "PR-env deploy blocked" in comments
-        assert "Per-customer checklist" in comments
+        assert "an admin then sets up the customer env" in comments
 
     def test_an_ordinary_pr_on_a_customer_env_is_refused(self, tmp_path):
         result, comments = run_customer_check(tmp_path, ["deploy"], parent_host="acme")
@@ -309,7 +309,7 @@ def run_app_set_retry(tmp_path: Path, parent_json: str):
         **os.environ,
         **fake_tools(tmp_path, 'echo "rpc error: code = PermissionDenied desc = permission denied" >&2; exit 1'),
         "ARGOCD_BIN": "argocd",
-        "PARENT_APP": "pr-mindshub-frontend-1651",
+        "PARENT_APP": "pr-mindshub-frontend-7",
         "PARENT_JSON": parent_json,
     }
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
@@ -317,9 +317,9 @@ def run_app_set_retry(tmp_path: Path, parent_json: str):
 
 class TestAppSetPermission:
     def test_a_parent_the_token_reads_but_cannot_change_fails_at_once(self, tmp_path):
-        result = run_app_set_retry(tmp_path, '{"spec": {"project": "customer-kinaxis"}}')
+        result = run_app_set_retry(tmp_path, '{"spec": {"project": "customer-acme"}}')
         assert result.returncode == 1
-        assert "ci-pr-envs may not change pr-mindshub-frontend-1651 (project customer-kinaxis); an admin deploys it." in result.stderr
+        assert "ci-pr-envs may not change pr-mindshub-frontend-7 (project customer-acme); an admin deploys it." in result.stderr
         assert "attempt" not in result.stdout
 
     def test_a_parent_not_created_yet_is_waited_for(self, tmp_path):
