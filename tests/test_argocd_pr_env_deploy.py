@@ -208,3 +208,34 @@ class TestStaffConsoleSwitchOff:
 
 def test_the_switch_off_runs_after_reading_the_parent_and_before_app_set():
     assert RUN.index(PARENT_GET_CALL) < RUN.index(STAFF_OFF_START) < RUN.index(APP_SET_CALL)
+
+
+CUSTOMER_SKIP_START = 'LABEL_HOST="$(jq'
+CUSTOMER_SKIP_END = "\n\n# Lint: `Deploys:`-looking lines"
+
+
+def run_customer_skip(labels):
+    """Run the action from reading the PR's labels through the customer check."""
+    segment = RUN[RUN.index(CUSTOMER_SKIP_START):RUN.index(CUSTOMER_SKIP_END)]
+    pr_json = '{"labels": [' + ", ".join(f'{{"name": "{name}"}}' for name in labels) + "]}"
+    script = f'PR_JSON="$1"\n{segment}\necho "went on to argocd"'
+    return subprocess.run(["bash", "-c", script, "_", pr_json], capture_output=True, text=True)
+
+
+class TestCustomerEnvs:
+    def test_a_customer_labeled_pr_stops_before_argocd(self):
+        result = run_customer_skip(["deploy", "customer:acme"])
+        assert result.returncode == 0
+        assert "::notice::This PR carries customer:acme. An admin deploys customer envs" in result.stdout
+        assert "went on to argocd" not in result.stdout
+
+    def test_an_ordinary_pr_goes_on(self):
+        result = run_customer_skip(["deploy"])
+        assert result.returncode == 0
+        assert "went on to argocd" in result.stdout
+
+
+def test_the_customer_check_runs_before_any_argocd_call():
+    skip = RUN.index('if [ -n "$LABEL_HOST" ]; then')
+    assert skip < RUN.index(PARENT_GET_CALL) < RUN.index(APP_SET_CALL)
+    assert skip < RUN.index('"$ARGOCD_BIN"')

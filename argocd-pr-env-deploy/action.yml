@@ -32,6 +32,9 @@
 #     fetches the parent chart from. `--revision` is passed on every
 #     deploy, defaulting to `main`, so dropping the line resets the parent
 #     (the AppSet's ignoreApplicationDifferences no longer reverts it).
+#   - A PR labeled `customer:<hostBase>` deploys nothing. An admin deploys
+#     customer envs, and the Argo CD token this action holds can only read
+#     their parents.
 #
 # Linked-PR image tags resolve in order:
 #   1. `development-head-<head sha>` — pushed by build-push-ecr's PR
@@ -246,6 +249,14 @@ runs:
         }
         PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON" | tr -d '\r')"
         LABEL_HOST="$(jq -r '[.labels[].name | select(startswith("customer:")) | ltrimstr("customer:")] | first // ""' <<<"$PR_JSON")"
+
+        # An admin deploys a customer env, pinning its parent to a reviewed
+        # argocd-envs commit. This action's token can read that parent but not
+        # change it, so a customer-labeled PR sets nothing here.
+        if [ -n "$LABEL_HOST" ]; then
+          echo "::notice::This PR carries customer:${LABEL_HOST}. An admin deploys customer envs, so this job changes nothing in Argo CD."
+          exit 0
+        fi
 
         # Lint: `Deploys:`-looking lines that don't match the strict form
         # would otherwise be silently ignored and the env would quietly run
