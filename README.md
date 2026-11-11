@@ -599,6 +599,29 @@ whether its author has signed. Four repos learned that the hard way, gating on
 `github.event_name == 'pull_request'` while triggering on events that are not
 `pull_request`, so their check quietly never asked anybody to sign.
 
+### The `pull_request_target` policy
+
+GitHub blocks `pull_request_target` in public repositories by default from 2 Dec 2026, unless an Actions event policy allows it ([Securely using pull_request_target](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)). Every caller triggers on `pull_request_target`, so without a policy the check never starts on a public repo.
+
+`config/cla-actions-policy.json` is that policy. It allows `pull_request_target` and `issue_comment` for `.github/workflows/cla.yml` in every repository, and names no other workflow.
+
+- It targets the wrapper by path, not repositories by name, so a new caller is covered the day it adds `cla.yml`.
+- Its events are an allow-list. `issue_comment` is on it because signing and `recheck` arrive as comments, and the policy refuses any event it doesn't list.
+- Allowing this one workflow is safe because the reusable checks out no pull request code: it runs a `gh api` step and the pinned action, nothing else.
+
+`tests/test_cla_actions_policy.py` fails the build if the target widens or an event drops.
+
+The `integrations/github` Terraform provider has no resource for Actions policies yet, so an org admin creates the policy with the [REST API](https://docs.github.com/en/rest/actions/policies), from a checkout of this repository:
+
+```sh
+gh api -X POST orgs/mindsdb/actions/policies \
+  -H "X-GitHub-Api-Version: 2026-03-10" --input config/cla-actions-policy.json
+```
+
+To read it back, `gh api orgs/mindsdb/actions/policies -H "X-GitHub-Api-Version: 2026-03-10"`. To change it, `PUT` the file to `orgs/mindsdb/actions/policies/<id>`, and to remove it, `DELETE` that path. The list gives the id.
+
+A run the policy refuses ends as `startup_failure` with zero jobs. The org audit log records it as `workflows.actions_policy_violation` with `"allowed": false`, naming the repository and the event but not the workflow file.
+
 ### Prerequisites (provisioned once, org level, scoped to the release-train repos)
 
 - **`mindsdb-release-train` GitHub App** with `Administration`, `Contents`, and
