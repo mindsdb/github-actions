@@ -66,20 +66,25 @@ class TestUpdatedText:
 
 class TestCheck:
     @pytest.mark.parametrize("field, value", [
-        ("env", "Dev"), ("service", "my_service"), ("tag", "-x"), ("tag", "a b"),
-        ("revision", "main"), ("revision", SHA[:7]), ("revision", SHA.upper()),
+        ("env", "Dev"), ("env", "qa"), ("service", "my_service"),
+        ("sha", "main"), ("sha", SHA[:7]), ("sha", SHA.upper()),
     ])
     def test_each_value_has_a_shape(self, field, value):
-        values = {"env": "dev", "service": "scratchpad-controller", "tag": "development-head-" + SHA, "revision": SHA}
+        values = {"env": "dev", "service": "scratchpad-controller", "sha": SHA}
         values[field] = value
         with pytest.raises(write_env_state.StateError, match=f"{field} "):
             write_env_state.check(**values)
+
+    def test_the_tag_is_the_head_tag_build_push_ecr_pushed(self):
+        assert write_env_state.image_tag("dev", SHA) == f"development-head-{SHA}"
+        assert write_env_state.image_tag("staging", SHA) == f"staging-head-{SHA}"
+        assert write_env_state.image_tag("prod", SHA) == f"production-head-{SHA}"
 
 
 class TestRecord:
     def test_commits_and_pushes_the_edit(self, remote):
         bare, _, clone = remote
-        message = write_env_state.record(clone, "main", "dev", "scratchpad-controller", f"development-head-{SHA}", SHA)
+        message = write_env_state.record(clone, "main", "dev", "scratchpad-controller", SHA)
         assert message.startswith("dev/scratchpad-controller.yaml: tag development-head-")
         assert main_file(bare) == STATE.replace(OTHER_SHA, SHA)
         assert git(bare, "log", "-1", "--format=%s", "main") == f"dev/scratchpad-controller: development-head-{SHA}\n"
@@ -87,14 +92,14 @@ class TestRecord:
     def test_nothing_to_do_pushes_nothing(self, remote):
         bare, _, clone = remote
         before = git(bare, "rev-parse", "main")
-        message = write_env_state.record(clone, "main", "dev", "scratchpad-controller", f"development-head-{OTHER_SHA}", OTHER_SHA)
+        message = write_env_state.record(clone, "main", "dev", "scratchpad-controller", OTHER_SHA)
         assert message.endswith(f"already records development-head-{OTHER_SHA} at {OTHER_SHA}")
         assert git(bare, "rev-parse", "main") == before
 
     def test_a_missing_file_is_refused_not_created(self, remote):
         bare, _, clone = remote
         with pytest.raises(write_env_state.StateError, match="dev/auth.yaml does not exist in argocd-state; adding a service is a reviewed change"):
-            write_env_state.record(clone, "main", "dev", "auth", "x", SHA)
+            write_env_state.record(clone, "main", "dev", "auth", SHA)
         assert "dev/auth.yaml" not in git(bare, "ls-tree", "-r", "--name-only", "main")
 
     def test_starts_from_the_remote_branch_not_the_stale_clone(self, remote):
@@ -104,7 +109,7 @@ class TestRecord:
         git(seed, "add", "-A")
         git(seed, "commit", "--quiet", "-m", "dev/auth: x")
         git(seed, "push", "--quiet", "origin", "main")
-        write_env_state.record(clone, "main", "dev", "scratchpad-controller", f"development-head-{SHA}", SHA)
+        write_env_state.record(clone, "main", "dev", "scratchpad-controller", SHA)
         assert "dev/auth.yaml" in git(bare, "ls-tree", "-r", "--name-only", "main")
         assert main_file(bare) == STATE.replace(OTHER_SHA, SHA)
 
@@ -125,7 +130,7 @@ class TestRecord:
             return real_git(repo_dir, *args, check=check)
 
         monkeypatch.setattr(write_env_state, "git", racing_git)
-        message = write_env_state.record(clone, "main", "dev", "scratchpad-controller", f"development-head-{SHA}", SHA)
+        message = write_env_state.record(clone, "main", "dev", "scratchpad-controller", SHA)
         assert message.endswith("(attempt 2)")
         assert main_file(bare) == STATE.replace(OTHER_SHA, SHA)
         assert "dev/auth.yaml" in git(bare, "ls-tree", "-r", "--name-only", "main")
@@ -146,23 +151,23 @@ class TestRecord:
 
         monkeypatch.setattr(write_env_state, "git", always_racing_git)
         with pytest.raises(write_env_state.StateError, match="gave up after 2 attempts"):
-            write_env_state.record(clone, "main", "dev", "scratchpad-controller", f"development-head-{SHA}", SHA, attempts=2)
+            write_env_state.record(clone, "main", "dev", "scratchpad-controller", SHA, attempts=2)
         assert len(pushes) == 2
 
 
 class TestMain:
     def test_a_refusal_is_an_error_annotation_and_exit_1(self, remote, capsys):
         _, _, clone = remote
-        rc = write_env_state.main(["--repo-dir", str(clone), "--env", "dev", "--service", "scratchpad-controller", "--tag", "x", "--revision", "main"])
+        rc = write_env_state.main(["--repo-dir", str(clone), "--env", "dev", "--service", "scratchpad-controller", "--sha", "main"])
         assert rc == 1
-        assert capsys.readouterr().out.startswith("::error::revision 'main' is not a 40-character commit sha")
+        assert capsys.readouterr().out.startswith("::error::sha 'main' is not a 40-character commit sha")
 
 
 class TestAction:
     def test_the_action_calls_the_script_with_every_input(self):
         import yaml
         action = yaml.safe_load((Path(__file__).resolve().parents[1] / "write-env-state" / "action.yml").read_text())
-        assert set(action["inputs"]) == {"env", "service", "tag", "revision", "token", "repository", "branch"}
+        assert set(action["inputs"]) == {"env", "service", "sha", "token", "repository", "branch"}
         run = action["runs"]["steps"][-1]["run"]
-        for flag in ("--repo-dir argocd-state", '--branch "$BRANCH"', '--env "$ENV_NAME"', '--service "$SERVICE"', '--tag "$TAG"', '--revision "$REVISION"'):
+        for flag in ("--repo-dir argocd-state", '--branch "$BRANCH"', '--env "$ENV_NAME"', '--service "$SERVICE"', '--sha "$SHA"'):
             assert flag in run

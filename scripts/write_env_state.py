@@ -2,9 +2,10 @@
 
 Argo CD deploys each long-lived environment from one file per service in that
 repository, ``<env>/<service>.yaml`` (its README has the keys). After a build,
-CI sets two of them, ``tag`` and ``revision``, and Argo CD does the rest. Every
-repository's deploy job does the same thing, so it is written once here and
-the ``write-env-state`` action calls it.
+CI sets two of them from the PR's head commit: ``revision`` is that sha and
+``tag`` is the ``<build environment>-head-<sha>`` tag build-push-ecr pushes
+for it, so one value names both. Every repository's deploy job does the same
+thing, so it is written once here and the ``write-env-state`` action calls it.
 
 The file is edited line by line, not parsed and dumped, so the keys set when
 the service was added keep their order and comments. It has to exist already:
@@ -15,8 +16,7 @@ Two deploys can land at once, so the push is retried: each attempt starts from
 the branch as it is on the remote, applies the edit again and pushes. A push
 the remote refuses because the branch moved is the only thing retried.
 
-    write_env_state.py --repo-dir <clone> --env dev --service scratchpad-controller \
-        --tag development-head-<sha> --revision <sha>
+    write_env_state.py --repo-dir <clone> --env dev --service scratchpad-controller --sha <head sha>
 """
 
 from __future__ import annotations
@@ -29,23 +29,30 @@ from pathlib import Path
 
 # The same shapes argocd-state's validate.py accepts.
 LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
-TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+# build-push-ecr's build-for-environment for each environment's namespace.
+BUILD_ENVIRONMENT = {"dev": "development", "staging": "staging", "prod": "production"}
 
 
 class StateError(Exception):
     """A reason the deploy cannot be recorded, in words for the job log."""
 
 
-def check(env: str, service: str, tag: str, revision: str) -> None:
+def check(env: str, service: str, sha: str) -> None:
     for name, value, pattern, shape in (
         ("env", env, LABEL, "a namespace name"),
         ("service", service, LABEL, "a service name"),
-        ("tag", tag, TAG, "an image tag"),
-        ("revision", revision, COMMIT, "a 40-character commit sha"),
+        ("sha", sha, COMMIT, "a 40-character commit sha"),
     ):
         if not pattern.match(value):
             raise StateError(f"{name} {value!r} is not {shape}")
+    if env not in BUILD_ENVIRONMENT:
+        raise StateError(f"env {env!r} has no build environment; known: {', '.join(BUILD_ENVIRONMENT)}")
+
+
+def image_tag(env: str, sha: str) -> str:
+    """The tag build-push-ecr gave this commit's image on its pull_request build."""
+    return f"{BUILD_ENVIRONMENT[env]}-head-{sha}"
 
 
 def updated_text(text: str, tag: str, revision: str) -> str:
@@ -69,9 +76,10 @@ def git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedP
     return subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True, text=True, check=check)
 
 
-def record(repo_dir: Path, branch: str, env: str, service: str, tag: str, revision: str, attempts: int = 5) -> str:
+def record(repo_dir: Path, branch: str, env: str, service: str, sha: str, attempts: int = 5) -> str:
     """Commit and push the edit; the message says what happened. Raises StateError when it can't."""
-    check(env, service, tag, revision)
+    check(env, service, sha)
+    tag, revision = image_tag(env, sha), sha
     path = Path(env) / f"{service}.yaml"
     for attempt in range(1, attempts + 1):
         git(repo_dir, "fetch", "--quiet", "origin", branch)
@@ -100,12 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--branch", default="main")
     parser.add_argument("--env", required=True)
     parser.add_argument("--service", required=True)
-    parser.add_argument("--tag", required=True)
-    parser.add_argument("--revision", required=True)
+    parser.add_argument("--sha", required=True, help="the PR's head commit: the chart revision, and the image tag's suffix")
     parser.add_argument("--attempts", type=int, default=5)
     args = parser.parse_args(argv)
     try:
-        print(record(args.repo_dir, args.branch, args.env, args.service, args.tag, args.revision, args.attempts))
+        print(record(args.repo_dir, args.branch, args.env, args.service, args.sha, args.attempts))
     except StateError as error:
         print(f"::error::{error}")
         return 1

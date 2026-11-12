@@ -1,12 +1,12 @@
 # Record a deploy in mindsdb/argocd-state, where Argo CD reads what each
 # long-lived environment runs: one file per service, <env>/<service>.yaml, and
-# this sets its `tag` and `revision`. Argo CD polls that repository and syncs
-# the service; nothing here touches a cluster.
+# this sets its `tag` and `revision` from one commit sha. Argo CD polls that
+# repository and syncs the service; nothing here touches a cluster.
 #
-# `revision` is the commit Argo CD renders the chart from, so pass the PR's
-# head sha, which stays fetchable, and the matching `<env>-head-<sha>` tag
-# build-push-ecr pushes. $GITHUB_SHA on a pull_request run is the synthetic
-# merge commit, which GitHub drops once the PR closes.
+# `sha` is the PR's head commit: Argo CD renders the chart from it, and the
+# image tag is the `<build environment>-head-<sha>` one build-push-ecr pushes
+# for it on every pull_request build. Not $GITHUB_SHA: on a pull_request run
+# that is the synthetic merge commit, which GitHub drops once the PR closes.
 #
 # `token` is an installation token for the mindsdb-release-train App, which
 # argocd-state's ruleset lets push to main; mint it in the calling job with
@@ -17,7 +17,7 @@
 # tests/test_write_env_state.py.
 
 name: Write environment state
-description: Set a service's tag and revision in mindsdb/argocd-state for Argo CD to deploy
+description: Record a service's commit in mindsdb/argocd-state for Argo CD to deploy
 
 inputs:
   env:
@@ -26,11 +26,8 @@ inputs:
   service:
     description: "The service, the file name in argocd-state without .yaml"
     required: true
-  tag:
-    description: "The image tag to run"
-    required: true
-  revision:
-    description: "The commit sha of the chart to render, 40 characters"
+  sha:
+    description: "The PR's head commit, 40 characters: the chart revision, and the image tag's suffix"
     required: true
   token:
     description: "An installation token for mindsdb-release-train"
@@ -59,8 +56,7 @@ runs:
       env:
         ENV_NAME: ${{ inputs.env }}
         SERVICE: ${{ inputs.service }}
-        TAG: ${{ inputs.tag }}
-        REVISION: ${{ inputs.revision }}
+        SHA: ${{ inputs.sha }}
         BRANCH: ${{ inputs.branch }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
@@ -69,4 +65,4 @@ runs:
         git -C argocd-state config user.email "mindsdb-release-train[bot]@users.noreply.github.com"
         python3 "$ACTION_PATH/../scripts/write_env_state.py" \
           --repo-dir argocd-state --branch "$BRANCH" \
-          --env "$ENV_NAME" --service "$SERVICE" --tag "$TAG" --revision "$REVISION"
+          --env "$ENV_NAME" --service "$SERVICE" --sha "$SHA"
