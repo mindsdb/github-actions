@@ -284,11 +284,15 @@ repeated `failed` always post.
 
 ### The one failure it cannot see: a run that never started
 
-`notify-main-failure` is a job *inside* the pipeline, so it covers every failure where the run exists. It cannot cover `conclusion: startup_failure` — GitHub rejecting the run at load time, with **zero jobs** — because there is no job to put the alert in. The run appears in the Actions tab and nowhere else, and the branch is not deployed.
+`notify-main-failure` is a job *inside* the pipeline, so it covers every failure where the run exists. It cannot cover `conclusion: startup_failure` — GitHub rejecting the run at load time, with **zero jobs** — because there is no job to put the alert in. The run appears in the Actions tab and nowhere else, so whatever it would have deployed didn't ship.
 
-That is not a corner case. It is produced by a caller job granting narrower `permissions:` than a called workflow's jobs declare (the cap is checked when the file *loads*, not when a job runs), by a `uses: ./.github/workflows/x.yml` path that does not exist on the ref, and by malformed YAML. It has already cost auth `staging` ten hours of running the previous image across two merges, with the recovery message being the first thing the channel heard about it.
+That is not a corner case. It is produced by a caller job granting narrower `permissions:` than a called workflow's jobs declare (the cap is checked when the file *loads*, not when a job runs), by a `uses: ./.github/workflows/x.yml` path that does not exist on the ref, by malformed YAML, and by an org Actions policy that blocks the run's event, which the org audit log records as `workflows.actions_policy_violation`. It has already cost one repository's `staging` ten hours of running the previous image across two merges, with the recovery message being the first thing the channel heard about it.
 
-`notify-startup-failure.yml` watches from outside, on a schedule. It sweeps the deploy branches and alerts when the newest conclusive run of a workflow is a `startup_failure` inside the lookback window, restricted to runs where no job ran — precisely the set the in-run notify job could not have reported:
+`notify-startup-failure.yml` watches from outside, on a schedule. It sweeps the deploy branches and alerts when the newest conclusive run of a workflow is a `startup_failure` inside the lookback window, restricted to runs where no job ran — precisely the set the in-run notify job could not have reported. The message names the run and both causes: the `permissions:` or YAML on that ref, or an Actions policy.
+
+**Only runs the branch started for itself count**: a `push`, a `schedule`, a `workflow_dispatch`, a `workflow_run` or a `repository_dispatch`. GitHub gives a pull request run its head branch, so a `staging` listing also returns the release pull request's runs, CI and the CLA check included, and those say nothing about whether `staging` deployed. Both sweeps share the list, `DEPLOY_EVENTS` in `scripts/branch_health.py`, and filter before they pick each workflow's newest run, so a later pull request run can't hide a red push. A deploy started by any other event goes unwatched.
+
+A caller:
 
 ```yaml
 name: Pipeline watchdog
@@ -331,7 +335,7 @@ Age is measured from the current attempt's `run_started_at`, not the run's `crea
 
 Selection logic lives in `scripts/branch_health.py` with unit tests, because it is date arithmetic plus a two-way trigger and that does not belong in a jq expression.
 
-Alerts repeat, by design: one failing push produces about three messages at that cadence and window, and then silence. Alerting only on the *transition* into a broken state gives exactly one message per break, which was rejected after replaying it against the auth incident — it would have said nothing about the second failing push, since the run before that one had also failed to start. A stateless sweep cannot be exactly-once, so the choice is a message that can be missed or a few that cannot, and the window is what bounds the few.
+Alerts repeat, by design: one failing push produces about three messages at that cadence and window, and then silence. Alerting only on the *transition* into a broken state gives exactly one message per break, which was rejected after replaying it against that incident — it would have said nothing about the second failing push, since the run before that one had also failed to start. A stateless sweep cannot be exactly-once, so the choice is a message that can be missed or a few that cannot, and the window is what bounds the few.
 
 Two things to know when adding it. GitHub only runs `schedule` triggers from a repository's **default branch**, so a watchdog merged to `staging` and no further is inert — `workflow_dispatch` is there to prove it before it reaches `main`. And widening `lookback-minutes` on a manual dispatch replays a past incident, which is how to check it would have caught one.
 
@@ -357,7 +361,7 @@ Two things to know when adding it. GitHub only runs `schedule` triggers from a r
 
 `zizmor` is advisory because pointing it at existing pipelines surfaces a backlog, and a lint job that is red on arrival gets ignored rather than fixed. Flip `zizmor-blocking: true` per repo once its backlog is triaged.
 
-**The permission check is not redundant with either tool**, which was verified against a tree that had already broken a deploy branch: `actionlint` reported nothing, and `zizmor --persona=auditor` reported only its generic "no `permissions:` block" note, equally true of jobs that work fine. What it checks is that no called workflow declares a permission its caller lacks. GitHub caps a called workflow at the calling job's grant and enforces that cap when the workflow **file is loaded**, so a job in a shared reusable naming a scope one caller does not grant does not run with less — it rejects that caller's whole run as a `startup_failure` with **zero jobs**, which means the pipeline's own notify job cannot report it either. In `mindsdb/auth` that cost two silently undeployed merges to `staging` and ten hours of serving the previous image.
+**The permission check is not redundant with either tool**, which was verified against a tree that had already broken a deploy branch: `actionlint` reported nothing, and `zizmor --persona=auditor` reported only its generic "no `permissions:` block" note, equally true of jobs that work fine. What it checks is that no called workflow declares a permission its caller lacks. GitHub caps a called workflow at the calling job's grant and enforces that cap when the workflow **file is loaded**, so a job in a shared reusable naming a scope one caller does not grant does not run with less — it rejects that caller's whole run as a `startup_failure` with **zero jobs**, which means the pipeline's own notify job cannot report it either. In one repository that cost two silently undeployed merges to `staging` and ten hours of serving the previous image.
 
 The rule it enforces: **a job in a shared reusable declares only what all its callers grant, and inherits anything only one of them needs.** Inheriting is the only thing that composes — the PR caller grants `pull-requests: write` and the comment posts, the push callers grant `contents: read` and the same job runs without a scope it never needed. And the reason it has to be a gate rather than a convention: a pull request only exercises the PR caller, which is usually the one that *does* grant the scope, so the mistake merges green and breaks on the merge commit.
 
@@ -367,7 +371,7 @@ Blind spot to know about: it can only read local (`./.github/workflows/...`) cal
 
 ## The release-freeze contract
 
-A freeze is one thing: the repo's `staging_frozen` custom property, set to `true` or `false`. A single org-level ruleset (terraform, `newprod/global/github`) blocks pushes to `staging` in every repo where it is `true`; the workflows never touch the ruleset. Four workflows care — freeze and unfreeze write it, and the two alerting paths read it to decide whether a red staging is worth interrupting anyone for.
+A freeze is one thing: the repo's `staging_frozen` custom property, set to `true` or `false`. A single org-level ruleset, managed outside this repository, blocks pushes to `staging` in every repo where it is `true`; the workflows never touch the ruleset. Four workflows care — freeze and unfreeze write it, and the two alerting paths read it to decide whether a red staging is worth interrupting anyone for.
 
 They used to carry three separate copies of that knowledge, and only two of them took the name as an input; the alerting path hardcoded it. Renaming it in one repo would therefore have moved the freeze and left the alerting reading a name that no longer existed — silent in the direction that hurts, because a reader that cannot establish the state escalates, so every ordinary mid-week staging red would have paged the channel forever and the cause would have looked like a Slack problem.
 
@@ -599,6 +603,29 @@ whether its author has signed. Four repos learned that the hard way, gating on
 `github.event_name == 'pull_request'` while triggering on events that are not
 `pull_request`, so their check quietly never asked anybody to sign.
 
+### The `pull_request_target` policy
+
+GitHub blocks `pull_request_target` in public repositories by default from 2 Dec 2026, unless an Actions event policy allows it ([Securely using pull_request_target](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)). Every caller triggers on `pull_request_target`, so without a policy the check never starts on a public repo.
+
+`config/cla-actions-policy.json` is that policy. It allows `pull_request_target` and `issue_comment` for `.github/workflows/cla.yml` in every repository, and names no other workflow.
+
+- It targets the wrapper by path, not repositories by name, so a new caller is covered the day it adds `cla.yml`.
+- Its events are an allow-list. `issue_comment` is on it because signing and `recheck` arrive as comments, and the policy refuses any event it doesn't list.
+- Allowing this one workflow is safe because the reusable checks out no pull request code: it runs a `gh api` step and the pinned action, nothing else.
+
+`tests/test_cla_actions_policy.py` fails the build if the target widens or an event drops.
+
+The `integrations/github` Terraform provider has no resource for Actions policies yet, so an org admin creates the policy with the [REST API](https://docs.github.com/en/rest/actions/policies), from a checkout of this repository:
+
+```sh
+gh api -X POST orgs/mindsdb/actions/policies \
+  -H "X-GitHub-Api-Version: 2026-03-10" --input config/cla-actions-policy.json
+```
+
+To read it back, `gh api orgs/mindsdb/actions/policies -H "X-GitHub-Api-Version: 2026-03-10"`. To change it, `PUT` the file to `orgs/mindsdb/actions/policies/<id>`, and to remove it, `DELETE` that path. The list gives the id.
+
+A run the policy refuses ends as `startup_failure` with zero jobs. The org audit log records it as `workflows.actions_policy_violation` with `"allowed": false`, naming the repository and the event but not the workflow file.
+
 ### Prerequisites (provisioned once, org level, scoped to the release-train repos)
 
 - **`mindsdb-release-train` GitHub App** with `Administration`, `Contents`, and
@@ -609,8 +636,8 @@ whether its author has signed. Four repos learned that the hard way, gating on
   **`secrets.RELEASE_APP_PRIVATE_KEY`** (org secret) — the private key reaches
   the reusable workflows via `secrets: inherit` in the caller.
 - The **`staging_frozen` org custom property** and the **`staging-freeze` org
-  ruleset** that targets repos where it is `true`, both defined in terraform
-  (`newprod/global/github/main.tf`). The workflows only set the property — they
+  ruleset** that targets repos where it is `true`, both managed outside this
+  repository. The workflows only set the property — they
   never touch the ruleset or the underlying branch protection.
 
 ### Caller wrappers

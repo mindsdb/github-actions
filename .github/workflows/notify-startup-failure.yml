@@ -35,6 +35,13 @@
 #     the cap is enforced when the FILE LOADS, not when a job runs)
 #   - a `uses: ./.github/workflows/x.yml` path that does not exist on the ref
 #   - malformed YAML, an unknown `on:` filter, a bad matrix expression
+#   - an org Actions policy that blocks the run's event, which the org audit
+#     log records as `workflows.actions_policy_violation`
+#
+# Only runs the branch started for itself count: a push, a schedule, a manual
+# dispatch, a `workflow_run` or a `repository_dispatch`. GitHub gives a pull
+# request run its head branch, so the branch listing also holds the release pull
+# request's runs, and those say nothing about the branch.
 #
 # Its consequence is the worst-shaped one available: a merge to a deploy branch
 # reports nothing, so the branch is believed deployed and is not. It has already
@@ -260,9 +267,19 @@ jobs:
             # and neither sweep is asking about them: "the branch is not deployed"
             # is a statement about a pipeline. See SYNTHESIZED_PREFIX in
             # scripts/branch_health.py, which drops them from the other sweep.
+            #
+            # Only the events a branch starts for itself count. GitHub gives a
+            # pull request run its HEAD branch, so this listing also holds the
+            # runs of a release pull request whose head is the branch, and a CLA
+            # run an Actions policy refused there read as "staging is not
+            # deployed". The list is DEPLOY_EVENTS in scripts/branch_health.py;
+            # tests/test_startup_failure_sweep.py fails if the two drift. It
+            # filters before the newest run is picked, so a later pull request
+            # run can't hide a push that never started.
             jq --argjson cutoff "${CUTOFF}" --arg branch "${BRANCH}" '
               [ .workflow_runs[]
                 | select(.path | startswith("dynamic/") | not)
+                | select(.event | IN("push", "schedule", "workflow_dispatch", "workflow_run", "repository_dispatch"))
                 | select(.conclusion == "success" or .conclusion == "failure"
                          or .conclusion == "timed_out" or .conclusion == "startup_failure")
                 | { id, path, name, conclusion, created_at, head_sha, html_url,
@@ -339,7 +356,7 @@ jobs:
                     type: "section",
                     text: {
                       type: "mrkdwn",
-                      text: ":rotating_light: *<\($server)/\($repo)|\($repo_name)>* — \($findings[0] | length) pipeline(s) *never started*, so nothing in the run could report it. The branch is not deployed."
+                      text: ":rotating_light: *<\($server)/\($repo)|\($repo_name)>* — \($findings[0] | length) workflow run(s) *never started*: GitHub refused them before any job ran, so nothing in the run could report it."
                     }
                   }]
                   + ( $findings[0] | map({
@@ -348,14 +365,14 @@ jobs:
                         { type: "mrkdwn", text: "*Workflow*\n<\($server)/\($repo)/actions/runs/\(.id)|\(.path)>" },
                         { type: "mrkdwn", text: "*Branch*\n<\($server)/\($repo)/tree/\(.branch)|\(.branch)>" },
                         { type: "mrkdwn", text: "*Commit*\n<\($server)/\($repo)/commit/\(.head_sha)|\(.head_sha[0:8])>" },
-                        { type: "mrkdwn", text: "*Pushed by*\n\(.actor)" }
+                        { type: "mrkdwn", text: "*Started by*\n\(.actor)" }
                       ]
                     }) )
                   + [{
                     type: "context",
                     elements: [{
                       type: "mrkdwn",
-                      text: "`startup_failure` with no jobs: GitHub rejected the run before scheduling anything — check the caller/callee `permissions:` relationship and the workflow YAML on that ref. <\($sweep)|Sweep run>"
+                      text: "`startup_failure` with no jobs. The cause is the caller/callee `permissions:` or the workflow YAML on that ref, or an org Actions policy that blocks the event (`workflows.actions_policy_violation` in the org audit log). <\($sweep)|Sweep run>"
                     }]
                   }]
                 )

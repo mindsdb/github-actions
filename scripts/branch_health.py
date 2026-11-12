@@ -92,6 +92,20 @@ RED = ("failure", "timed_out")
 # is asking. Naming one in `workflows:` still reports it: an explicit ask wins.
 SYNTHESIZED_PREFIX = "dynamic/"
 
+# The events by which a deploy branch starts a run for itself. GitHub gives a
+# pull request run its HEAD branch, so a `staging` listing also returns every run
+# of the release pull request from `staging` to `main`: its CI, and the CLA
+# check's `pull_request_target`. Those runs test a merge or check a contributor;
+# they say nothing about whether the branch deployed. On 9 Nov 2026 an Actions
+# policy refused one, and the startup sweep reported staging "not deployed" while
+# the push from the same commit had deployed eight seconds earlier.
+#
+# An allow-list, so a deploy started by an event not named here goes unwatched.
+# None was seen in the run listings of seven repositories' deploy branches. The
+# startup sweep's jq in notify-startup-failure.yml carries the same list, and
+# tests/test_startup_failure_sweep.py fails if the two drift.
+DEPLOY_EVENTS = ("push", "schedule", "workflow_dispatch", "workflow_run", "repository_dispatch")
+
 # The freeze workflow's per-repo wrapper keeps this name verbatim, because the
 # release-PR workflow chains off it by name. That makes it a stable handle for
 # "the window just opened" without this file knowing anything about the schedule,
@@ -122,6 +136,16 @@ def started_at(run: dict) -> datetime:
     parses is trimmed to the fields it needs.
     """
     return parse_time(run.get("run_started_at") or run["created_at"])
+
+
+def started_by_the_branch(run: dict) -> bool:
+    """Whether the branch started this run for itself (see ``DEPLOY_EVENTS``).
+
+    Synthesized runs carry the event ``dynamic`` and pass here, because
+    ``in_scope`` already decides them, and naming one in `workflows:` has to keep
+    reporting it.
+    """
+    return run.get("event") in DEPLOY_EVENTS or (run.get("path") or "").startswith(SYNTHESIZED_PREFIX)
 
 
 def newest_conclusive_per_workflow(runs: Iterable[dict]) -> list[dict]:
@@ -204,8 +228,10 @@ def select_red(
 
     just_froze = branch == staging_branch and freeze_opened_within(freeze_runs, cutoff=cutoff)
 
+    # Filter before picking the newest run, so a later pull request run can't
+    # stand in for a red push and hide it.
     findings = []
-    for run in newest_conclusive_per_workflow(runs):
+    for run in newest_conclusive_per_workflow(r for r in runs if started_by_the_branch(r)):
         if run["conclusion"] not in RED:
             continue
         if not in_scope(run["path"], only=only, exclude=exclude):

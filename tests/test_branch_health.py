@@ -36,12 +36,14 @@ def run(
     conclusion="failure",
     minutes_ago=45,
     run_id=1,
+    event="push",
 ):
     created = NOW - timedelta(minutes=minutes_ago)
     return {
         "id": run_id,
         "path": path,
         "name": name,
+        "event": event,
         "conclusion": conclusion,
         "created_at": created.isoformat().replace("+00:00", "Z"),
         "head_sha": "abcdef1234567890",
@@ -275,10 +277,14 @@ class TestScope:
         assert select(runs, branch="main", frozen=False) == []
 
     def test_an_allowlist_that_names_a_synthesized_run_still_reports_it(self):
-        """The default is a scope decision, not a ban: an explicit ask wins."""
+        """The default is a scope decision, not a ban: an explicit ask wins.
+
+        GitHub gives these runs the event ``dynamic``, which is not a deploy
+        event, so this also pins that the event filter leaves them to the scope.
+        """
         path = "dynamic/dependabot/dependabot-updates"
         findings = health.select_red(
-            [run(path=path)], branch="main", cutoff=CUTOFF, settled=SETTLED, frozen=False,
+            [run(path=path, event="dynamic")], branch="main", cutoff=CUTOFF, settled=SETTLED, frozen=False,
             staging_branch="staging", only=[path],
         )
         assert [f["path"] for f in findings] == [path]
@@ -299,6 +305,39 @@ class TestScope:
             staging_branch="staging", only=[path], exclude=[path],
         )
         assert findings == []
+
+
+class TestOnlyRunsTheBranchStartedForItself:
+    """GitHub gives a pull request run its HEAD branch, so a `staging` listing also
+    returns every run of the release pull request from `staging` to `main`. Those
+    runs test a merge; they say nothing about whether staging deployed.
+    """
+
+    def test_a_red_pull_request_run_headed_staging_is_ignored(self):
+        runs = [run(path="ci.yml", event="pull_request")]
+        assert select(runs) == []
+
+    def test_a_red_comment_run_is_ignored(self):
+        runs = [run(path="cla.yml", event="issue_comment")]
+        assert select(runs) == []
+
+    def test_a_red_push_on_staging_is_still_reported(self):
+        runs = [run(path="publish-staging.yml", event="push")]
+        assert [f["path"] for f in select(runs)] == ["publish-staging.yml"]
+
+    def test_a_later_pull_request_run_does_not_hide_a_red_push(self):
+        runs = [
+            run(path="ci.yml", event="push", conclusion="failure", minutes_ago=60, run_id=1),
+            run(path="ci.yml", event="pull_request", conclusion="success", minutes_ago=40, run_id=2),
+        ]
+        assert [f["id"] for f in select(runs)] == [1]
+
+    def test_every_deploy_event_counts(self):
+        runs = [
+            run(path=f"{event}.yml", event=event, run_id=i)
+            for i, event in enumerate(health.DEPLOY_EVENTS)
+        ]
+        assert len(select(runs)) == len(health.DEPLOY_EVENTS)
 
 
 class TestUnreadableBranchIsNotAnAllClear:
