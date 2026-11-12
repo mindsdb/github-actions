@@ -1,0 +1,72 @@
+# Record a deploy in mindsdb/argocd-state, where Argo CD reads what each
+# long-lived environment runs: one file per service, <env>/<service>.yaml, and
+# this sets its `tag` and `revision`. Argo CD polls that repository and syncs
+# the service; nothing here touches a cluster.
+#
+# `revision` is the commit Argo CD renders the chart from, so pass the PR's
+# head sha, which stays fetchable, and the matching `<env>-head-<sha>` tag
+# build-push-ecr pushes. $GITHUB_SHA on a pull_request run is the synthetic
+# merge commit, which GitHub drops once the PR closes.
+#
+# `token` is an installation token for the mindsdb-release-train App, which
+# argocd-state's ruleset lets push to main; mint it in the calling job with
+# actions/create-github-app-token (vars.RELEASE_APP_CLIENT_ID and
+# secrets.RELEASE_APP_PRIVATE_KEY). The push is retried when another deploy
+# lands first. The file has to exist: adding a service is a reviewed change
+# in argocd-state. scripts/write_env_state.py does the work; its tests are in
+# tests/test_write_env_state.py.
+
+name: Write environment state
+description: Set a service's tag and revision in mindsdb/argocd-state for Argo CD to deploy
+
+inputs:
+  env:
+    description: "The environment, the directory in argocd-state (dev, staging)"
+    required: true
+  service:
+    description: "The service, the file name in argocd-state without .yaml"
+    required: true
+  tag:
+    description: "The image tag to run"
+    required: true
+  revision:
+    description: "The commit sha of the chart to render, 40 characters"
+    required: true
+  token:
+    description: "An installation token for mindsdb-release-train"
+    required: true
+  repository:
+    description: "The state repository"
+    required: false
+    default: mindsdb/argocd-state
+  branch:
+    description: "The branch Argo CD reads"
+    required: false
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.branch }}
+        token: ${{ inputs.token }}
+        path: argocd-state
+        persist-credentials: true
+
+    - shell: bash
+      env:
+        ENV_NAME: ${{ inputs.env }}
+        SERVICE: ${{ inputs.service }}
+        TAG: ${{ inputs.tag }}
+        REVISION: ${{ inputs.revision }}
+        BRANCH: ${{ inputs.branch }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        git -C argocd-state config user.name "mindsdb-release-train[bot]"
+        git -C argocd-state config user.email "mindsdb-release-train[bot]@users.noreply.github.com"
+        python3 "$ACTION_PATH/../scripts/write_env_state.py" \
+          --repo-dir argocd-state --branch "$BRANCH" \
+          --env "$ENV_NAME" --service "$SERVICE" --tag "$TAG" --revision "$REVISION"
