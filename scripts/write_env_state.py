@@ -49,16 +49,20 @@ def check(env: str, service: str, sha: str, tag: str) -> None:
             raise StateError(f"{name} {value!r} is not {shape}")
 
 
+LINE = re.compile(r"^(?P<key>tag|revision):[^#\r\n]*?(?P<comment>[ \t]+#[^\r\n]*)?(?P<eol>\r?\n?)$")
+
+
 def updated_text(text: str, tag: str, revision: str) -> str:
-    """The state file with its tag and revision lines replaced, everything else as it was."""
+    """The state file with its tag and revision values replaced, everything else as it was: a comment after the value stays."""
     out = []
     seen = set()
     for line in text.splitlines(keepends=True):
-        key = line.split(":", 1)[0] if ":" in line else None
-        if key in ("tag", "revision") and not line.startswith((" ", "#")):
+        match = LINE.match(line)
+        if match:
+            key = match["key"]
             seen.add(key)
             value = tag if key == "tag" else revision
-            line = f"{key}: {value}\n"
+            line = f"{key}: {value}{match['comment'] or ''}{match['eol']}"
         out.append(line)
     missing = {"tag", "revision"} - seen
     if missing:
@@ -67,11 +71,21 @@ def updated_text(text: str, tag: str, revision: str) -> str:
 
 
 def git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True, text=True, check=check)
+    """Run git in the clone; with check, a failure is a StateError carrying git's own message."""
+    result = subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise StateError(f"git {args[0]} failed: {result.stderr.strip()}")
+    return result
 
 
-def record(repo_dir: Path, branch: str, env: str, service: str, sha: str, tag: str, attempts: int = 5) -> str:
-    """Commit and push the edit; the message says what happened. Raises StateError when it can't."""
+# What git says when the push lost a race, client side (the branch moved since
+# the fetch) or server side (two pushes reached the server at once). Anything
+# else, a ruleset or a hook refusing the push, is not retried.
+RACE_MARKERS = ("(fetch first)", "(non-fast-forward)", "(incorrect old value provided)", "cannot lock ref")
+
+
+def record(repo_dir: Path, branch: str, env: str, service: str, sha: str, tag: str, attempts: int = 5) -> tuple[bool, str]:
+    """Commit and push the edit. Returns whether a commit was pushed and a message saying what happened; raises StateError when it can't."""
     check(env, service, sha, tag)
     revision = sha
     path = Path(env) / f"{service}.yaml"
@@ -84,14 +98,14 @@ def record(repo_dir: Path, branch: str, env: str, service: str, sha: str, tag: s
         text = file.read_text(encoding="utf-8")
         new = updated_text(text, tag, revision)
         if new == text:
-            return f"{path} already records {tag} at {revision}"
+            return False, f"{path} already records {tag} at {revision}"
         file.write_text(new, encoding="utf-8")
         git(repo_dir, "add", str(path))
         git(repo_dir, "commit", "--quiet", "-m", f"{env}/{service}: {tag}")
         push = git(repo_dir, "push", "--quiet", "origin", f"HEAD:{branch}", check=False)
         if push.returncode == 0:
-            return f"{path}: tag {tag}, revision {revision} (attempt {attempt})"
-        if "rejected" not in push.stderr and "fetch first" not in push.stderr and "non-fast-forward" not in push.stderr:
+            return True, f"{path}: tag {tag}, revision {revision} (attempt {attempt})"
+        if not any(marker in push.stderr for marker in RACE_MARKERS):
             raise StateError(f"push to {branch} failed: {push.stderr.strip()}")
     raise StateError(f"{branch} kept moving; gave up after {attempts} attempts")
 
@@ -105,12 +119,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sha", required=True, help="the commit Argo CD renders the chart from")
     parser.add_argument("--tag", required=True, help="the image tag build-push-ecr pushed for it")
     parser.add_argument("--attempts", type=int, default=5)
+    parser.add_argument("--github-output", type=Path, help="a file to append pushed=true|false to, as $GITHUB_OUTPUT")
     args = parser.parse_args(argv)
     try:
-        print(record(args.repo_dir, args.branch, args.env, args.service, args.sha, args.tag, args.attempts))
+        pushed, message = record(args.repo_dir, args.branch, args.env, args.service, args.sha, args.tag, args.attempts)
     except StateError as error:
         print(f"::error::{error}")
         return 1
+    print(message)
+    if args.github_output:
+        with args.github_output.open("a", encoding="utf-8") as out:
+            out.write(f"pushed={'true' if pushed else 'false'}\n")
     return 0
 
 
