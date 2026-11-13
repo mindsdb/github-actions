@@ -15,6 +15,11 @@
 # lands first. The file has to exist: adding a service is a reviewed change
 # in argocd-state. scripts/write_env_state.py does the work; its tests are in
 # tests/test_write_env_state.py.
+#
+# Before the push, commit status `argocd/<env>` is set to pending on `sha`
+# in the calling repository: Argo CD's notifier sets the same status to
+# success or failure once it has synced, so a sync that never starts shows
+# as a pending that never clears. The calling job needs `statuses: write`.
 
 name: Write environment state
 description: Record a service's commit and image tag in mindsdb/argocd-state for Argo CD to deploy
@@ -43,6 +48,14 @@ inputs:
     description: "The branch Argo CD reads"
     required: false
     default: main
+  status-token:
+    description: "A token that may write commit statuses on the calling repository"
+    required: false
+    default: ${{ github.token }}
+  argocd-url:
+    description: "The Argo CD that deploys this environment, for the status link"
+    required: false
+    default: https://argo.dev.mindsdb.com
 
 runs:
   using: composite
@@ -54,6 +67,22 @@ runs:
         token: ${{ inputs.token }}
         path: argocd-state
         persist-credentials: true
+
+    - name: Mark the commit as waiting for Argo CD
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.status-token }}
+        REPOSITORY: ${{ github.repository }}
+        ENV_NAME: ${{ inputs.env }}
+        SERVICE: ${{ inputs.service }}
+        SHA: ${{ inputs.sha }}
+        ARGOCD_URL: ${{ inputs.argocd-url }}
+      run: |
+        set -euo pipefail
+        gh api "repos/$REPOSITORY/statuses/$SHA" \
+          -f state=pending -f context="argocd/$ENV_NAME" \
+          -f description="Waiting for Argo CD to sync" \
+          -f target_url="$ARGOCD_URL/applications/$ENV_NAME-$SERVICE?operation=true" > /dev/null
 
     - shell: bash
       env:
@@ -70,3 +99,20 @@ runs:
         python3 "$ACTION_PATH/../scripts/write_env_state.py" \
           --repo-dir argocd-state --branch "$BRANCH" \
           --env "$ENV_NAME" --service "$SERVICE" --sha "$SHA" --tag "$TAG"
+
+    - name: Mark the commit as not recorded
+      # The pending above would otherwise outlive a failed push.
+      if: failure()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.status-token }}
+        REPOSITORY: ${{ github.repository }}
+        ENV_NAME: ${{ inputs.env }}
+        SHA: ${{ inputs.sha }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        gh api "repos/$REPOSITORY/statuses/$SHA" \
+          -f state=error -f context="argocd/$ENV_NAME" \
+          -f description="The deploy was not recorded in argocd-state" \
+          -f target_url="$RUN_URL" > /dev/null
