@@ -28,6 +28,10 @@ inputs:
   image-ref:
     description: "The version number or sha used in creating image tag"
     required: false
+  remote-builder:
+    description: "Build on the in-cluster BuildKit agent, which only a runner inside newdev can reach. Set 'false' on a GitHub-hosted runner: the build then runs on the builder setup-buildx-action made on the runner."
+    required: false
+    default: "true"
 
 
 runs:
@@ -42,6 +46,8 @@ runs:
       uses: aws-actions/amazon-ecr-login@v2
     - shell: bash
       id: build
+      env:
+        REMOTE_BUILDER: ${{ inputs.remote-builder }}
       run: |
         # Env var parsing
 
@@ -70,7 +76,9 @@ runs:
         aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
         true # Just let this fail if the repo already exists
 
-        docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
+        if [ "$REMOTE_BUILDER" != "false" ]; then
+          docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
+        fi
 
         cd $SRC_PATH
         BUILD_ARGS="--build-arg BUILD_FOR_ENVIRONMENT=$ENVIRONMENT --build-arg IMAGE_TAG=$IMAGE_TAG"

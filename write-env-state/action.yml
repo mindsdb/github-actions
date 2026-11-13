@@ -1,0 +1,106 @@
+# Record a deploy in mindsdb/argocd-state, where Argo CD reads what each
+# long-lived environment runs: one file per service, <env>/<service>.yaml, and
+# this sets its `revision` and `tag`. Argo CD polls that repository and syncs
+# the service; nothing here touches a cluster.
+#
+# `sha` is the commit Argo CD renders the chart from and `tag` the image
+# build-push-ecr pushed for it. On a pull_request run pass the PR's head sha
+# and its `<build environment>-head-<sha>` tag, not $GITHUB_SHA: that is the
+# synthetic merge commit, which GitHub drops once the PR closes.
+#
+# `token` is an installation token for the mindsdb-release-train App, which
+# argocd-state's ruleset lets push to main; mint it in the calling job with
+# actions/create-github-app-token (vars.RELEASE_APP_CLIENT_ID and
+# secrets.RELEASE_APP_PRIVATE_KEY). The push is retried when another deploy
+# lands first. The file has to exist: adding a service is a reviewed change
+# in argocd-state. scripts/write_env_state.py does the work; its tests are in
+# tests/test_write_env_state.py.
+#
+# When a commit was pushed, commit status `argocd/<env>` is set to pending
+# on `sha` in the calling repository: Argo CD's notifier sets the same
+# status to success or failure once it has synced, so a sync that never
+# starts shows as a pending that never clears. A rerun that finds the file
+# already up to date sets nothing, since nothing will sync. The calling job
+# needs `statuses: write`.
+
+name: Write environment state
+description: Record a service's commit and image tag in mindsdb/argocd-state for Argo CD to deploy
+
+inputs:
+  env:
+    description: "The environment, the directory in argocd-state (dev, staging)"
+    required: true
+  service:
+    description: "The service, the file name in argocd-state without .yaml"
+    required: true
+  sha:
+    description: "The commit Argo CD renders the chart from, 40 characters"
+    required: true
+  tag:
+    description: "The image tag build-push-ecr pushed for that commit"
+    required: true
+  token:
+    description: "An installation token for mindsdb-release-train"
+    required: true
+  repository:
+    description: "The state repository"
+    required: false
+    default: mindsdb/argocd-state
+  branch:
+    description: "The branch Argo CD reads"
+    required: false
+    default: main
+  status-token:
+    description: "A token that may write commit statuses on the calling repository"
+    required: false
+    default: ${{ github.token }}
+  argocd-url:
+    description: "The Argo CD that deploys this environment, for the status link"
+    required: false
+    default: https://argo.dev.mindsdb.com
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.branch }}
+        token: ${{ inputs.token }}
+        path: argocd-state
+        persist-credentials: true
+
+    - id: write
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.env }}
+        SERVICE: ${{ inputs.service }}
+        SHA: ${{ inputs.sha }}
+        TAG: ${{ inputs.tag }}
+        BRANCH: ${{ inputs.branch }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        git -C argocd-state config user.name "mindsdb-release-train[bot]"
+        git -C argocd-state config user.email "mindsdb-release-train[bot]@users.noreply.github.com"
+        python3 "$ACTION_PATH/../scripts/write_env_state.py" \
+          --repo-dir argocd-state --branch "$BRANCH" \
+          --env "$ENV_NAME" --service "$SERVICE" --sha "$SHA" --tag "$TAG" \
+          --github-output "$GITHUB_OUTPUT"
+
+    - name: Mark the commit as waiting for Argo CD
+      if: steps.write.outputs.pushed == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.status-token }}
+        REPOSITORY: ${{ github.repository }}
+        ENV_NAME: ${{ inputs.env }}
+        SERVICE: ${{ inputs.service }}
+        SHA: ${{ inputs.sha }}
+        ARGOCD_URL: ${{ inputs.argocd-url }}
+      run: |
+        set -euo pipefail
+        gh api "repos/$REPOSITORY/statuses/$SHA" \
+          -f state=pending -f context="argocd/$ENV_NAME" \
+          -f description="Waiting for Argo CD to sync" \
+          -f target_url="$ARGOCD_URL/applications/$ENV_NAME-$SERVICE?operation=true" > /dev/null
