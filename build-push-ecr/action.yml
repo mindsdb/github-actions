@@ -29,7 +29,7 @@ inputs:
     description: "The version number or sha used in creating image tag"
     required: false
   remote-builder:
-    description: "Build on the in-cluster BuildKit agent, which only a runner inside newdev can reach. Set 'false' on a GitHub-hosted runner: the build then runs on the runner's own builder with the GitHub Actions cache."
+    description: "Build on the in-cluster BuildKit agent, which only a runner inside newdev can reach. Set 'false' on a GitHub-hosted runner: the build then runs on the builder setup-buildx-action made on the runner."
     required: false
     default: "true"
 
@@ -46,6 +46,8 @@ runs:
       uses: aws-actions/amazon-ecr-login@v2
     - shell: bash
       id: build
+      env:
+        REMOTE_BUILDER: ${{ inputs.remote-builder }}
       run: |
         # Env var parsing
 
@@ -60,7 +62,6 @@ runs:
         BRANCH_NAME=${{env.ENV_NAME}}
         IMAGE_TAG=$ENVIRONMENT-$IMAGE_REF
         PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-        REMOTE_BUILDER="${{ inputs.remote-builder }}"
 
         # On pull_request events, also tag by the immutable PR head SHA (see
         # header comment). HEAD_TAG is expanded unquoted on the build line —
@@ -75,17 +76,12 @@ runs:
         aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
         true # Just let this fail if the repo already exists
 
-        CACHE_ARGS=""
-        if [ "$REMOTE_BUILDER" = "false" ]; then
-          # setup-buildx-action gave this runner a builder of its own; the
-          # GitHub Actions cache stands in for the agent's layer cache.
-          CACHE_ARGS="--cache-from type=gha --cache-to type=gha,mode=max"
-        else
+        if [ "$REMOTE_BUILDER" != "false" ]; then
           docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
         fi
 
         cd $SRC_PATH
-        BUILD_ARGS="--build-arg BUILD_FOR_ENVIRONMENT=$ENVIRONMENT --build-arg IMAGE_TAG=$IMAGE_TAG $CACHE_ARGS"
+        BUILD_ARGS="--build-arg BUILD_FOR_ENVIRONMENT=$ENVIRONMENT --build-arg IMAGE_TAG=$IMAGE_TAG"
 
         # Finally, build our runner container
         docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS $HEAD_TAG -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:$ENVIRONMENT -t $REPO_IMAGE:latest --push .
