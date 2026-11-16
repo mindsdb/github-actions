@@ -173,7 +173,15 @@ jobs:
             RANGE+=("^${SINCE}")
           fi
 
-          COMMITS=$(git log --oneline --no-merges "${RANGE[@]}")
+          # GitHub rejects a PR body over 65536 characters, so a long queue lists
+          # only the newest commits and links the full comparison.
+          MAX_LISTED=250
+          TOTAL=$(git rev-list --count --no-merges "${RANGE[@]}")
+          COMMITS=$(git log --oneline --no-merges --max-count="${MAX_LISTED}" "${RANGE[@]}")
+          OVERFLOW_LINE=""
+          if [ "$TOTAL" -gt "$MAX_LISTED" ]; then
+            OVERFLOW_LINE="Showing the newest ${MAX_LISTED} of ${TOTAL} commits. [Full list](https://github.com/${REPO}/compare/${SINCE:-$BASE}...${STAGING})"
+          fi
           CONTRIBUTORS=$(git log --format='%an' "${RANGE[@]}" | sort -u | sed 's/^/- /')
 
           # Find the PR before writing about it. The body describes whether this is
@@ -215,6 +223,7 @@ jobs:
           \`\`\`
           ${COMMITS}
           \`\`\`
+          ${OVERFLOW_LINE}
 
           ### Contributors
           ${CONTRIBUTORS}
