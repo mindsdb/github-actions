@@ -179,7 +179,6 @@ jobs:
           # limit, so the list is capped by characters as well as by count.
           MAX_LISTED=250
           LIST_BUDGET=50000
-          TOTAL=$(git rev-list --count --no-merges "${RANGE[@]}")
           CANDIDATES=$(git log --oneline --no-merges --max-count="${MAX_LISTED}" "${RANGE[@]}")
           COMMITS=""
           LISTED=0
@@ -194,10 +193,10 @@ jobs:
           fi
           COMMITS="${COMMITS%$'\n'}"
           OVERFLOW_LINE=""
-          if [ "$TOTAL" -gt "$LISTED" ]; then
-            OVERFLOW_LINE="Showing the newest ${LISTED} of ${TOTAL} commits. [Compare](https://github.com/${REPO}/compare/${SINCE:-$BASE}...${STAGING})"
+          if [ "$AHEAD" -gt "$LISTED" ]; then
+            OVERFLOW_LINE="Showing the newest ${LISTED} of ${AHEAD} commits. [Compare](https://github.com/${REPO}/compare/${SINCE:-$BASE}...${STAGING})"
           fi
-          CONTRIBUTORS=$(git log --format='%an' "${RANGE[@]}" | sort -u | sed 's/^/- /')
+          CONTRIBUTORS=$(git log --no-merges --format='%an' "${RANGE[@]}" | sort -u | sed 's/^/- /')
 
           # Find the PR before writing about it. The body describes whether this is
           # a draft, and only the PR itself knows that: an existing PR may already
