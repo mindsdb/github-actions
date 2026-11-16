@@ -115,14 +115,38 @@ jobs:
       - name: Check for unreleased changes
         id: check
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
           STAGING: ${{ inputs.staging-branch }}
           BASE: ${{ inputs.base-branch }}
         run: |
           set -euo pipefail
+          # Release PRs are squash merged, so the commits they shipped never become
+          # ancestors of BASE. The head of the last merged one marks what shipped.
+          SINCE=""
+          if LAST=$(gh pr list --repo "${REPO}" --base "${BASE}" --head "${STAGING}" \
+                --state merged --limit 20 --json headRefOid,mergedAt \
+                --jq 'sort_by(.mergedAt) | last | .headRefOid // empty'); then
+            if [ -z "$LAST" ]; then
+              echo "No merged release PR yet. Listing every commit not on ${BASE}."
+            elif git merge-base --is-ancestor "$LAST" "origin/${STAGING}"; then
+              SINCE="$LAST"
+            else
+              echo "::warning::Last release head ${LAST} is not on ${STAGING}. Listing every commit not on ${BASE}."
+            fi
+          else
+            echo "::warning::Could not look up the last merged release PR. Listing every commit not on ${BASE}."
+          fi
+          echo "since=${SINCE}" >> "$GITHUB_OUTPUT"
+
+          RANGE=("origin/${STAGING}" "^origin/${BASE}")
+          if [ -n "$SINCE" ]; then
+            RANGE+=("^${SINCE}")
+          fi
           if git diff --quiet "origin/${BASE}" "origin/${STAGING}"; then
             AHEAD=0
           else
-            AHEAD=$(git rev-list --count "origin/${BASE}..origin/${STAGING}")
+            AHEAD=$(git rev-list --count "${RANGE[@]}")
           fi
           echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
           if [ "$AHEAD" -eq 0 ]; then
@@ -140,11 +164,17 @@ jobs:
           STAGING: ${{ inputs.staging-branch }}
           BASE: ${{ inputs.base-branch }}
           FROZEN: ${{ steps.freeze.outputs.frozen }}
+          SINCE: ${{ steps.check.outputs.since }}
         run: |
           set -euo pipefail
 
-          COMMITS=$(git log --oneline --no-merges "origin/${BASE}..origin/${STAGING}")
-          CONTRIBUTORS=$(git log --format='%an' "origin/${BASE}..origin/${STAGING}" | sort -u | sed 's/^/- /')
+          RANGE=("origin/${STAGING}" "^origin/${BASE}")
+          if [ -n "$SINCE" ]; then
+            RANGE+=("^${SINCE}")
+          fi
+
+          COMMITS=$(git log --oneline --no-merges "${RANGE[@]}")
+          CONTRIBUTORS=$(git log --format='%an' "${RANGE[@]}" | sort -u | sed 's/^/- /')
 
           # Find the PR before writing about it. The body describes whether this is
           # a draft, and only the PR itself knows that: an existing PR may already
