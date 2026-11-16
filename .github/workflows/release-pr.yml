@@ -125,10 +125,12 @@ jobs:
           # ancestors of BASE. The head of the last merged one marks what shipped.
           SINCE=""
           if LAST=$(gh pr list --repo "${REPO}" --base "${BASE}" --head "${STAGING}" \
-                --state merged --limit 20 --json headRefOid,mergedAt \
-                --jq 'sort_by(.mergedAt) | last | .headRefOid // empty'); then
+                --state merged --limit 20 --json headRefOid,mergedAt,isCrossRepository \
+                --jq 'map(select(.isCrossRepository | not)) | sort_by(.mergedAt) | last | .headRefOid // empty'); then
             if [ -z "$LAST" ]; then
               echo "No merged release PR yet. Listing every commit not on ${BASE}."
+            elif ! [[ "$LAST" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::warning::The last release PR head is not a commit SHA. Listing every commit not on ${BASE}."
             elif git merge-base --is-ancestor "$LAST" "origin/${STAGING}"; then
               SINCE="$LAST"
             else
@@ -146,7 +148,7 @@ jobs:
           if git diff --quiet "origin/${BASE}" "origin/${STAGING}"; then
             AHEAD=0
           else
-            AHEAD=$(git rev-list --count "${RANGE[@]}")
+            AHEAD=$(git rev-list --count --no-merges "${RANGE[@]}")
           fi
           echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
           if [ "$AHEAD" -eq 0 ]; then
@@ -173,14 +175,27 @@ jobs:
             RANGE+=("^${SINCE}")
           fi
 
-          # GitHub rejects a PR body over 65536 characters, so a long queue lists
-          # only the newest commits and links the full comparison.
+          # GitHub rejects a PR body over 65536 characters. Subjects have no length
+          # limit, so the list is capped by characters as well as by count.
           MAX_LISTED=250
+          LIST_BUDGET=50000
           TOTAL=$(git rev-list --count --no-merges "${RANGE[@]}")
-          COMMITS=$(git log --oneline --no-merges --max-count="${MAX_LISTED}" "${RANGE[@]}")
+          CANDIDATES=$(git log --oneline --no-merges --max-count="${MAX_LISTED}" "${RANGE[@]}")
+          COMMITS=""
+          LISTED=0
+          if [ -n "$CANDIDATES" ]; then
+            while IFS= read -r LINE; do
+              if [ $(( ${#COMMITS} + ${#LINE} + 1 )) -gt "$LIST_BUDGET" ]; then
+                break
+              fi
+              COMMITS+="${LINE}"$'\n'
+              LISTED=$((LISTED + 1))
+            done <<< "$CANDIDATES"
+          fi
+          COMMITS="${COMMITS%$'\n'}"
           OVERFLOW_LINE=""
-          if [ "$TOTAL" -gt "$MAX_LISTED" ]; then
-            OVERFLOW_LINE="Showing the newest ${MAX_LISTED} of ${TOTAL} commits. [Full list](https://github.com/${REPO}/compare/${SINCE:-$BASE}...${STAGING})"
+          if [ "$TOTAL" -gt "$LISTED" ]; then
+            OVERFLOW_LINE="Showing the newest ${LISTED} of ${TOTAL} commits. [Compare](https://github.com/${REPO}/compare/${SINCE:-$BASE}...${STAGING})"
           fi
           CONTRIBUTORS=$(git log --format='%an' "${RANGE[@]}" | sort -u | sed 's/^/- /')
 
