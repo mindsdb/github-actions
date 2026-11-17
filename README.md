@@ -124,6 +124,8 @@ concurrency:
 
 The sync is idempotent (it exits 0 when `staging` already contains `main`), so whichever run loses the race no-ops.
 
+**A hotfix staging already holds lands on its own.** Both syncs merge through `scripts/sync_staging.py`. A hotfix lands on staging first and is then cherry-picked onto main, so staging usually holds the change before main's push fires the sync. A plain `git merge` still conflicts when staging has since edited a neighboring line. On a conflict, the script asks `git cherry` whether every commit main gained since the merge base has an equal patch on staging. If so, it records the merge with `-s ours`, which keeps staging's content and makes `main` an ancestor of `staging`; the run log carries a notice naming the held commits. If main brings any change staging lacks, or a merge commit `git cherry` cannot compare, the run fails and its error names the conflicting files and the missing commits. A person then resolves it. Staging takes squash merges only, so a hand-made merge PR into staging does not make `main` an ancestor. Instead, open a PR on `main` that brings the conflicting lines in line with staging, and the next sync merges cleanly.
+
 The chain is event-driven: `Staging Freeze` finishing fires the release-PR
 workflow via `workflow_run`; merging that PR fires `Staging Unfreeze`. The
 `workflow_run` link matches on the **caller** workflow's name, so callers must
