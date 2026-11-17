@@ -228,7 +228,9 @@ def test_a_list_over_the_budget_is_cut_and_counts_what_it_cut(history):
     assert result.omitted > 0
 
 
-def test_main_prints_one_json_object(history, capsys):
+def test_main_prints_one_json_object(history, capsys, monkeypatch):
+    # CI sets this for its own steps; the test must not write into that summary.
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     history.on_staging("first a")
 
     assert release_commits.main(
@@ -237,4 +239,23 @@ def test_main_prints_one_json_object(history, capsys):
 
     out = json.loads(capsys.readouterr().out)
     assert out["count"] == 1
-    assert set(out) == {"since", "since_reason", "lookup_failed", "count", "commits", "omitted", "contributors"}
+    assert set(out) == {
+        "since", "since_reason", "lookup_failed", "count", "commits", "all_commits", "omitted", "contributors"
+    }
+
+
+def test_a_cut_list_still_reaches_the_run_summary_in_full(history, capsys, monkeypatch, tmp_path_factory):
+    history.on_staging(*[f"change {i:03d} with a reasonably long subject line" for i in range(40)])
+    summary = tmp_path_factory.mktemp("summary") / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    assert release_commits.main(
+        ["--repo", REPO, "--base", "main", "--staging", "staging", "--max-chars", "500"],
+        runner=runner_for(history, gh_answer=[]),
+    ) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["omitted"] > 0
+    written = summary.read_text(encoding="utf-8")
+    assert "### Release PR list: 40 commit(s)" in written
+    assert sum("reasonably long subject line" in line for line in written.splitlines()) == 40

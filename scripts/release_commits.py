@@ -3,9 +3,9 @@
 `git log main..staging` is that list only while releases merge with a merge
 commit. Most callers allow squash merges only, and a squashed release puts one
 new commit on main: the staging commits it shipped never become ancestors of
-main, so `main..staging` keeps every commit ever released. cowork's list reached
-868 commits with 19 of them unreleased, and its body passed GitHub's 65,536
-character limit, so `gh pr create` failed on every staging build.
+main, so `main..staging` keeps every commit ever released. cowork's release
+title reached 868 commits, and only 18 of them were unreleased. Its body passed
+GitHub's 65,536 character limit, so `gh pr create` failed on every staging build.
 
 So the list starts at the last release instead: the head of the newest merged
 `staging -> main` PR. A commit is listed when it is on staging and reachable
@@ -14,9 +14,10 @@ on main, so the list is `main..staging`, exactly as before. With no previous
 release, or a head staging no longer contains (staging was rebuilt), it falls
 back to `main..staging` and says why.
 
-The Changes list is cut to a character budget, and the caller links the full
-comparison, so a long but correct list (a long freeze, a first release) still
-opens the PR.
+The Changes list is cut to a character budget, so a long but correct list (a
+long freeze, a first release) still opens the PR. The full list goes to the
+run's step summary, and the caller links that run when the list was cut.
+GitHub's compare view is no substitute: it fails to render a range that long.
 
 Run it inside the caller's checkout, with `origin/<base>` and
 `origin/<staging>` fetched at full depth. It prints one JSON object.
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -53,8 +55,9 @@ class ReleaseCommits:
     lookup_failed: bool  # the merged-PR lookup errored, so the list fell back to origin/<base>
     count: int  # every unreleased non-merge commit, listed or not
     commits: str  # `git log --oneline` lines, cut to the budget
+    all_commits: str  # every unreleased `git log --oneline` line, uncut, for the run summary
     omitted: int  # commits cut from `commits` by the budget
-    contributors: str  # "- <author>" lines of the listed commits, sorted and unique
+    contributors: str  # "- <author>" lines of every unreleased commit, listed or cut, sorted and unique
 
 
 def _run(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
@@ -147,6 +150,7 @@ def release_commits(
         lookup_failed=lookup_failed,
         count=len(lines),
         commits="\n".join(kept),
+        all_commits="\n".join(lines),
         omitted=len(lines) - len(kept),
         contributors="\n".join(f"- {name}" for name in sorted(set(authors))),
     )
@@ -163,6 +167,17 @@ def main(argv: Sequence[str] | None = None, runner: Runner = _run) -> int:
     result = release_commits(runner, args.repo, args.base, args.staging, args.max_chars)
     level = "warning" if result.lookup_failed else "notice"
     print(f"::{level}::Release PR lists from {result.since_reason}: {result.count} commit(s).", file=sys.stderr)
+
+    # The run summary holds every commit, so the PR body can link it when the
+    # list there was cut. A step summary holds 1 MiB, about 12,000 lines.
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as out:
+            out.write(
+                f"### Release PR list: {result.count} commit(s)\n\n"
+                f"Start point: {result.since_reason}.\n\n```\n{result.all_commits}\n```\n"
+            )
+
     print(json.dumps(asdict(result)))
     return 0
 

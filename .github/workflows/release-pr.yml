@@ -23,7 +23,7 @@
 # `gh pr create` takes a 422, and `set -euo pipefail` turns that into a red
 # "release PR pipeline failed" alert for a PR that exists and is fine.
 #
-# The ahead-check is kept even though the freeze caller guards on freeze success —
+# The tree check is kept even though the freeze caller guards on freeze success —
 # a manual workflow_dispatch can invoke this workflow directly.
 #
 # The PR is created with the `mindsdb-release-train` App token (NOT the default
@@ -119,20 +119,18 @@ jobs:
           BASE: ${{ inputs.base-branch }}
         run: |
           set -euo pipefail
+          # The tree decides. A commit count here would be `main..staging`, which
+          # on a squash-merge repo counts every commit a release already shipped.
           if git diff --quiet "origin/${BASE}" "origin/${STAGING}"; then
-            AHEAD=0
-          else
-            AHEAD=$(git rev-list --count "origin/${BASE}..origin/${STAGING}")
-          fi
-          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
-          if [ "$AHEAD" -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "${STAGING} is up to date with ${BASE} — nothing to release."
           else
-            echo "${STAGING} is ${AHEAD} commit(s) ahead of ${BASE}."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "${STAGING}'s tree differs from ${BASE}'s; the next step lists what no release has shipped."
           fi
 
       - name: Create or update PR
-        if: steps.check.outputs.ahead != '0'
+        if: steps.check.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -151,10 +149,12 @@ jobs:
           COMMITS=$(jq -r '.commits' <<<"$RELEASE")
           CONTRIBUTORS=$(jq -r '.contributors' <<<"$RELEASE")
           OMITTED=$(jq -r '.omitted' <<<"$RELEASE")
-          SINCE=$(jq -r '.since' <<<"$RELEASE")
+          # A cut list links this run, whose summary the script filled with every
+          # commit. A compare link can't stand in: GitHub fails to render a range
+          # long enough to need the cut.
           MORE_LINE=""
           if [ "${OMITTED}" -gt 0 ]; then
-            MORE_LINE="…and ${OMITTED} more commit(s), cut to fit GitHub's body limit: [full comparison](https://github.com/${REPO}/compare/${SINCE}...${STAGING})."
+            MORE_LINE="…and ${OMITTED} more commit(s), cut to fit GitHub's body limit. The [run summary](${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}) lists all ${COUNT}."
           fi
 
           # Find the PR before writing about it. The body describes whether this is
