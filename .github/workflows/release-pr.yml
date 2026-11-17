@@ -136,15 +136,26 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          AHEAD: ${{ steps.check.outputs.ahead }}
           STAGING: ${{ inputs.staging-branch }}
           BASE: ${{ inputs.base-branch }}
           FROZEN: ${{ steps.freeze.outputs.frozen }}
         run: |
           set -euo pipefail
 
-          COMMITS=$(git log --oneline --no-merges "origin/${BASE}..origin/${STAGING}")
-          CONTRIBUTORS=$(git log --format='%an' "origin/${BASE}..origin/${STAGING}" | sort -u | sed 's/^/- /')
+          # Only what no release has shipped: `main..staging` keeps every commit a
+          # squash-merged release shipped, and its list outgrew GitHub's 65,536
+          # character body limit. The script says where the list starts and why.
+          RELEASE=$(python3 .ci-shared/scripts/release_commits.py \
+            --repo "${REPO}" --base "${BASE}" --staging "${STAGING}")
+          COUNT=$(jq -r '.count' <<<"$RELEASE")
+          COMMITS=$(jq -r '.commits' <<<"$RELEASE")
+          CONTRIBUTORS=$(jq -r '.contributors' <<<"$RELEASE")
+          OMITTED=$(jq -r '.omitted' <<<"$RELEASE")
+          SINCE=$(jq -r '.since' <<<"$RELEASE")
+          MORE_LINE=""
+          if [ "${OMITTED}" -gt 0 ]; then
+            MORE_LINE="…and ${OMITTED} more commit(s), cut to fit GitHub's body limit: [full comparison](https://github.com/${REPO}/compare/${SINCE}...${STAGING})."
+          fi
 
           # Find the PR before writing about it. The body describes whether this is
           # a draft, and only the PR itself knows that: an existing PR may already
@@ -179,12 +190,13 @@ jobs:
           BODY=$(cat <<EOF
           ## Release: ${STAGING} → ${BASE}
 
-          **${AHEAD} commit(s)** queued for the next production release.
+          **${COUNT} commit(s)** queued for the next production release.
 
           ### Changes
           \`\`\`
           ${COMMITS}
           \`\`\`
+          ${MORE_LINE}
 
           ### Contributors
           ${CONTRIBUTORS}
@@ -205,7 +217,7 @@ jobs:
           BODY="${BODY//$'\n'          /$'\n'}"
           BODY="${BODY#          }"
 
-          TITLE="Release: ${STAGING} → ${BASE} (${AHEAD} commits)"
+          TITLE="Release: ${STAGING} → ${BASE} (${COUNT} commits)"
 
           if [ -z "$EXISTING" ]; then
             # New PR. Draft unless the window is already open, so a rolling PR can
