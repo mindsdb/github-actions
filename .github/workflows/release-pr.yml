@@ -23,7 +23,7 @@
 # `gh pr create` takes a 422, and `set -euo pipefail` turns that into a red
 # "release PR pipeline failed" alert for a PR that exists and is fine.
 #
-# The ahead-check is kept even though the freeze caller guards on freeze success —
+# The tree check is kept even though the freeze caller guards on freeze success —
 # a manual workflow_dispatch can invoke this workflow directly.
 #
 # The PR is created with the `mindsdb-release-train` App token (NOT the default
@@ -119,32 +119,43 @@ jobs:
           BASE: ${{ inputs.base-branch }}
         run: |
           set -euo pipefail
+          # The tree decides. A commit count here would be `main..staging`, which
+          # on a squash-merge repo counts every commit a release already shipped.
           if git diff --quiet "origin/${BASE}" "origin/${STAGING}"; then
-            AHEAD=0
-          else
-            AHEAD=$(git rev-list --count "origin/${BASE}..origin/${STAGING}")
-          fi
-          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
-          if [ "$AHEAD" -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "${STAGING} is up to date with ${BASE} — nothing to release."
           else
-            echo "${STAGING} is ${AHEAD} commit(s) ahead of ${BASE}."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "${STAGING}'s tree differs from ${BASE}'s; the next step lists what no release has shipped."
           fi
 
       - name: Create or update PR
-        if: steps.check.outputs.ahead != '0'
+        if: steps.check.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          AHEAD: ${{ steps.check.outputs.ahead }}
           STAGING: ${{ inputs.staging-branch }}
           BASE: ${{ inputs.base-branch }}
           FROZEN: ${{ steps.freeze.outputs.frozen }}
         run: |
           set -euo pipefail
 
-          COMMITS=$(git log --oneline --no-merges "origin/${BASE}..origin/${STAGING}")
-          CONTRIBUTORS=$(git log --format='%an' "origin/${BASE}..origin/${STAGING}" | sort -u | sed 's/^/- /')
+          # Only what no release has shipped: `main..staging` keeps every commit a
+          # squash-merged release shipped, and its list outgrew GitHub's 65,536
+          # character body limit. The script says where the list starts and why.
+          RELEASE=$(python3 .ci-shared/scripts/release_commits.py \
+            --repo "${REPO}" --base "${BASE}" --staging "${STAGING}")
+          COUNT=$(jq -r '.count' <<<"$RELEASE")
+          COMMITS=$(jq -r '.commits' <<<"$RELEASE")
+          CONTRIBUTORS=$(jq -r '.contributors' <<<"$RELEASE")
+          OMITTED=$(jq -r '.omitted' <<<"$RELEASE")
+          # A cut list links this run, whose summary the script filled with every
+          # commit. A compare link can't stand in: GitHub fails to render a range
+          # long enough to need the cut.
+          MORE_LINE=""
+          if [ "${OMITTED}" -gt 0 ]; then
+            MORE_LINE="…and ${OMITTED} more commit(s), cut to fit GitHub's body limit. The [run summary](${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}) lists all ${COUNT}."
+          fi
 
           # Find the PR before writing about it. The body describes whether this is
           # a draft, and only the PR itself knows that: an existing PR may already
@@ -179,12 +190,13 @@ jobs:
           BODY=$(cat <<EOF
           ## Release: ${STAGING} → ${BASE}
 
-          **${AHEAD} commit(s)** queued for the next production release.
+          **${COUNT} commit(s)** queued for the next production release.
 
           ### Changes
           \`\`\`
           ${COMMITS}
           \`\`\`
+          ${MORE_LINE}
 
           ### Contributors
           ${CONTRIBUTORS}
@@ -205,7 +217,7 @@ jobs:
           BODY="${BODY//$'\n'          /$'\n'}"
           BODY="${BODY#          }"
 
-          TITLE="Release: ${STAGING} → ${BASE} (${AHEAD} commits)"
+          TITLE="Release: ${STAGING} → ${BASE} (${COUNT} commits)"
 
           if [ -z "$EXISTING" ]; then
             # New PR. Draft unless the window is already open, so a rolling PR can
