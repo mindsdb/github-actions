@@ -159,7 +159,10 @@ jobs:
             echo "${STAGING} already contains ${BASE} — nothing to sync."
             exit 0
           fi
-          git merge --no-ff "origin/${BASE}" -m "Sync ${BASE} back into ${STAGING} after release"
+          # The same merge as sync-main-to-staging.yml: a conflict only on changes
+          # staging already holds lands, and any other conflict fails naming them.
+          python3 ../.ci-shared/scripts/sync_staging.py \
+            --base "origin/${BASE}" --message "Sync ${BASE} back into ${STAGING} after release"
           git push origin "HEAD:${STAGING}"
 
       # The alert lives here rather than in each repo's wrapper, which is what

@@ -88,7 +88,7 @@ jobs:
 
       # After the checkout above, which would otherwise clean this back out of
       # the workspace.
-      - name: Check out the shared alert implementation
+      - name: Check out the shared alert and sync scripts
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: mindsdb/github-actions
@@ -124,8 +124,12 @@ jobs:
               exit 0
             fi
 
-            git merge --no-ff "origin/${BASE}" \
-              -m "Sync ${BASE} into ${STAGING}"
+            # A plain merge, or, when it conflicts only on changes staging already
+            # holds (a hotfix that landed on staging first), a merge that keeps
+            # staging's content. Any other conflict fails here, naming the files
+            # and the commits staging lacks.
+            python3 .ci-shared/scripts/sync_staging.py \
+              --base "origin/${BASE}" --message "Sync ${BASE} into ${STAGING}"
 
             if git push origin "HEAD:${STAGING}"; then
               echo "Pushed ${BASE} -> ${STAGING} on attempt ${attempt}."
