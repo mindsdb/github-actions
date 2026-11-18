@@ -89,6 +89,10 @@ runs:
         secrets: ${{ inputs.secrets }}
         no-cache-filters: ${{ inputs.no-cache-filters }}
         push: true
+        # Keep the pushed image a plain manifest, as build-push-ecr pushed it.
+        # The action's default adds a provenance attestation, which turns every
+        # tag into a manifest list with an unknown/unknown entry beside the image.
+        provenance: false
         tags: |
           ${{ steps.repo.outputs.image }}:${{ steps.repo.outputs.tag }}
           ${{ steps.repo.outputs.image }}:${{ inputs.build-for-environment }}
