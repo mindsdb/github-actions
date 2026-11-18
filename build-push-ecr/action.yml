@@ -6,6 +6,15 @@
 # new hash, identical content — whenever the PR's base or head moves, so
 # it's not a stable handle. The head SHA is immutable, making the extra
 # tag the one deploy-time consumers can pin race-free.
+#
+# Layer cache on a GitHub-hosted runner (remote-builder "false"): every build
+# imports from and exports to two caches, one per image.
+#   - The GitHub Actions cache, scope <module-name>. A run reads only its own
+#     branch, the PR's base branch and the default branch, and GitHub evicts
+#     entries it has not used for a while.
+#   - <registry>/<module-name>:buildcache in ECR, readable from any branch.
+# The in-cluster builder keeps its own local cache, so the remote-builder path
+# passes no cache flags and builds exactly as before.
 
 outputs:
   image:
@@ -20,7 +29,7 @@ inputs:
     description: "The backend environment we are building for (API calls are pointed to).  This should be one of (development, staging, production)."
     required: true
   extra-build-args:
-    description: "Extra args passed to 'docker build'."
+    description: "Extra args passed to 'docker build'. Split on whitespace, so no quoting."
     required: false
   src-path:
     description: "What folder to be (generally to find the Dockerfile in) default is root of repo"
@@ -37,35 +46,42 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - uses: FranzDiebold/github-env-vars-action@v2
-    # https://github.com/aws-actions/amazon-ecr-login
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
+    # The gha cache backend reads the cache service URL and token from
+    # ACTIONS_RESULTS_URL and ACTIONS_RUNTIME_TOKEN. The runner hands those to
+    # JavaScript actions only, never to a `run:` step, so a JavaScript step
+    # copies them into the job environment for the build below.
+    - name: Expose the GitHub Actions cache to BuildKit
+      if: inputs.remote-builder == 'false'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        script: |
+          for (const [name, value] of Object.entries(process.env)) {
+            if (name.startsWith('ACTIONS_')) core.exportVariable(name, value);
+          }
     - shell: bash
       id: build
       env:
         REMOTE_BUILDER: ${{ inputs.remote-builder }}
+        SRC_PATH: ${{ inputs.src-path || './' }}
+        IMAGE_NAME: ${{ inputs.module-name }}
+        IMAGE_REF: ${{ inputs.image-ref || github.sha }}
+        ENVIRONMENT: ${{ inputs.build-for-environment }}
+        EXTRA_BUILD_ARGS: ${{ inputs.extra-build-args }}
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        ECR_POLICY: ${{ github.action_path }}/shared-ecr-policy.json
       run: |
-        # Env var parsing
-
-        INPUT_SRC_PATH=${{ inputs.src-path }}
-        SRC_PATH=${INPUT_SRC_PATH:-"./"}
-        INPUT_IMAGE_REF=${{ inputs.image-ref }}
-        IMAGE_REF=${INPUT_IMAGE_REF:-$CI_SHA}
-        IMAGE_NAME=${{ inputs.module-name }}
-        REPO_IMAGE=${{ steps.login-ecr.outputs.registry }}/$IMAGE_NAME
-        DOCKER_BUILDKIT=1
-        ENVIRONMENT=${{ inputs.build-for-environment }}
-        BRANCH_NAME=${{env.ENV_NAME}}
+        REPO_IMAGE=$REGISTRY/$IMAGE_NAME
         IMAGE_TAG=$ENVIRONMENT-$IMAGE_REF
-        PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
         # On pull_request events, also tag by the immutable PR head SHA (see
         # header comment). HEAD_TAG is expanded unquoted on the build line —
-        # like $BUILD_ARGS — so the empty non-PR case contributes zero args.
+        # like $EXTRA_BUILD_ARGS — so the empty non-PR case contributes zero args.
         HEAD_TAG=""
         if [ -n "$PR_HEAD_SHA" ]; then
           HEAD_TAG="-t $REPO_IMAGE:$ENVIRONMENT-head-$PR_HEAD_SHA"
@@ -73,17 +89,21 @@ runs:
 
         # Create repo if needed
         aws ecr create-repository --repository-name $IMAGE_NAME && \
-        aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat ${{ github.action_path }}/shared-ecr-policy.json)" || \
+        aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text "$(cat $ECR_POLICY)" || \
         true # Just let this fail if the repo already exists
 
+        CACHE_ARGS=""
         if [ "$REMOTE_BUILDER" != "false" ]; then
           docker buildx create --name=remote-buildkit-agent --driver=remote --use tcp://remote-buildkit-agent.infrastructure.svc.cluster.local:80 || true # Create the builder (might already exist)
+        else
+          CACHE_ARGS="--cache-from type=gha,scope=$IMAGE_NAME --cache-to type=gha,scope=$IMAGE_NAME,mode=max
+                      --cache-from type=registry,ref=$REPO_IMAGE:buildcache --cache-to type=registry,ref=$REPO_IMAGE:buildcache,mode=max"
         fi
 
         cd $SRC_PATH
         BUILD_ARGS="--build-arg BUILD_FOR_ENVIRONMENT=$ENVIRONMENT --build-arg IMAGE_TAG=$IMAGE_TAG"
 
         # Finally, build our runner container
-        docker buildx build ${{ inputs.extra-build-args }} $BUILD_ARGS $HEAD_TAG -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:$ENVIRONMENT -t $REPO_IMAGE:latest --push .
-        
+        docker buildx build $EXTRA_BUILD_ARGS $BUILD_ARGS $CACHE_ARGS $HEAD_TAG -t $REPO_IMAGE:$IMAGE_TAG -t $REPO_IMAGE:$ENVIRONMENT -t $REPO_IMAGE:latest --push .
+
         echo "image=$REPO_IMAGE:$IMAGE_TAG" >> $GITHUB_OUTPUT
