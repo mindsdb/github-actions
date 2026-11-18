@@ -1,0 +1,106 @@
+# Builds an image with docker/build-push-action and pushes it to our ECR registry.
+#
+# The successor to build-push-ecr for GitHub-hosted runners. The job assumes
+# the ECR push role first (aws-actions/configure-aws-credentials with the org
+# variable ECR_PUSH_ROLE_ARN). Every flag reaches `docker buildx build` through
+# a named input; there is no free-form argument string.
+#
+# Tags, all on <registry>/<module-name>:
+#   <env>-<image-ref>       one per build; the `image` output
+#   <env>-head-<pr head sha> pull requests only; $GITHUB_SHA there is the merge
+#                           commit, which GitHub regenerates when the base or
+#                           head moves, so the head sha is the stable handle
+#   <env>, latest           moved to every build
+#
+# Cache: each build imports from and exports to the GitHub Actions cache
+# (scope <module-name>) and <image>:buildcache in ECR, mode=max.
+
+inputs:
+  module-name:
+    description: "Image name; also the ECR repository name, created with the shared policy if missing."
+    required: true
+  build-for-environment:
+    description: "The backend environment the build targets: development, staging or production. The BUILD_FOR_ENVIRONMENT build arg and the first part of every tag."
+    required: true
+  image-ref:
+    description: "The sha or version in the image tag. Defaults to the commit sha."
+    required: false
+    default: ${{ github.sha }}
+  context:
+    description: "Build context directory."
+    required: false
+    default: "."
+  file:
+    description: "Dockerfile path, relative to the repository (not to the context)."
+    required: false
+  target:
+    description: "Build stage to build."
+    required: false
+  build-args:
+    description: "Build args, one NAME=value per line."
+    required: false
+  build-contexts:
+    description: "Named build contexts, one name=source per line."
+    required: false
+  secrets:
+    description: "Build secrets, one id=value per line."
+    required: false
+  no-cache-filters:
+    description: "Stages to build without cache, one per line."
+    required: false
+
+outputs:
+  image:
+    description: "<registry>/<module-name>:<env>-<image-ref>"
+    value: ${{ steps.repo.outputs.image }}:${{ steps.repo.outputs.tag }}
+  digest:
+    description: "Digest of the pushed image."
+    value: ${{ steps.build.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+      id: ecr
+    - name: Ensure the ECR repository
+      id: repo
+      shell: bash
+      env:
+        IMAGE_NAME: ${{ inputs.module-name }}
+        REGISTRY: ${{ steps.ecr.outputs.registry }}
+        TAG: ${{ inputs.build-for-environment }}-${{ inputs.image-ref }}
+        POLICY: ${{ github.action_path }}/shared-ecr-policy.json
+      run: |
+        set -euo pipefail
+        if ! aws ecr describe-repositories --repository-names "$IMAGE_NAME" >/dev/null 2>&1; then
+          aws ecr create-repository --repository-name "$IMAGE_NAME" >/dev/null
+          aws ecr set-repository-policy --repository-name "$IMAGE_NAME" --policy-text "$(cat "$POLICY")" >/dev/null
+        fi
+        echo "image=$REGISTRY/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+    - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      id: build
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        target: ${{ inputs.target }}
+        build-contexts: ${{ inputs.build-contexts }}
+        secrets: ${{ inputs.secrets }}
+        no-cache-filters: ${{ inputs.no-cache-filters }}
+        push: true
+        tags: |
+          ${{ steps.repo.outputs.image }}:${{ steps.repo.outputs.tag }}
+          ${{ steps.repo.outputs.image }}:${{ inputs.build-for-environment }}
+          ${{ steps.repo.outputs.image }}:latest
+          ${{ github.event.pull_request.head.sha && format('{0}:{1}-head-{2}', steps.repo.outputs.image, inputs.build-for-environment, github.event.pull_request.head.sha) || '' }}
+        build-args: |
+          BUILD_FOR_ENVIRONMENT=${{ inputs.build-for-environment }}
+          IMAGE_TAG=${{ steps.repo.outputs.tag }}
+          ${{ inputs.build-args }}
+        cache-from: |
+          type=gha,scope=${{ inputs.module-name }}
+          type=registry,ref=${{ steps.repo.outputs.image }}:buildcache
+        cache-to: |
+          type=gha,scope=${{ inputs.module-name }},mode=max
+          type=registry,ref=${{ steps.repo.outputs.image }}:buildcache,mode=max
