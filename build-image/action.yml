@@ -12,8 +12,10 @@
 #                           head moves, so the head sha is the stable handle
 #   <env>, latest           moved to every build
 #
-# Cache: each build imports from and exports to the GitHub Actions cache
-# (scope <module-name>) and <image>:buildcache in ECR, mode=max.
+# Cache: each build imports from and exports to <image>:buildcache in ECR,
+# mode=max. Measured against the GitHub Actions cache on a 938 MB build
+# stage, ECR was faster both ways (34s against 55s to pull it back, 67s
+# against 167s to export), and it is readable from every branch.
 
 inputs:
   module-name:
@@ -102,9 +104,5 @@ runs:
           BUILD_FOR_ENVIRONMENT=${{ inputs.build-for-environment }}
           IMAGE_TAG=${{ steps.repo.outputs.tag }}
           ${{ inputs.build-args }}
-        cache-from: |
-          type=gha,scope=${{ inputs.module-name }}
-          type=registry,ref=${{ steps.repo.outputs.image }}:buildcache
-        cache-to: |
-          type=gha,scope=${{ inputs.module-name }},mode=max
-          type=registry,ref=${{ steps.repo.outputs.image }}:buildcache,mode=max
+        cache-from: type=registry,ref=${{ steps.repo.outputs.image }}:buildcache
+        cache-to: type=registry,ref=${{ steps.repo.outputs.image }}:buildcache,mode=max
