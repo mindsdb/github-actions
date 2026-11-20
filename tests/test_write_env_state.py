@@ -221,4 +221,4 @@ class TestAction:
         pending = next(step for step in steps if step.get("name") == "Mark the commit as waiting for Argo CD")
         assert steps.index(pending) > steps.index(next(step for step in steps if step.get("id") == "write"))
         assert pending["if"] == "steps.write.outputs.pushed == 'true'"
-        assert "state=pending" in pending["run"] and 'context="argocd/$ENV_NAME"' in pending["run"]
+        assert "state=pending" in pending["run"] and 'context="argocd/$ENV_NAME/$SERVICE"' in pending["run"]
