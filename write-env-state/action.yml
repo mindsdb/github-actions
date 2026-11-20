@@ -16,10 +16,11 @@
 # in argocd-state. scripts/write_env_state.py does the work; its tests are in
 # tests/test_write_env_state.py.
 #
-# When a commit was pushed, commit status `argocd/<env>` is set to pending
-# on `sha` in the calling repository: Argo CD's notifier sets the same
-# status to success or failure once it has synced, so a sync that never
-# starts shows as a pending that never clears. A rerun that finds the file
+# When a commit was pushed, commit status `argocd/<env>/<service>` is set to
+# pending on `sha` in the calling repository: Argo CD's notifier sets the
+# same status to success or failure once that service has synced, so a sync
+# that never starts shows as a pending that never clears. One status per
+# service, so a repository that deploys two charts can tell them apart. A rerun that finds the file
 # already up to date sets nothing, since nothing will sync. The calling job
 # needs `statuses: write`.
 
@@ -101,6 +102,6 @@ runs:
       run: |
         set -euo pipefail
         gh api "repos/$REPOSITORY/statuses/$SHA" \
-          -f state=pending -f context="argocd/$ENV_NAME" \
+          -f state=pending -f context="argocd/$ENV_NAME/$SERVICE" \
           -f description="Waiting for Argo CD to sync" \
           -f target_url="$ARGOCD_URL/applications/$ENV_NAME-$SERVICE?operation=true" > /dev/null
