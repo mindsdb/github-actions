@@ -1,0 +1,84 @@
+# Keep a pull request that changes migrations (or another order-sensitive file)
+# from merging on results from an old base. scripts/migration_freshness.py does
+# the work and explains the rule; its tests are in tests/test_migration_freshness.py.
+#
+# mode: pr — in the pull request's workflow, as a job named
+# `migration-freshness` with no `needs:` and no `if:`, because GitHub counts a
+# skipped job as passing. It exits 0 at once for a pull request that changes no
+# protected path, and fails a protected one whose head lacks the base tip.
+# Output `protected` is `true` when the caller should run its own
+# migration-graph check on the head. Job permissions: contents read,
+# pull-requests read.
+#
+# mode: refresh — on every push to a gated base, in a workflow of its own. It
+# writes a `failure` status named `migration-freshness` on each open protected
+# pull request the push left behind. Job permissions: contents read,
+# pull-requests read, statuses write.
+#
+# mode: backfill — refresh plus a `success` status on unprotected open pull
+# requests that have none, run once by hand when the rule turns on.
+
+name: Migration freshness
+description: Fail a pull request that changes protected paths while its head lacks the base branch's current tip
+
+inputs:
+  mode:
+    description: "pr, refresh or backfill"
+    required: true
+  protected-paths:
+    description: "Path patterns, one per line; fnmatch, so * also matches /"
+    required: true
+  constant-file:
+    description: "A file whose matching lines are protected too (optional)"
+    required: false
+    default: ""
+  constant-pattern:
+    description: "A regular expression for those lines, matched against each changed line of constant-file"
+    required: false
+    default: ""
+  gated-bases:
+    description: "pr mode: the base branches the rule covers, space separated"
+    required: false
+    default: "staging main"
+  token:
+    description: "A token that may read pull requests (and, outside pr mode, write commit statuses)"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  protected:
+    description: "pr mode: true when the pull request changes a protected path"
+    value: ${{ steps.check.outputs.protected }}
+  tip:
+    description: "pr mode: the base tip the head was compared with, when protected"
+    value: ${{ steps.check.outputs.tip }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        MODE: ${{ inputs.mode }}
+        PATHS: ${{ inputs.protected-paths }}
+        CONSTANT_FILE: ${{ inputs.constant-file }}
+        CONSTANT_PATTERN: ${{ inputs.constant-pattern }}
+        GATED_BASES: ${{ inputs.gated-bases }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_BASE: ${{ github.event.pull_request.base.ref }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        REF_NAME: ${{ github.ref_name }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        args=(--repo "$REPOSITORY" --paths "$PATHS"
+              --constant-file "$CONSTANT_FILE" --constant-pattern "$CONSTANT_PATTERN"
+              --github-output "$GITHUB_OUTPUT" --step-summary "$GITHUB_STEP_SUMMARY")
+        if [ "$MODE" = pr ]; then
+          args+=(--base "$PR_BASE" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA" --gated-bases "$GATED_BASES")
+        else
+          args+=(--base "$REF_NAME")
+        fi
+        python3 "$ACTION_PATH/../scripts/migration_freshness.py" "$MODE" "${args[@]}"
