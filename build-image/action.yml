@@ -19,7 +19,7 @@
 
 inputs:
   module-name:
-    description: "Image name; also the ECR repository name, created with the shared policy if missing."
+    description: "Image name; also the ECR repository name. ECR creates a missing repository on push from the registry's creation template (terraform, github-oidc)."
     required: true
   build-for-environment:
     description: "The backend environment the build targets: development, staging or production. The BUILD_FOR_ENVIRONMENT build arg and the first part of every tag."
@@ -65,21 +65,14 @@ runs:
     - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
     - uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
       id: ecr
-    - name: Ensure the ECR repository
+    - name: Name the image
       id: repo
       shell: bash
       env:
-        IMAGE_NAME: ${{ inputs.module-name }}
-        REGISTRY: ${{ steps.ecr.outputs.registry }}
+        IMAGE: ${{ steps.ecr.outputs.registry }}/${{ inputs.module-name }}
         TAG: ${{ inputs.build-for-environment }}-${{ inputs.image-ref }}
-        POLICY: ${{ github.action_path }}/shared-ecr-policy.json
       run: |
-        set -euo pipefail
-        if ! aws ecr describe-repositories --repository-names "$IMAGE_NAME" >/dev/null 2>&1; then
-          aws ecr create-repository --repository-name "$IMAGE_NAME" >/dev/null
-          aws ecr set-repository-policy --repository-name "$IMAGE_NAME" --policy-text "$(cat "$POLICY")" >/dev/null
-        fi
-        echo "image=$REGISTRY/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
     - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
       id: build
