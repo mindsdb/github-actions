@@ -278,3 +278,11 @@ def test_backfill_still_marks_stale_protected_pull_requests():
     gh = FakeGh(pulls=[(7, HEAD)], files={7: [changed("app/db/alembic/versions/a.py")]}, behind={HEAD: 3})
     run_refresh(gh, mode="backfill")
     assert [fields["state"] for _, fields in gh.posted] == ["failure"]
+
+
+def test_a_retarget_refreshes_the_pull_requests_new_base():
+    # On pull_request_target, github.ref names the default branch, so a refresh
+    # that read it would check the wrong base after a retarget onto staging.
+    action = (Path(__file__).resolve().parents[1] / "migration-freshness" / "action.yml").read_text()
+    assert "PR_BASE: ${{ github.event.pull_request.base.ref }}" in action
+    assert 'args+=(--base "${PR_BASE:-$REF_NAME}")' in action

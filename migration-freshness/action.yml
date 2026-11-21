@@ -2,7 +2,7 @@
 # from merging on results from an old base. scripts/migration_freshness.py does
 # the work and explains the rule; its tests are in tests/test_migration_freshness.py.
 #
-# mode: pr — in the pull request's workflow, as a job named
+# mode: pr: in the pull request's workflow, as a job named
 # `migration-freshness` with no `needs:` and no `if:`, because GitHub counts a
 # skipped job as passing. It exits 0 at once for a pull request that changes no
 # protected path, and fails a protected one whose head lacks the base tip.
@@ -10,12 +10,13 @@
 # migration-graph check on the head. Job permissions: contents read,
 # pull-requests read.
 #
-# mode: refresh — on every push to a gated base, in a workflow of its own. It
+# mode: refresh: on every push to a gated base, in a workflow of its own, and
+# on a pull_request_target `edited` event that changed a pull request's base. It
 # writes a `failure` status named `migration-freshness` on each open protected
-# pull request the push left behind. Job permissions: contents read,
+# pull request into that base which lacks its tip. Job permissions: contents read,
 # pull-requests read, statuses write.
 #
-# mode: backfill — refresh plus a `success` status on unprotected open pull
+# mode: backfill: refresh plus a `success` status on unprotected open pull
 # requests that have none, run once by hand when the rule turns on.
 
 name: Migration freshness
@@ -79,6 +80,8 @@ runs:
         if [ "$MODE" = pr ]; then
           args+=(--base "$PR_BASE" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA" --gated-bases "$GATED_BASES")
         else
-          args+=(--base "$REF_NAME")
+          # A retarget arrives as pull_request_target, whose ref is the default
+          # branch, not the pull request's new base.
+          args+=(--base "${PR_BASE:-$REF_NAME}")
         fi
         python3 "$ACTION_PATH/../scripts/migration_freshness.py" "$MODE" "${args[@]}"
