@@ -432,7 +432,7 @@ The calling job has no `needs:` and no `if:`, because GitHub counts a skipped jo
         run: pytest tests/test_migration_graph.py
 ```
 
-The refresher's job needs `statuses: write` as well. A required status check also blocks direct pushes to the branch, so the ruleset that requires `migration-freshness` lists the release-train App as a bypass actor, or its sync and unfreeze pushes fail. Patterns use `fnmatch`, where `*` also matches `/`: `*/migrations/*` covers every app's migrations folder at any depth.
+The refresher also runs on `pull_request_target` with `types: [edited]` on the gated bases, with a job `if:` that passes only when `github.event.changes.base` is set. A stacked pull request whose base merged is retargeted onto `staging` and otherwise keeps the check it passed against its old base. The job checks out nothing and runs no pull request code, so the base repository's token is safe on that trigger. Its concurrency group includes the event name, so a skipped title-edit run never cancels a push refresh. The refresher's job needs `statuses: write` as well. A required status check also blocks direct pushes to the branch, so the ruleset that requires `migration-freshness` lists the release-train App as a bypass actor, or its sync and unfreeze pushes fail. Patterns use `fnmatch`, where `*` also matches `/`: `*/migrations/*` covers every app's migrations folder at any depth.
 
 One race remains. A merge that lands in the seconds between a base push and the refresher's write still goes through. Only strict mode or a merge queue closes it, and both apply to every pull request. The caller's graph check on the base branch's own push stays the backstop.
 
