@@ -18,19 +18,21 @@ So the rule lives here, as one required check named ``migration-freshness``:
   repository's own migration-graph check can run on the head and see what the
   base will see.
 
-``pr`` runs in the pull request's own workflow. It passes an unprotected pull
-request at once and fails a protected one whose head lacks the tip. The calling
-job runs its graph check after it, on the head, only when the output
-``protected`` is ``true``.
+``pr`` runs in a workflow of its own, on a pull request's opened, reopened,
+synchronize and edited events. It passes an unprotected pull request at once
+and fails a protected one whose head lacks the tip. The calling job runs its
+graph check after it, on the head, only when the output ``protected`` is
+``true``. GitHub sends ``edited`` when a pull request's base changes, so a
+retargeted pull request is checked against its new base.
 
-``refresh`` runs on every push to a gated base. A green check run stays green
-after the base moves, so it writes a ``failure`` commit status with the same
-name on the head of every open protected pull request that the push left
-behind. GitHub requires a check run and a commit status that share a required
-name to both pass, so that pull request cannot merge until its author merges
-the base and the check runs again on the new head. It never writes
-``success``: a head that lacks the tip once lacks it for good, because the
-base only moves forward.
+``refresh`` runs on every push to a gated base, and on a manual dispatch. A
+green check run stays green after the base moves, so it writes a ``failure``
+commit status with the same name on the head of every open protected pull
+request that the push left behind. GitHub requires a check run and a commit
+status that share a required name to both pass, so that pull request cannot
+merge until its author merges the base and the check runs again on the new
+head. It never writes ``success``: a head that lacks the tip once lacks it for
+good, because the base only moves forward.
 
 ``backfill`` is ``refresh`` for the day the rule turns on. Open pull requests
 from before then have no ``migration-freshness`` check run at all, so it also
@@ -48,6 +50,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Callable, Sequence
@@ -56,6 +59,14 @@ from typing import Callable, Sequence
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 CONTEXT = "migration-freshness"
+
+# Seconds to wait before the second and the third try of a failed `gh api`
+# call. One refresh makes dozens of calls, and a single 502 or other transient
+# answer must not leave a stale pull request green until the next push.
+RETRY_DELAYS = (1, 4)
+
+# The wait between tries; the tests replace it so they never really sleep.
+sleep = time.sleep
 
 # GitHub's pull request files endpoint stops at 3000 files and drops the
 # `patch` of a file whose diff is too large. Either one hides what changed, so
@@ -76,6 +87,12 @@ class Rules:
     constant_pattern: str = ""
 
     def __post_init__(self) -> None:
+        # A rule that protects nothing passes every pull request without a word.
+        if not self.paths:
+            raise ValueError("protected-paths is empty, so nothing would be protected")
+        folders = [pattern for pattern in self.paths if pattern.endswith("/")]
+        if folders:
+            raise ValueError(f"{', '.join(folders)} ends in / and matches no file; add a * to cover the folder")
         if bool(self.constant_file) != bool(self.constant_pattern):
             raise ValueError("constant-file and constant-pattern go together")
 
@@ -106,7 +123,17 @@ def _run(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
 
 
 def _gh_json(args: Sequence[str], runner: Runner) -> object:
+    """Run `gh api`, trying again after each of RETRY_DELAYS, and parse its JSON.
+
+    Every call here reads, except the status write, which GitHub accepts again
+    without harm, so each one is safe to repeat.
+    """
     result = runner(["gh", "api", *args])
+    for delay in RETRY_DELAYS:
+        if result.returncode == 0:
+            break
+        sleep(delay)
+        result = runner(["gh", "api", *args])
     if result.returncode != 0:
         # Both streams: `gh` prints the API's error body on stdout and its own
         # diagnostics on stderr.
@@ -138,7 +165,9 @@ def changed_files(repo: str, number: int, runner: Runner) -> list[ChangedFile]:
 
 def behind_by(repo: str, tip: str, head_sha: str, runner: Runner) -> int:
     """How many of the base tip's commits the head lacks."""
-    comparison = _gh_json([f"repos/{repo}/compare/{tip}...{head_sha}"], runner)
+    # One commit per page: the count is all this reads, and a release pull
+    # request's full commit list runs to megabytes.
+    comparison = _gh_json([f"repos/{repo}/compare/{tip}...{head_sha}?per_page=1"], runner)
     return int(comparison["behind_by"])
 
 
@@ -151,11 +180,12 @@ def scope(files: Sequence[ChangedFile], rules: Rules) -> Scope:
             for pattern in rules.paths:
                 if fnmatchcase(name, pattern):
                     return Scope(True, f"{name} matches {pattern}")
-        if constant is not None and changed.filename == rules.constant_file:
+        if constant is not None and rules.constant_file in (changed.filename, changed.previous_filename):
             if changed.patch is None:
                 return Scope(True, f"{changed.filename} has no diff to read, so a constant may have changed")
+            # A per-file patch has no ---/+++ headers, so every +/- line is content.
             for line in changed.patch.splitlines():
-                if line[:1] in "+-" and not line.startswith(("+++", "---")) and constant.search(line[1:]):
+                if line.startswith(("+", "-")) and constant.search(line[1:]):
                     return Scope(True, f"{changed.filename} changes {line[1:].strip()}")
     return Scope(False, "no protected path changed")
 
@@ -239,7 +269,6 @@ def plan_refresh(repo: str, base: str, rules: Rules, backfill: bool, runner: Run
     and makes the run fail, so a refresher that skipped someone shows red.
     """
     tip = base_tip(repo, base, runner)
-    stale = f"{base} moved to {tip[:7]}; merge {base} into this branch and push"
     actions: list[RefreshAction] = []
     for pull in open_pulls(repo, base, runner):
         try:
@@ -256,6 +285,9 @@ def plan_refresh(repo: str, base: str, rules: Rules, backfill: bool, runner: Run
             elif latest_state(repo, pull.head_sha, runner) == "failure":
                 actions.append(RefreshAction(pull.number, pull.head_sha, "", "already marked stale", found.reason))
             else:
+                # A status belongs to the head commit, which another pull request
+                # into another base can share, so the text names this one.
+                stale = f"#{pull.number} into {base}: {base} moved to {tip[:7]}; merge {base} into that branch and push"
                 actions.append(RefreshAction(pull.number, pull.head_sha, "failure", stale, found.reason))
         except GitHubError as error:
             actions.append(RefreshAction(pull.number, pull.head_sha, "error", str(error), ""))
@@ -276,10 +308,8 @@ def _rules(args: argparse.Namespace) -> Rules:
     )
 
 
-def run_pr(args: argparse.Namespace, runner: Runner) -> int:
-    result = check_pr(
-        args.repo, args.pr, args.base, args.head_sha, args.gated_bases.split(), _rules(args), runner
-    )
+def run_pr(args: argparse.Namespace, rules: Rules, runner: Runner) -> int:
+    result = check_pr(args.repo, args.pr, args.base, args.head_sha, args.gated_bases.split(), rules, runner)
     protected = result.gated and result.scope.protected
     _write_lines(args.github_output, [f"protected={'true' if protected else 'false'}", f"tip={result.tip}"])
     if not protected:
@@ -297,10 +327,15 @@ def run_pr(args: argparse.Namespace, runner: Runner) -> int:
     return 0 if (not protected or result.fresh) else 1
 
 
-def run_refresh(args: argparse.Namespace, runner: Runner, backfill: bool) -> int:
-    plan = plan_refresh(args.repo, args.base, _rules(args), backfill, runner)
-    failed = 0
+def run_refresh(args: argparse.Namespace, rules: Rules, runner: Runner, backfill: bool) -> int:
     mode = "backfill" if backfill else "refresh"
+    if args.base not in args.gated_bases.split():
+        message = f"`{args.base}` is not one of the gated bases ({args.gated_bases}), so the {mode} wrote nothing."
+        print(f"::notice::{CONTEXT} {mode}: {message}")
+        _write_lines(args.step_summary, [f"**{CONTEXT} {mode}:** {message}"])
+        return 0
+    plan = plan_refresh(args.repo, args.base, rules, backfill, runner)
+    failed = 0
     lines = [f"**{CONTEXT} {mode}** of open pull requests into `{args.base}` at {plan.tip[:7]}:", ""]
     for action in plan.actions:
         if action.state in ("failure", "success"):
@@ -332,16 +367,20 @@ def main(argv: Sequence[str] | None = None, runner: Runner = _run) -> int:
     parser.add_argument("--constant-pattern", default="")
     parser.add_argument("--pr", type=int, help="pr mode: the pull request number")
     parser.add_argument("--head-sha", default="", help="pr mode: the pull request's head commit")
-    parser.add_argument("--gated-bases", default="staging main", help="pr mode: bases the rule covers")
+    parser.add_argument("--gated-bases", default="staging main", help="the base branches the rule covers")
     parser.add_argument("--github-output")
     parser.add_argument("--step-summary")
     args = parser.parse_args(argv)
     try:
+        rules = _rules(args)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
         if args.mode == "pr":
             if args.pr is None or not args.head_sha:
                 parser.error("pr mode needs --pr and --head-sha")
-            return run_pr(args, runner)
-        return run_refresh(args, runner, backfill=args.mode == "backfill")
+            return run_pr(args, rules, runner)
+        return run_refresh(args, rules, runner, backfill=args.mode == "backfill")
     except GitHubError as error:
         # Fail closed: a check that cannot read the pull request must not pass it.
         print(f"::error::{CONTEXT} could not read GitHub: {error}")

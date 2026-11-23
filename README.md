@@ -403,15 +403,23 @@ Two pull requests can each add a database migration on the same parent. Each pas
 
 | Mode | Runs on | What it does |
 |---|---|---|
-| `pr` | the pull request's workflow, as a job named `migration-freshness` | Passes an unprotected pull request, fails a protected one whose head lacks the tip, and outputs `protected=true` so the caller runs its graph check on the head |
-| `refresh` | every push to a gated base, in a workflow of its own | Writes a `failure` status named `migration-freshness` on each open protected pull request the push left behind |
+| `pr` | `pull_request` with types `opened`, `reopened`, `synchronize` and `edited`, in a workflow of its own, as a job named `migration-freshness` | Passes an unprotected pull request, fails a protected one whose head lacks the tip, and outputs `protected=true` so the caller runs its graph check on the head |
+| `refresh` | every push to a gated base, and `workflow_dispatch`, in a workflow of its own | Writes a `failure` status named `migration-freshness` on each open protected pull request the push left behind |
 | `backfill` | once, by hand, when the rule turns on | `refresh`, plus a `success` status on unprotected open pull requests that have none |
 
 The refresher exists because a green check run stays green after the base moves. GitHub requires a check run and a commit status that share a required name to both pass ([troubleshooting required status checks](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks)), so the stale pull request stays blocked until its author merges the base and the check passes on the new head. The refresher never writes `success`, because a head that lacks the tip once lacks it for good.
 
-The calling job has no `needs:` and no `if:`, because GitHub counts a skipped job as passing. A pull request whose base is not one of `gated-bases` passes without a lookup. A lookup that fails fails the check. A listing at GitHub's 3,000-file limit, or a constant file whose diff GitHub did not return, counts as protected.
+The calling job has no `needs:` and no `if:`, because GitHub counts a skipped job as passing. A pull request whose base is not one of `gated-bases` passes without a lookup, and a refresh or backfill on such a base writes nothing. Each GitHub call is tried up to three times. One that still fails fails the check in `pr` mode, and the run in `refresh` and `backfill`. A listing at GitHub's 3,000-file limit, or a constant file whose diff GitHub did not return, counts as protected.
 
 ```yaml
+# .github/workflows/migration-freshness.yml
+name: Migration freshness
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+jobs:
   migration-freshness:
     runs-on: ubuntu-latest
     permissions:
@@ -425,16 +433,17 @@ The calling job has no `needs:` and no `if:`, because GitHub counts a skipped jo
           protected-paths: |
             app/db/alembic/versions/*
       - if: steps.scope.outputs.protected == 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
       - if: steps.scope.outputs.protected == 'true'
         run: pytest tests/test_migration_graph.py
 ```
 
-The refresher also runs on `pull_request_target` with `types: [edited]` on the gated bases, with a job `if:` that passes only when `github.event.changes.base` is set. A stacked pull request whose base merged is retargeted onto `staging` and otherwise keeps the check it passed against its old base. The job checks out nothing and runs no pull request code, so the base repository's token is safe on that trigger. Its concurrency group includes the event name, so a skipped title-edit run never cancels a push refresh. The refresher's job needs `statuses: write` as well. A required status check also blocks direct pushes to the branch, so the ruleset that requires `migration-freshness` lists the release-train App as a bypass actor, or its sync and unfreeze pushes fail. Patterns use `fnmatch`, where `*` also matches `/`: `*/migrations/*` covers every app's migrations folder at any depth.
+The job runs on `edited` too, which GitHub sends when a pull request's base changes. A pull request moved onto a gated base is then checked against its new base, and the caller's graph check runs again on its head. A title or body edit re-runs the job as well, which takes seconds on an unprotected pull request and re-runs the graph check on a protected one. `pr` mode writes nothing, so a fork's read-only token is enough. The refresher runs only on `push` to the gated bases and on `workflow_dispatch`, so neither workflow needs `pull_request_target`. The refresher's job needs `statuses: write` beside the two read permissions the example shows. A required status check also blocks direct pushes to the branch, so the ruleset that requires `migration-freshness` lists the App that pushes release and sync commits as a bypass actor, or its sync and unfreeze pushes fail. Patterns use `fnmatch`, where `*` also matches `/`: `*/migrations/*` covers every app's migrations folder at any depth. A pattern that ends in `/` matches no file, so the action refuses it, and it refuses an empty list too.
 
-One race remains. A merge that lands in the seconds between a base push and the refresher's write still goes through. Only strict mode or a merge queue closes it, and both apply to every pull request. The caller's graph check on the base branch's own push stays the backstop.
+One race remains. A merge that lands in the minute or so between a base push and the refresher's write still goes through. Only strict mode or a merge queue closes it, and both apply to every pull request. The caller's graph check on the base branch's own push stays the backstop. Two gaps sit outside the rule. A hotfix migration on `main` reaches `staging` through the App's sync push, which bypasses the rule, so no pull request check runs before it lands, and the graph check on that push to `staging` is the backstop there too. A `[skip ci]` head leaves the check unreported, and a `[skip ci]` merge skips the refresher.
 
 ## Reading a Kubernetes secret
 
