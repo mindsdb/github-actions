@@ -8,6 +8,9 @@ runs:
       run: |
         touch .pre-commit-config.yaml
         cat "${{ github.action_path }}/.pre-commit-config.yaml" > .pre-commit-config.yaml
+    - name: Install pre-commit
+      shell: bash
+      run: pipx install pre-commit
     - name: Run pre-commit
       shell: bash
       run: |
