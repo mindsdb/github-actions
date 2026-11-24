@@ -8,6 +8,8 @@ whose PR fails that test is stale and is deleted here.
 
 Environments are listed before PRs, so an environment created mid-run is left
 for the next run. A repo whose PR list cannot be read is skipped entirely.
+Each read retries up to three attempts, since one truncated ``--paginate`` page
+fails the call; writes run once, so a reminder is never posted twice.
 
 A closed PR labelled ``deploy`` and ``customer:<hostBase>`` had a customer env
 whose data nothing deletes, so each one gets a single comment listing it (see
@@ -21,9 +23,11 @@ import argparse
 import re
 import subprocess
 import sys
+import time
 from typing import Callable, Iterable, Sequence
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
+Sleep = Callable[[float], None]
 
 DEPLOY_LABEL = "deploy"
 CUSTOMER_PREFIX = "customer:"
@@ -39,6 +43,17 @@ This customer env is gone, but its data is not. Delete by hand when the engageme
 
 def _run(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(list(argv), capture_output=True, text=True, check=False)
+
+
+def _read(runner: Runner, argv: Sequence[str], *, sleep: Sleep, attempts: int = 3) -> "subprocess.CompletedProcess[str]":
+    """Run a read-only gh call, retrying a failure after 2 s, then 4 s; returns the last result."""
+    result = runner(argv)
+    for attempt in range(1, attempts):
+        if result.returncode == 0:
+            break
+        sleep(2 * attempt)
+        result = runner(argv)
+    return result
 
 
 def stale_environments(repo: str, names: Iterable[str], keep: set[int]) -> list[str]:
@@ -61,22 +76,22 @@ def _error(result: "subprocess.CompletedProcess[str]") -> str:
     return result.stderr.strip() or result.stdout.strip()
 
 
-def customer_reminders(repo: str, runner: Runner = _run, *, dry_run: bool) -> bool:
+def customer_reminders(repo: str, runner: Runner = _run, *, dry_run: bool, sleep: Sleep = time.sleep) -> bool:
     """Comment once on each closed PR in ``repo`` that had a customer env; False if a gh call failed."""
     slug = repo.split("/", 1)[1].replace("_", "-")
-    closed = runner([
+    closed = _read(runner, [
         "gh", "api", "--paginate", f"repos/{repo}/pulls?state=closed&per_page=100",
         "--jq", f'.[] | select(any(.labels[]; .name == "{DEPLOY_LABEL}")) | '
                 f'select(any(.labels[]; .name | startswith("{CUSTOMER_PREFIX}"))) | '
                 f'"\\(.number) \\([.labels[].name | select(startswith("{CUSTOMER_PREFIX}"))][0])"',
-    ])
+    ], sleep=sleep)
     if closed.returncode != 0:
         print(f"::error title={repo}::could not list closed PRs: {_error(closed)}", flush=True)
         return False
     ok = True
     for line in _lines(closed):
         number, label = line.split(" ", 1)
-        comments = runner(["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments", "--jq", ".[].body"])
+        comments = _read(runner, ["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments", "--jq", ".[].body"], sleep=sleep)
         if comments.returncode != 0:
             print(f"::error title={repo}::could not read comments on #{number}: {_error(comments)}", flush=True)
             ok = False
@@ -96,18 +111,18 @@ def customer_reminders(repo: str, runner: Runner = _run, *, dry_run: bool) -> bo
     return ok
 
 
-def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run) -> int:
+def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run, sleep: Sleep = time.sleep) -> int:
     failed = False
     for repo in repos:
-        envs = runner(["gh", "api", "--paginate", f"repos/{repo}/environments?per_page=100", "--jq", ".environments[].name"])
+        envs = _read(runner, ["gh", "api", "--paginate", f"repos/{repo}/environments?per_page=100", "--jq", ".environments[].name"], sleep=sleep)
         if envs.returncode != 0:
             print(f"::error title={repo}::could not list environments: {_error(envs)}", flush=True)
             failed = True
             continue
-        prs = runner([
+        prs = _read(runner, [
             "gh", "api", "--paginate", f"repos/{repo}/pulls?state=open&per_page=100",
             "--jq", f'.[] | select(any(.labels[]; .name == "{DEPLOY_LABEL}")) | .number',
-        ])
+        ], sleep=sleep)
         if prs.returncode != 0:
             print(f"::error title={repo}::could not list PRs, deleting nothing: {_error(prs)}", flush=True)
             failed = True
@@ -124,7 +139,7 @@ def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run) -> int:
                 failed = True
             else:
                 print(f"  deleted {name}", flush=True)
-        if not customer_reminders(repo, runner, dry_run=dry_run):
+        if not customer_reminders(repo, runner, dry_run=dry_run, sleep=sleep):
             failed = True
     return 1 if failed else 0
 
