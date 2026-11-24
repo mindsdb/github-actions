@@ -221,31 +221,31 @@ class TestCustomerReminders:
 class TestRetries:
     def test_truncated_closed_pr_page_is_retried(self, capsys):
         # 21 Nov: one truncated --paginate page failed the whole hourly run.
-        closed = {"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}]}
-        gh = FakeGh(envs={"mindsdb/auth": []}, prs={"mindsdb/auth": []}, closed=closed, flaky_closed={"mindsdb/auth": 1})
+        closed = {"mindsdb/example": [{"number": 5, "labels": ["deploy", "customer:acme"]}]}
+        gh = FakeGh(envs={"mindsdb/example": []}, prs={"mindsdb/example": []}, closed=closed, flaky_closed={"mindsdb/example": 1})
         pauses = []
-        assert prune.prune(["mindsdb/auth"], dry_run=False, runner=gh, sleep=pauses.append) == 0
+        assert prune.prune(["mindsdb/example"], dry_run=False, runner=gh, sleep=pauses.append) == 0
         assert len(gh.closed_listings()) == 2
         assert pauses == [2]
         assert "::error" not in capsys.readouterr().out
-        assert gh.posted() == [("mindsdb/auth", 5)]
+        assert gh.posted() == [("mindsdb/example", 5)]
 
     def test_read_failing_every_attempt_reports_as_before(self, capsys):
-        gh = FakeGh(envs={"mindsdb/auth": []}, prs={"mindsdb/auth": []}, fail_closed={"mindsdb/auth"})
+        gh = FakeGh(envs={"mindsdb/example": []}, prs={"mindsdb/example": []}, fail_closed={"mindsdb/example"})
         pauses = []
-        assert prune.prune(["mindsdb/auth"], dry_run=False, runner=gh, sleep=pauses.append) == 1
+        assert prune.prune(["mindsdb/example"], dry_run=False, runner=gh, sleep=pauses.append) == 1
         assert len(gh.closed_listings()) == 3
         assert pauses == [2, 4]
         errors = [line for line in capsys.readouterr().out.splitlines() if line.startswith("::error")]
-        assert errors == ["::error title=mindsdb/auth::could not list closed PRs: HTTP 502"]
+        assert errors == ["::error title=mindsdb/example::could not list closed PRs: HTTP 502"]
 
     def test_failed_reminder_post_is_not_repeated(self):
-        closed = {"mindsdb/auth": [{"number": 5, "labels": ["deploy", "customer:acme"]}]}
-        gh = FakeGh(envs={}, prs={}, closed=closed, comments={}, fail_post={("mindsdb/auth", 5)})
-        assert prune.customer_reminders("mindsdb/auth", gh, dry_run=False, sleep=no_sleep) is False
-        assert gh.posted() == [("mindsdb/auth", 5)]
+        closed = {"mindsdb/example": [{"number": 5, "labels": ["deploy", "customer:acme"]}]}
+        gh = FakeGh(envs={}, prs={}, closed=closed, comments={}, fail_post={("mindsdb/example", 5)})
+        assert prune.customer_reminders("mindsdb/example", gh, dry_run=False, sleep=no_sleep) is False
+        assert gh.posted() == [("mindsdb/example", 5)]
 
     def test_failed_delete_is_not_repeated(self):
-        gh = FakeGh(envs={"mindsdb/auth": ["pr-auth-1"]}, prs={"mindsdb/auth": []}, fail_delete={"pr-auth-1"})
-        assert prune.prune(["mindsdb/auth"], dry_run=False, runner=gh, sleep=no_sleep) == 1
-        assert gh.deleted() == ["mindsdb/auth/environments/pr-auth-1"]
+        gh = FakeGh(envs={"mindsdb/example": ["pr-example-1"]}, prs={"mindsdb/example": []}, fail_delete={"pr-example-1"})
+        assert prune.prune(["mindsdb/example"], dry_run=False, runner=gh, sleep=no_sleep) == 1
+        assert gh.deleted() == ["mindsdb/example/environments/pr-example-1"]
