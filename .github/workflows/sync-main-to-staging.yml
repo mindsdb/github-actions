@@ -20,7 +20,9 @@
 # the same App, so the CALLER must put both workflows in one `concurrency` group
 # to serialise them; the loser then finds staging already current and no-ops.
 # The push also retries once on a non-fast-forward, which covers a staging that
-# moved between fetch and push for any other reason.
+# moved between fetch and push for any other reason. A repository rule refusal
+# (GH013) does not retry: the same push meets the same rule, so the run stops
+# at once and names the rule.
 #
 # The push uses the `mindsdb-release-train` App token. The App is the ruleset
 # bypass actor on staging, so it lands even while staging is frozen — which is
@@ -115,6 +117,10 @@ jobs:
           # staging moved after the fetch (a concurrent sync, or an ordinary push
           # landing while staging is unfrozen), which shows up as a rejected
           # non-fast-forward rather than an error worth failing the run over.
+          # A repository rule refusal (GH013) does not retry, because the same
+          # push meets the same rule. On 2026-11-21 a hotfix on main changed a
+          # workflow file, the App had no `workflows` permission, and the run
+          # retried and then blamed a moving staging.
           for attempt in 1 2; do
             git fetch origin "${BASE}" "${STAGING}"
             git checkout -B "${STAGING}" "origin/${STAGING}"
@@ -131,7 +137,11 @@ jobs:
             python3 .ci-shared/scripts/sync_staging.py \
               --base "origin/${BASE}" --message "Sync ${BASE} into ${STAGING}"
 
-            if git push origin "HEAD:${STAGING}"; then
+            # Capture the push's output to read the refusal, and print it either
+            # way. The assignment sits in the `if`, so a failed push does not trip
+            # `set -e`.
+            if push_out=$(git push origin "HEAD:${STAGING}" 2>&1); then
+              echo "${push_out}"
               echo "Pushed ${BASE} -> ${STAGING} on attempt ${attempt}."
               {
                 echo "## Synced \`${BASE}\` into \`${STAGING}\`"
@@ -139,6 +149,18 @@ jobs:
                 echo "\`${STAGING}\` now contains every commit on \`${BASE}\`."
               } >> "$GITHUB_STEP_SUMMARY"
               exit 0
+            fi
+            echo "${push_out}"
+
+            if grep -q 'GH013' <<<"${push_out}"; then
+              # The rule lines read `remote: - <rule>`; join them onto one line.
+              rules=$(grep '^remote: - ' <<<"${push_out}" | sed 's/^remote: - //; s/[[:space:].]*$//' | paste -sd ';' - || true)
+              message="GitHub refused the push to ${STAGING} by a repository rule (GH013): ${rules:-see the push output above}. A retry meets the same rule, so this run stops."
+              if grep -q "without \`workflows\` permission" <<<"${push_out}"; then
+                message+=" The ${APP_SLUG} App needs the \"Workflows: Read and write\" permission: grant it on the App, accept it on the org installation, then re-run all jobs of this run to complete the sync."
+              fi
+              echo "::error::${message}"
+              exit 1
             fi
 
             echo "Push rejected on attempt ${attempt} — ${STAGING} moved underneath us."
