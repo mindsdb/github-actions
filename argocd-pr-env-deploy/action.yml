@@ -116,6 +116,19 @@ inputs:
 runs:
   using: composite
   steps:
+    # A branch that predates the argocd-state deploy calls this action with
+    # the old inputs and no state-token. Say so, instead of failing inside
+    # the checkout with "Input required and not supplied: token".
+    - shell: bash
+      env:
+        STATE_TOKEN: ${{ inputs.state-token }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        if [ -z "$STATE_TOKEN" ]; then
+          echo "::error::state-token is empty: this branch's build-deploy.yml predates the argocd-state deploy. Merge ${BASE_REF:-the base branch} into it and push; the environment keeps its last deploy until then."
+          exit 1
+        fi
+
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       with:
         repository: ${{ inputs.state-repository }}
