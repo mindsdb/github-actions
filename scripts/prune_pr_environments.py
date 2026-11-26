@@ -8,6 +8,13 @@ whose PR fails that test is stale and is deleted here.
 
 Environments are listed before PRs, so an environment created mid-run is left
 for the next run. A repo whose PR list cannot be read is skipped entirely.
+
+With ``--state-dir``, a clone of mindsdb/argocd-state, the same test deletes
+the environment's values file, ``pr-envs/pr-<repo slug>-<PR number>.yaml``,
+which the anchor's deploy job wrote and nothing else removes. A file whose
+``hostBase`` is set is a customer environment's, written and removed by hand,
+and is left alone. The deletions go in one commit, pushed with the same retry
+as a deploy's write.
 Each read retries up to three attempts, since one truncated ``--paginate`` page
 fails the call; writes run once, so a reminder is never posted twice.
 
@@ -24,7 +31,11 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Callable, Iterable, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from write_env_state import StateError, push_change  # noqa: E402
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 Sleep = Callable[[float], None]
@@ -66,6 +77,43 @@ def stale_environments(repo: str, names: Iterable[str], keep: set[int]) -> list[
         if match and int(match.group(1)) not in keep:
             stale.append(name)
     return sorted(stale)
+
+
+def stale_state_files(state_dir: Path, repo: str, keep: set[int]) -> list[Path]:
+    """The files under pr-envs/ for ``repo``'s PR envs whose PR is not in ``keep``, customer environments left out."""
+    names = {path.stem: path for path in (state_dir / "pr-envs").glob("pr-*.yaml")}
+    return [names[name] for name in stale_environments(repo, names, keep) if not _host_base(names[name])]
+
+
+def _host_base(path: Path) -> str:
+    """The file's hostBase, read without a YAML parser: CI writes none, and a hand-written customer file sets it on its own line."""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("hostBase:"):
+            return line.split(":", 1)[1].split("#", 1)[0].strip().strip("'\"")
+    return ""
+
+
+def delete_state_files(state_dir: Path, paths: Sequence[Path], *, dry_run: bool) -> bool:
+    """Delete these files from argocd-state in one pushed commit; False if the push failed."""
+    names = sorted(path.stem for path in paths)
+    if dry_run:
+        for name in names:
+            print(f"  would delete pr-envs/{name}.yaml", flush=True)
+        return True
+
+    def edit(root: Path) -> str | None:
+        gone = [name for name in names if (root / "pr-envs" / f"{name}.yaml").is_file()]
+        for name in gone:
+            (root / "pr-envs" / f"{name}.yaml").unlink()
+        return f"deleted {', '.join(gone)}" if gone else None
+
+    try:
+        _pushed, message = push_change(state_dir, "main", edit, "prune: " + ", ".join(names))
+    except StateError as error:
+        print(f"::error title=argocd-state::{error}", flush=True)
+        return False
+    print(f"argocd-state: {message}", flush=True)
+    return True
 
 
 def _lines(result: "subprocess.CompletedProcess[str]") -> list[str]:
@@ -111,8 +159,9 @@ def customer_reminders(repo: str, runner: Runner = _run, *, dry_run: bool, sleep
     return ok
 
 
-def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run, sleep: Sleep = time.sleep) -> int:
+def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run, sleep: Sleep = time.sleep, state_dir: Path | None = None) -> int:
     failed = False
+    stale_files: list[Path] = []
     for repo in repos:
         envs = _read(runner, ["gh", "api", "--paginate", f"repos/{repo}/environments?per_page=100", "--jq", ".environments[].name"], sleep=sleep)
         if envs.returncode != 0:
@@ -127,7 +176,10 @@ def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run, sleep: 
             print(f"::error title={repo}::could not list PRs, deleting nothing: {_error(prs)}", flush=True)
             failed = True
             continue
-        stale = stale_environments(repo, _lines(envs), {int(n) for n in _lines(prs)})
+        keep = {int(n) for n in _lines(prs)}
+        stale = stale_environments(repo, _lines(envs), keep)
+        if state_dir is not None:
+            stale_files += stale_state_files(state_dir, repo, keep)
         print(f"{repo}: {len(stale)} stale", flush=True)
         for name in stale:
             if dry_run:
@@ -141,6 +193,10 @@ def prune(repos: Sequence[str], *, dry_run: bool, runner: Runner = _run, sleep: 
                 print(f"  deleted {name}", flush=True)
         if not customer_reminders(repo, runner, dry_run=dry_run, sleep=sleep):
             failed = True
+    if stale_files:
+        print(f"argocd-state: {len(stale_files)} stale", flush=True)
+        if not delete_state_files(state_dir, stale_files, dry_run=dry_run):
+            failed = True
     return 1 if failed else 0
 
 
@@ -148,8 +204,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", action="append", required=True, metavar="OWNER/NAME", help="anchor repo; repeat for each")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--state-dir", type=Path, help="a clone of argocd-state with origin set; stale pr-envs/ files are deleted from it")
     args = parser.parse_args(argv)
-    return prune(args.repo, dry_run=args.dry_run)
+    return prune(args.repo, dry_run=args.dry_run, state_dir=args.state_dir)
 
 
 if __name__ == "__main__":

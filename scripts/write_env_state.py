@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 # The same shapes argocd-state's validate.py accepts.
 LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
@@ -84,30 +85,49 @@ def git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedP
 RACE_MARKERS = ("(fetch first)", "(non-fast-forward)", "(incorrect old value provided)", "cannot lock ref")
 
 
+def push_change(repo_dir: Path, branch: str, edit: Callable[[Path], str | None], message: str, attempts: int = 5) -> tuple[bool, str]:
+    """Apply ``edit`` to a fresh copy of the branch, commit it as ``message`` and push; retry while the push loses a race.
+
+    ``edit`` gets the clone's root, changes files in it, and returns what it did in words, or None when the
+    branch already says what it would write. Returns whether a commit was pushed and the message for the job log;
+    raises StateError when the push is refused for another reason, or the branch keeps moving."""
+    for attempt in range(1, attempts + 1):
+        git(repo_dir, "fetch", "--quiet", "origin", branch)
+        git(repo_dir, "reset", "--quiet", "--hard", f"origin/{branch}")
+        done = edit(repo_dir)
+        if done is None:
+            return False, f"{branch} already records this: nothing to push"
+        git(repo_dir, "add", "-A")
+        git(repo_dir, "commit", "--quiet", "-m", message)
+        push = git(repo_dir, "push", "--quiet", "origin", f"HEAD:{branch}", check=False)
+        if push.returncode == 0:
+            return True, f"{done} (attempt {attempt})"
+        if not any(marker in push.stderr for marker in RACE_MARKERS):
+            raise StateError(f"push to {branch} failed: {push.stderr.strip()}")
+    raise StateError(f"{branch} kept moving; gave up after {attempts} attempts")
+
+
 def record(repo_dir: Path, branch: str, env: str, service: str, sha: str, tag: str, attempts: int = 5) -> tuple[bool, str]:
     """Commit and push the edit. Returns whether a commit was pushed and a message saying what happened; raises StateError when it can't."""
     check(env, service, sha, tag)
     revision = sha
     path = Path(env) / f"{service}.yaml"
-    for attempt in range(1, attempts + 1):
-        git(repo_dir, "fetch", "--quiet", "origin", branch)
-        git(repo_dir, "reset", "--quiet", "--hard", f"origin/{branch}")
-        file = repo_dir / path
+
+    def edit(root: Path) -> str | None:
+        file = root / path
         if not file.is_file():
             raise StateError(f"{path} does not exist in argocd-state; adding a service is a reviewed change there, not a deploy")
         text = file.read_text(encoding="utf-8")
         new = updated_text(text, tag, revision)
         if new == text:
-            return False, f"{path} already records {tag} at {revision}"
+            return None
         file.write_text(new, encoding="utf-8")
-        git(repo_dir, "add", str(path))
-        git(repo_dir, "commit", "--quiet", "-m", f"{env}/{service}: {tag}")
-        push = git(repo_dir, "push", "--quiet", "origin", f"HEAD:{branch}", check=False)
-        if push.returncode == 0:
-            return True, f"{path}: tag {tag}, revision {revision} (attempt {attempt})"
-        if not any(marker in push.stderr for marker in RACE_MARKERS):
-            raise StateError(f"push to {branch} failed: {push.stderr.strip()}")
-    raise StateError(f"{branch} kept moving; gave up after {attempts} attempts")
+        return f"{path}: tag {tag}, revision {revision}"
+
+    pushed, message = push_change(repo_dir, branch, edit, f"{env}/{service}: {tag}", attempts)
+    if not pushed:
+        return False, f"{path} already records {tag} at {revision}"
+    return True, message
 
 
 def main(argv: list[str] | None = None) -> int:

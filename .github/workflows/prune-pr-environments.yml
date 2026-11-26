@@ -1,7 +1,8 @@
 name: Prune PR environments
 
-# Deletes each anchor repo's pr-<repo>-<N> GitHub Environment once PR N is
-# closed or loses the `deploy` label. See scripts/prune_pr_environments.py.
+# Deletes each anchor repo's pr-<repo>-<N> GitHub Environment, and the
+# environment's values file in argocd-state, once PR N is closed or loses the
+# `deploy` label. See scripts/prune_pr_environments.py.
 
 on:
   schedule:
@@ -49,6 +50,23 @@ jobs:
           # The customer close reminder is a PR comment.
           permission-pull-requests: write
 
+      - name: Mint a token for argocd-state
+        id: state-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd-state
+          permission-contents: write
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ github.repository_owner }}/argocd-state
+          token: ${{ steps.state-token.outputs.token }}
+          path: argocd-state
+          persist-credentials: true
+
       - name: Delete stale PR environments
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
@@ -60,7 +78,9 @@ jobs:
           IFS=',' read -ra repos <<< "${ANCHOR_REPOS}"
           for repo in "${repos[@]}"; do args+=(--repo "${OWNER}/${repo}"); done
           if [ "${DRY_RUN}" = true ]; then args+=(--dry-run); fi
-          python3 scripts/prune_pr_environments.py "${args[@]}"
+          git -C argocd-state config user.name "mindsdb-release-train[bot]"
+          git -C argocd-state config user.email "mindsdb-release-train[bot]@users.noreply.github.com"
+          python3 scripts/prune_pr_environments.py "${args[@]}" --state-dir argocd-state
 
   notify:
     needs: [prune]

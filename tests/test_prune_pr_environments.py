@@ -7,7 +7,10 @@ PR list could not be read.
 
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "prune_pr_environments.py"
 _spec = importlib.util.spec_from_file_location("prune_pr_environments", _PATH)
@@ -249,3 +252,93 @@ class TestRetries:
         gh = FakeGh(envs={"mindsdb/example": ["pr-example-1"]}, prs={"mindsdb/example": []}, fail_delete={"pr-example-1"})
         assert prune.prune(["mindsdb/example"], dry_run=False, runner=gh, sleep=no_sleep) == 1
         assert gh.deleted() == ["mindsdb/example/environments/pr-example-1"]
+
+
+def state_dir(tmp_path, files):
+    root = tmp_path / "argocd-state"
+    (root / "pr-envs").mkdir(parents=True)
+    for name, text in files.items():
+        (root / "pr-envs" / f"{name}.yaml").write_text(text)
+    return root
+
+
+STATE = {
+    "pr-auth-1": "tags:\n  auth: staging\n",
+    "pr-auth-2": "tags:\n  auth: staging\n",
+    "pr-mindshub-frontend-7": "hostBase: ''\ntags:\n  mindshub_frontend: staging\n",
+    "pr-mindshub-frontend-8": "hostBase: acme  # the customer\ntags:\n  mindshub_frontend: staging\n",
+    "pr-authx-3": "{}\n",
+}
+
+
+class TestStaleStateFiles:
+    def test_files_of_closed_or_unlabelled_prs_only_in_that_repo(self, tmp_path):
+        root = state_dir(tmp_path, STATE)
+        assert [p.name for p in prune.stale_state_files(root, "mindsdb/auth", {1})] == ["pr-auth-2.yaml"]
+        assert [p.name for p in prune.stale_state_files(root, "mindsdb/mindshub_frontend", set())] == ["pr-mindshub-frontend-7.yaml"]
+
+    def test_a_customer_environments_file_is_left_alone(self, tmp_path):
+        root = state_dir(tmp_path, STATE)
+        names = [p.name for p in prune.stale_state_files(root, "mindsdb/mindshub_frontend", set())]
+        assert "pr-mindshub-frontend-8.yaml" not in names
+
+    def test_no_pr_envs_directory_is_nothing_stale(self, tmp_path):
+        assert prune.stale_state_files(tmp_path, "mindsdb/auth", set()) == []
+
+
+class TestDeleteStateFiles:
+    def test_one_commit_deletes_every_stale_file(self, tmp_path, monkeypatch):
+        root = state_dir(tmp_path, STATE)
+        pushes = []
+
+        def fake_push(repo_dir, branch, edit, message, attempts=5):
+            pushes.append((repo_dir, branch, message, edit(repo_dir)))
+            return True, "pushed"
+
+        monkeypatch.setattr(prune, "push_change", fake_push)
+        paths = prune.stale_state_files(root, "mindsdb/auth", set())
+        assert prune.delete_state_files(root, paths, dry_run=False)
+        assert pushes == [(root, "main", "prune: pr-auth-1, pr-auth-2", "deleted pr-auth-1, pr-auth-2")]
+        assert not (root / "pr-envs" / "pr-auth-1.yaml").exists()
+        assert (root / "pr-envs" / "pr-authx-3.yaml").exists()
+
+    def test_a_file_already_gone_is_not_a_change(self, tmp_path, monkeypatch):
+        root = state_dir(tmp_path, STATE)
+        paths = prune.stale_state_files(root, "mindsdb/auth", set())
+        for path in paths:
+            path.unlink()
+        monkeypatch.setattr(prune, "push_change", lambda repo_dir, branch, edit, message, attempts=5: (False, edit(repo_dir) or "nothing"))
+        assert prune.delete_state_files(root, paths, dry_run=False)
+
+    def test_dry_run_deletes_nothing(self, tmp_path, capsys):
+        root = state_dir(tmp_path, STATE)
+        paths = prune.stale_state_files(root, "mindsdb/auth", set())
+        assert prune.delete_state_files(root, paths, dry_run=True)
+        assert (root / "pr-envs" / "pr-auth-1.yaml").exists()
+        assert "would delete pr-envs/pr-auth-1.yaml" in capsys.readouterr().out
+
+    def test_a_refused_push_fails_the_run(self, tmp_path, monkeypatch):
+        root = state_dir(tmp_path, STATE)
+
+        def refused(repo_dir, branch, edit, message, attempts=5):
+            raise prune.StateError("push to main failed: protected")
+
+        monkeypatch.setattr(prune, "push_change", refused)
+        assert not prune.delete_state_files(root, prune.stale_state_files(root, "mindsdb/auth", set()), dry_run=False)
+
+
+class TestPruneWithState:
+    def test_files_follow_the_prs_and_an_unreadable_repo_keeps_its_files(self, tmp_path, monkeypatch):
+        root = state_dir(tmp_path, STATE)
+        gh = FakeGh(envs={"mindsdb/auth": [], "mindsdb/mindshub_frontend": []},
+                    prs={"mindsdb/auth": [1], "mindsdb/mindshub_frontend": []}, fail_prs={"mindsdb/mindshub_frontend"})
+        deleted = []
+        monkeypatch.setattr(prune, "push_change", lambda repo_dir, branch, edit, message, attempts=5: (True, deleted.append(edit(repo_dir)) or "ok"))
+        assert prune.prune(["mindsdb/auth", "mindsdb/mindshub_frontend"], dry_run=False, runner=gh, sleep=no_sleep, state_dir=root) == 1
+        assert deleted == ["deleted pr-auth-2"]
+        assert (root / "pr-envs" / "pr-mindshub-frontend-7.yaml").exists()
+
+    def test_without_a_state_dir_nothing_is_pushed(self, monkeypatch):
+        gh = FakeGh(envs={"mindsdb/auth": []}, prs={"mindsdb/auth": []})
+        monkeypatch.setattr(prune, "push_change", lambda *a, **k: (_ for _ in ()).throw(AssertionError("pushed")))
+        assert prune.prune(["mindsdb/auth"], dry_run=False, runner=gh, sleep=no_sleep) == 0
