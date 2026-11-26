@@ -476,43 +476,60 @@ What actually goes wrong with a GitHub secret is different and has a cheaper fix
 
 ## PR environment rollout
 
-`argocd-pr-env-deploy` applies a PR's image tags to its ArgoCD environment and
-blocks until the environment is Synced and Healthy.
+`argocd-pr-env-deploy` resolves what a PR deploys (its own image, and every
+`Deploys:` link in its description), commits that to
+[argocd-state](https://github.com/mindsdb/argocd-state) as
+`pr-envs/pr-<repo>-<N>.yaml`, and waits for the commit status `argocd/pr-env`
+that Argo CD's notifications controller sets on the PR's head commit once the
+environment is up. The environment's parent Application reads that file as its
+values. Nothing talks to Argo CD, so the job runs on `ubuntu-latest`; it
+assumes the ECR push role first, which the image-existence checks use.
 
-The staff console is opt-in. A `mindshub_stafftools` anchor PR, or a
-`Deploys: mindshub_stafftools#<N|staging|main>` line, selects it. `argocd app
-set` only adds parameters, so when nothing selects the console any more the
-action unsets its two parameters, and removing the line turns the console off
-on the next deploy.
+The file's `tags` and `revisions` are replaced whole on every deploy, so a
+`Deploys:` link removed from the description drops its pin on the next deploy,
+and the staff console (opt-in: a `mindshub_stafftools` anchor PR or a
+`Deploys: mindshub_stafftools#<N|staging|main>` line) goes with its line.
+`services.apiHost`, which mindshub_services' stacks workflow writes, stays.
 
-It talks to ArgoCD over the **in-cluster Service** by default
-(`argo-cd-argocd-server.argocd.svc.cluster.local`), not over the public
-hostname. Every caller runs on `mdb-dev`, a runner pod in the same cluster, so
-the Service is the shortest path and the only one that does not depend on
-ingress or DNS state. The public hostname sits behind the internal-ops ingress
-and is reachable only from inside the VPC or over the VPN.
+Two things the description used to carry are refused with a comment: a
+`Deploys: argocd-envs#N` line (the parent chart's branch is an
+`argocd-envs:<branch>` label on the PR, which Argo CD reads itself) and a
+`customer:<hostBase>` label (a customer environment's file is written by hand,
+in a reviewed PR to argocd-state).
 
-`argocd-plaintext` defaults to `auto` and derives the transport from
-`argocd-server`: cleartext for an in-cluster or loopback endpoint, TLS for
-anything else. argocd-server runs with `server.insecure: true`, so it serves
-cleartext on Service port 80 and expects TLS to terminate at the ingress. That
-makes the two inputs a matched pair, which is why one derives from the other
-instead of both being set by hand.
+A re-run of the same commit pushes nothing and reads the status Argo CD last
+set. To deploy again, push a commit.
 
 ```yaml
   deploy-pr-env:
-    runs-on: mdb-dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # the ECR push role
+      statuses: write   # argocd/pr-env pending on the head commit
     steps:
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Mint a token for argocd-state
+        id: release-train
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: mindsdb
+          repositories: argocd-state
+          permission-contents: write
       - uses: mindsdb/github-actions/argocd-pr-env-deploy@main
         with:
-          argocd-token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          state-token: ${{ steps.release-train.outputs.token }}
           gh-token: ${{ secrets.GH_PULL_REQUEST_READ_TOKEN }}
-          # Only when the runner is outside the cluster:
-          # argocd-server: argo.dev.mindsdb.com
 ```
 
-The `ci-pr-envs` token is a JWT the server validates itself, so it works
-unchanged over either endpoint.
+`prune-pr-environments.yml` (hourly) deletes the GitHub Environment and the
+argocd-state file of every PR env whose PR is closed or has lost the `deploy`
+label; a file with a `hostBase` is a customer environment's and is left alone.
 
 ## PR environment comments
 

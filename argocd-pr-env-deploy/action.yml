@@ -1,4 +1,5 @@
-# Apply per-PR image tags to the anchor PR's ArgoCD environment.
+# Deploy the anchor PR's environment: resolve what it deploys, commit that to
+# mindsdb/argocd-state, and wait for Argo CD to report back.
 #
 # Resolves:
 #   - This PR (anchor) — own merge SHA (image built in this same run), repo
@@ -13,25 +14,19 @@
 #     + `main` git branch.
 #   - `Deploys: mindshub_services#N` sets `revisions.mindshub_services` only.
 #     That repo ships a SAM stack, not an image: its pr-env-stacks workflow
-#     reads the revision off the parent Application and deploys it, so there
+#     reads the revision off the environment's file and deploys it, so there
 #     is no ECR tag to check and no `tags.<repo>` to set.
 #   - The staff console is opt-in. A mindshub_stafftools anchor PR, or any
 #     `Deploys: mindshub_stafftools#...` line, sets its tag and revision, and
-#     the parent renders it only while both are set. `app set` only ever adds
-#     parameters, so when nothing selects the console any more the action
-#     unsets those two, and removing the line turns the console off on the
-#     next deploy. Values pinned in an argocd-envs branch are not parameters
-#     and stay.
-#   - `Deploys: argocd-envs#N` is special-cased. argocd-envs holds the PR
-#     env's own parent chart, so it has no image and no child Application.
-#     The link moves the PARENT Application's source.targetRevision onto
-#     that PR's head BRANCH (not its head SHA, so later pushes to the
-#     branch re-propagate on ArgoCD's own poll without re-running this
-#     anchor's pipeline). At most one such link, and the branch must live
-#     in mindsdb/argocd-envs itself, since that is the only repo ArgoCD
-#     fetches the parent chart from. `--revision` is passed on every
-#     deploy, defaulting to `main`, so dropping the line resets the parent
-#     (the AppSet's ignoreApplicationDifferences no longer reverts it).
+#     the parent renders it only while both are set. The file's `tags` and
+#     `revisions` are replaced whole on every deploy, so removing the line
+#     turns the console off on the next deploy, and a removed link of any
+#     kind drops its pin.
+#   - `Deploys: argocd-envs#N` is refused, with a comment: the parent chart's
+#     branch is an `argocd-envs:<branch>` label on the PR, which the
+#     pr-environments ApplicationSet reads itself.
+#   - A PR labeled `customer:<hostBase>` is refused. A customer environment's
+#     file in argocd-state is written by hand, in a reviewed PR there.
 #
 # Linked-PR image tags resolve in order:
 #   1. `development-head-<head sha>` — pushed by build-push-ecr's PR
@@ -45,7 +40,9 @@
 #      the env in ImagePullBackOff silently.
 # Every pinned tag — the anchor's own included — is existence-checked
 # against ECR (`aws ecr describe-images`; GitHub short name maps to the
-# `mindsdb-<name-with-hyphens>` ECR repo). Only Image/RepositoryNotFound
+# `mindsdb-<name-with-hyphens>` ECR repo). The calling job assumes the ECR
+# push role first (`ECR_PUSH_ROLE_ARN`, whose policy includes DescribeImages);
+# a hosted runner has no credentials of its own. Only Image/RepositoryNotFound
 # count as absent; if the aws CLI is missing or errors for infra reasons
 # (auth, throttle, network) the checks are skipped with one warning rather
 # than blocking a deploy that would have worked.
@@ -53,77 +50,53 @@
 # `Deploys:`-looking body lines that don't match the accepted forms (e.g. a
 # pasted PR URL) emit a ::warning:: instead of being silently ignored.
 #
-# Issues a single `argocd app set` against the parent Application
-# (`pr-<anchor>-<num>`) with `--helm-set tags.<repo>=development-<sha>` per
-# resolved repo, kicks the auto-sync via `argocd app sync --async`, and then
-# blocks on `argocd app wait` (`wait-timeout`, 30m default) so the GH job
-# stays open until the env is actually up. On timeout it prints every app's
-# sync/health plus any Application conditions, because the CLI's own timeout
-# message names neither the stuck app nor the reason.
+# Then it writes `pr-envs/pr-<anchor>-<num>.yaml` in argocd-state
+# (scripts/write_pr_env_state.py, retried when another deploy lands first)
+# and sets commit status `argocd/pr-env` to pending on the PR's head commit.
+# The parent Application reads that file as its values; Argo CD's
+# notifications controller flips the status to success once the parent has
+# synced and every child is healthy, or to failure when the sync fails or
+# times out (Kubernetes-Foundational-Services, argo-cd chart). The step waits
+# on the status (`wait-timeout`, 30m default) so the job stays open until the
+# env is actually up, and the integration tests after it run against it.
+# Nothing here talks to Argo CD, so this runs on ubuntu-latest.
 #
-# Rollout state surfaces in the PR via the caller workflow's `environment:`
-# block (native GH Deployment). The PR sidebar pill is `in_progress` while
-# the job runs and flips to `success`/`failure` on the job's exit code.
+# A re-run of the same commit with nothing changed pushes nothing and reads
+# the status Argo CD last set. To deploy again, push a commit; to sync again
+# without one, press Sync on the parent in Argo CD (argo.dev.mindsdb.com,
+# over the VPN).
 #
 # Must run from a `pull_request` event; PR number and head SHA are read from
 # $GITHUB_EVENT_PATH so callers don't have to pass them.
 #
-# ENDPOINT. The action talks to the in-cluster Service
-# (`argo-cd-argocd-server.argocd.svc.cluster.local`) by default, not to
-# `argo.dev.mindsdb.com`. Every caller runs on `mdb-dev`, a runner pod in the
-# same cluster, so the Service is the shortest path and the only one that does
-# not depend on ingress or DNS state. It also holds while the internal-ops
-# cutover (ENG-2079) is mid-flight: `argo.dev.mindsdb.com` moved to the private
-# ingress class before its private DNS record existed, so the public hostname
-# resolves to the public ALB, whose controller no longer reconciles that Ingress
-# and answers a bare HTTP 404. The argocd CLI surfaces that as
-# `rpc error: code = Unknown ... status code 404`, which matches none of the
-# tolerated states in the `app set` retry below and fails the deploy.
-#
-# argocd-server runs with `server.insecure: true`, so it serves cleartext on
-# Service port 80 and expects TLS to terminate at the ingress. `--plaintext` is
-# therefore required for the Service and wrong for the hostname; the
-# `argocd-plaintext: auto` default derives it from `argocd-server` so the two
-# inputs cannot drift apart. Pass the public hostname to route through the
-# ingress instead, which needs the runner to be inside the VPC or on the VPN.
-#
-# The `ci-pr-envs` token is a JWT the server validates itself, so it is
-# unaffected by which endpoint is used.
-#
-# Requires `curl` + `jq` on the runner. Does NOT require `gh` (the action
-# talks to the GitHub REST API directly). Uses the ambient `aws` CLI for
-# the ECR existence checks when present (degrades to a warning when not).
-# Installs `argocd` to $RUNNER_TEMP if it's not already on PATH.
-
+# Requires `curl`, `jq` and python3 with PyYAML on the runner (ubuntu-latest
+# has all three). Does NOT require `gh`.
 name: ArgoCD Deploy (PR env)
-description: Update the per-PR env's parent Application with own + linked image tags.
+description: Record the PR's own and linked image tags in argocd-state and wait for Argo CD to deploy them.
 
 inputs:
-  argocd-token:
-    description: ArgoCD API token (for the ci-pr-envs account).
+  state-token:
+    description: An installation token for mindsdb-release-train with contents write on argocd-state.
     required: true
   gh-token:
     description: GitHub PAT used to query cross-referenced PRs' head SHAs.
     required: true
-  argocd-server:
-    description: >-
-      ArgoCD server endpoint. Defaults to the in-cluster Service, because every
-      caller of this action runs on `mdb-dev`, a runner pod in the same cluster.
-      Set the public hostname (`argo.dev.mindsdb.com`) to go through the ingress
-      instead; that route is reachable only from inside the VPC or over the VPN.
+  state-repository:
+    description: The state repository.
     required: false
-    default: argo-cd-argocd-server.argocd.svc.cluster.local
-  argocd-plaintext:
-    description: >-
-      Whether to talk to the server over cleartext HTTP. `auto` (default) picks
-      it from `argocd-server`: cleartext for an in-cluster or loopback endpoint,
-      TLS for anything else. `true`/`false` override that.
+    default: mindsdb/argocd-state
+  state-branch:
+    description: The branch Argo CD reads.
     required: false
-    default: auto
-  argocd-version:
-    description: ArgoCD CLI version installed when missing from the runner.
+    default: main
+  status-token:
+    description: A token that may write commit statuses on the calling repository.
     required: false
-    default: v2.13.1
+    default: ${{ github.token }}
+  argocd-url:
+    description: The Argo CD that deploys the environment, for the status link.
+    required: false
+    default: https://argo.dev.mindsdb.com
   stacks-dispatch-token:
     description: >-
       Token used to dispatch mindshub_services' pr-env-stacks.yml for this env
@@ -133,30 +106,37 @@ inputs:
     default: ""
   wait-timeout:
     description: >-
-      Seconds to wait for the env to reach Synced+Healthy before failing.
-      Covers a cold env's image pulls and migrations, so lower it only if you
-      know this repo's envs come up faster.
+      Seconds to wait for Argo CD to report the env Synced+Healthy before
+      failing. Covers a cold env's image pulls and migrations, so lower it only
+      if you know this repo's envs come up faster. Argo CD itself fails a sync
+      after 30 minutes.
     required: false
     default: "1800"
 
 runs:
   using: composite
   steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      with:
+        repository: ${{ inputs.state-repository }}
+        ref: ${{ inputs.state-branch }}
+        token: ${{ inputs.state-token }}
+        path: argocd-state
+        persist-credentials: true
+
     - shell: bash
       env:
-        ARGOCD_SERVER: ${{ inputs.argocd-server }}
-        ARGOCD_PLAINTEXT: ${{ inputs.argocd-plaintext }}
-        ARGOCD_AUTH_TOKEN: ${{ inputs.argocd-token }}
-        ARGOCD_VERSION: ${{ inputs.argocd-version }}
         GH_TOKEN: ${{ inputs.gh-token }}
+        STATUS_TOKEN: ${{ inputs.status-token }}
+        STATE_BRANCH: ${{ inputs.state-branch }}
+        ARGOCD_URL: ${{ inputs.argocd-url }}
         STACKS_DISPATCH_TOKEN: ${{ inputs.stacks-dispatch-token || inputs.gh-token }}
         WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
 
-        # Fail fast on empty tokens — otherwise argocd silently falls back to
-        # an interactive `Username:` prompt and dies with `fatal msg=EOF`.
-        : "${ARGOCD_AUTH_TOKEN:?ARGOCD_AUTH_TOKEN is empty — check the org/repo secret is set and visible to this repo}"
+        # Fail fast on an empty token: a missing secret reads as "".
         : "${GH_TOKEN:?GH_TOKEN is empty — pass GH_PRIVATE_ACCESS_TOKEN via the gh-token input}"
 
         OWN_REPO="$GITHUB_REPOSITORY"
@@ -247,6 +227,13 @@ runs:
         PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON" | tr -d '\r')"
         LABEL_HOST="$(jq -r '[.labels[].name | select(startswith("customer:")) | ltrimstr("customer:")] | first // ""' <<<"$PR_JSON")"
 
+        # A customer environment's file is written by hand, in a reviewed PR
+        # to argocd-state, never by CI.
+        if [ -n "$LABEL_HOST" ]; then
+          echo "::error::Refusing to deploy: this PR carries the customer:${LABEL_HOST} label. A customer environment's file, pr-envs/${PARENT_APP}.yaml in argocd-state, is written by hand in a PR there."
+          exit 1
+        fi
+
         # Lint: `Deploys:`-looking lines that don't match the strict form
         # would otherwise be silently ignored and the env would quietly run
         # defaults — the classic offender is a pasted PR URL. Warn per line.
@@ -289,8 +276,9 @@ runs:
         # tags.mindshub_stafftools and revisions.mindshub_stafftools are set.
         # It is selected when this run sets its revision: a mindshub_stafftools
         # anchor, or a `Deploys: mindshub_stafftools#...` line the link loop
-        # below resolved. Reading set_args keeps that loop the one parser of
-        # `Deploys:` lines.
+        # below resolved. Nothing switches it off by hand: the writer replaces
+        # the file's maps with this run's, so an unselected console has no
+        # keys. Kept for the tests that pin which lines select it.
         staff_console_selected() {
           local arg
           for arg in "${set_args[@]}"; do
@@ -300,12 +288,6 @@ runs:
           done
           return 1
         }
-        # The staff console parameters a parent Application carries, one per
-        # line. Arg: the parent's `argocd app get -o json`.
-        staff_console_params() {
-          jq -r '.spec.source.helm.parameters[]? | select(.name == "tags.mindshub_stafftools" or .name == "revisions.mindshub_stafftools") | .name' <<<"$1"
-        }
-
         if is_revision_only_repo "$OWN_SHORT"; then
           set_args=(--helm-set "revisions.${OWN_SHORT}=${OWN_HEAD_SHA}")
         else
@@ -329,16 +311,8 @@ runs:
         # only kills that subshell, so the existence checks and the abort
         # must live out here where exit actually terminates the step (and
         # where the guard's warn-once cache persists across iterations).
-        # Parent chart revision. Always emitted into set_args below, default
-        # `main`: the AppSet's ignoreApplicationDifferences now covers
-        # spec/source/targetRevision, so nothing else will ever reset it.
-        # Removing a `Deploys: argocd-envs#N` line therefore has to actively
-        # reset the parent, or the env stays pinned to a branch that may since
-        # have been merged and deleted.
-        ENVS_REVISION=main
-        ENVS_LINK=""
-
         unresolved_links=()
+        envs_links=()
         while IFS=: read -r kind link repo merge_sha head_sha branch; do
           case "$kind" in
             unresolved)
@@ -375,22 +349,10 @@ runs:
               set_args+=(--helm-set "revisions.${repo}=${head_sha}")
               ;;
             envs)
-              # The parent chart itself. One source, so one branch: a second
-              # link is a contradiction rather than something to merge.
-              if [ -n "$ENVS_LINK" ]; then
-                echo "::error::Refusing to deploy: two 'Deploys: argocd-envs#N' links (${ENVS_LINK} and ${link}). The PR env renders from a single parent chart source, so only one argocd-envs branch can be deployed."
-                exit 1
-              fi
-              ENVS_LINK="$link"
-              ENVS_REVISION="$branch"
-              ;;
-            envs-fork)
-              echo "::error::Refusing to deploy: ${link} is opened from a fork. ArgoCD fetches the parent chart from ${link%%#*} only and cannot reach a fork's branch, so push the branch to ${link%%#*} and re-open the PR from there."
-              exit 1
-              ;;
-            envs-missing)
-              echo "::error::Refusing to deploy: could not resolve a head branch for ${link}. Check the PR exists and is open, then re-run this job."
-              exit 1
+              # The parent chart itself is not deployed from here any more:
+              # its branch is a label the ApplicationSet reads. Collected for
+              # one comment after the loop, where exit works.
+              envs_links+=("$link")
               ;;
             pr)
               # Prefer the head-SHA tag: PR head SHAs are immutable, so the
@@ -433,38 +395,16 @@ runs:
                   *)   full="${OWN_REPO%%/*}/$full" ;;
                 esac
                 [ "$full" = "$OWN_REPO" ] && continue
-                # `#staging` / `#main`: reuse the linked repo's release
-                # pipeline outputs, moving ECR image tag + git branch. For
-                # argocd-envs the branch is the parent chart revision itself.
-                if [ "$num" = "staging" ] || [ "$num" = "main" ]; then
-                  if [ "${full##*/}" = "argocd-envs" ]; then
-                    echo "envs:${full}#${num}:${full##*/}:::${num}"
-                  else
-                    echo "line:${full}#${num}:${full##*/}:::${num}"
-                  fi
+                # argocd-envs is the env's own parent chart, not a workload;
+                # its branch is a label now. No lookup, refused after the loop.
+                if [ "${full##*/}" = "argocd-envs" ]; then
+                  echo "envs:${full}#${num}:${full##*/}::"
                   continue
                 fi
-                # argocd-envs is the env's own parent chart, not a workload:
-                # no image to tag and no child Application to revision. Emit
-                # the head BRANCH so phase 2 can move the parent Application's
-                # source.targetRevision onto it. Branch, not head SHA, so a
-                # later push to the chart branch re-propagates on ArgoCD's own
-                # repo poll instead of needing this anchor's pipeline re-run.
-                # Fork branches are unreachable: ArgoCD only ever fetches the
-                # chart from this repoURL.
-                if [ "${full##*/}" = "argocd-envs" ]; then
-                  head_ref=""; head_repo=""
-                  read -r head_ref head_repo < <(
-                    gh_api "/repos/$full/pulls/$num" \
-                      | jq -r '[.head.ref // "", .head.repo.full_name // ""] | @tsv'
-                  ) || true
-                  if [ -z "${head_ref:-}" ] || [ -z "${head_repo:-}" ]; then
-                    echo "envs-missing:${full}#${num}:${full##*/}::"
-                  elif [ "$head_repo" != "$full" ]; then
-                    echo "envs-fork:${full}#${num}:${full##*/}:::${head_ref}"
-                  else
-                    echo "envs:${full}#${num}:${full##*/}:::${head_ref}"
-                  fi
+                # `#staging` / `#main`: reuse the linked repo's release
+                # pipeline outputs, moving ECR image tag + git branch.
+                if [ "$num" = "staging" ] || [ "$num" = "main" ]; then
+                  echo "line:${full}#${num}:${full##*/}:::${num}"
                   continue
                 fi
                 # Repos without an image: head SHA only, no ECR lookup.
@@ -513,194 +453,60 @@ runs:
           exit 1
         fi
 
-        # Pin the parent chart's own source revision. Unconditional: see the
-        # ENVS_REVISION declaration for why the default has to be written out
-        # rather than left alone.
-        set_args+=(--revision "$ENVS_REVISION")
-        if [ -n "$ENVS_LINK" ]; then
-          echo "Parent chart (argocd-envs) pinned to branch ${ENVS_REVISION} via ${ENVS_LINK}."
+        # The parent chart's branch is a label, not a line, so the line gets
+        # a comment saying which label to use instead of being ignored.
+        if [ "${#envs_links[@]}" -gt 0 ]; then
+          links="$(printf '%s, ' "${envs_links[@]}")"; links="${links%, }"
+          comment="$(printf '**PR-env deploy blocked.**\n\n`Deploys: argocd-envs#N` is no longer read: %s\n\nThe parent chart'"'"'s branch is a label on this PR, `argocd-envs:<branch>`, which Argo CD reads itself and follows as the branch moves. Add the label with the argocd-envs PR'"'"'s branch name, remove the line above from this description, and re-run the failed jobs from the Checks tab. Removing the label puts the environment back on `main`.' "$links")"
+          post_blocking_comment "$comment"
+          echo "::error::Refusing to deploy: Deploys: argocd-envs links (${links}); use the argocd-envs:<branch> label."
+          exit 1
         fi
 
-        # Install argocd CLI to a writable location if missing. /usr/local/bin
-        # is owned by root on self-hosted runners; $RUNNER_TEMP is per-job
-        # and always user-writable.
-        if command -v argocd >/dev/null 2>&1; then
-          ARGOCD_BIN=argocd
-        else
-          ARGOCD_BIN="${RUNNER_TEMP:-/tmp}/argocd"
-          if [ ! -x "$ARGOCD_BIN" ]; then
-            curl -sSLo "$ARGOCD_BIN" "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
-            chmod +x "$ARGOCD_BIN"
-          fi
-        fi
-
-        # Flags every argocd call needs, resolved once.
-        #
-        # --grpc-web is unconditional: it is harmless on a direct connection and
-        # required through the nginx ingress.
-        #
-        # --plaintext is the endpoint question. argocd-server runs with
-        # `server.insecure: true`, so it serves cleartext on Service port 80 and
-        # expects TLS to terminate upstream at the ingress. Talking to the
-        # Service directly therefore MUST be plaintext, and talking to the public
-        # hostname must NOT be. `auto` reads that off the endpoint rather than
-        # making callers keep two inputs consistent by hand; an explicit
-        # true/false still wins for anything this rule does not cover.
-        case "${ARGOCD_PLAINTEXT:-auto}" in
-          true)  ARGOCD_PLAINTEXT_RESOLVED=true ;;
-          false) ARGOCD_PLAINTEXT_RESOLVED=false ;;
-          auto)
-            case "$ARGOCD_SERVER" in
-              *.svc.cluster.local|*.svc.cluster.local:*|*.svc|*.svc:*|localhost|localhost:*|127.0.0.1|127.0.0.1:*)
-                ARGOCD_PLAINTEXT_RESOLVED=true ;;
-              *)
-                ARGOCD_PLAINTEXT_RESOLVED=false ;;
-            esac
-            ;;
-          *)
-            echo "::error::argocd-plaintext must be 'auto', 'true' or 'false' (got '${ARGOCD_PLAINTEXT}')."
-            exit 1
-            ;;
-        esac
-        ARGOCD_FLAGS=(--grpc-web)
-        if [ "$ARGOCD_PLAINTEXT_RESOLVED" = true ]; then
-          ARGOCD_FLAGS+=(--plaintext)
-        fi
-        echo "ArgoCD endpoint: ${ARGOCD_SERVER} (plaintext=${ARGOCD_PLAINTEXT_RESOLVED})"
-
-        # Skip `argocd login` — it doesn't honour --auth-token (login only
-        # accepts username/password/sso), and the ARGOCD_SERVER +
-        # ARGOCD_AUTH_TOKEN env vars set above are picked up by every
-        # subsequent argocd command directly.
-
-        # The `customer:` label is read only when the env is created. A parent
-        # that is absent or being deleted has nothing to compare: skip, and the
-        # `app set` retry below waits for the ApplicationSet to create it.
-        PARENT_JSON=""
-        get_errfile="$(mktemp)"
-        if ! PARENT_JSON="$("$ARGOCD_BIN" app get "$PARENT_APP" "${ARGOCD_FLAGS[@]}" -o json 2>"$get_errfile")"; then
-          PARENT_JSON=""
-          get_err="$(cat "$get_errfile")"
-          case "$get_err" in
-            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*|*"being deleted"*)
-              echo "Application ${PARENT_APP} not found or being deleted; skipping the customer label check."
-              ;;
-            *)
-              echo "argocd app get ${PARENT_APP} failed unexpectedly:" >&2
-              echo "$get_err" >&2
-              rm -f "$get_errfile"
-              exit 1
-              ;;
+        # What this run resolved, as tags.<repo>=<tag> and revisions.<repo>=<revision>
+        # lines for the writer, which replaces both maps in the file with
+        # exactly these. A link removed from the PR drops its pin here.
+        settings=()
+        for arg in "${set_args[@]}"; do
+          case "$arg" in
+            --helm-set) ;;
+            *) settings+=("$arg") ;;
           esac
-        fi
-        rm -f "$get_errfile"
-        if [ -n "$PARENT_JSON" ]; then
-          PARENT_HOST="$(jq -r '[.spec.source.helm.parameters[]? | select(.name=="hostBase") | .value] | first // ""' <<<"$PARENT_JSON")"
-          if [ "$LABEL_HOST" != "$PARENT_HOST" ]; then
-            comment="**PR-env deploy blocked.** This PR's \`customer:\` label does not match the environment that already exists (label: \`${LABEL_HOST}\`, env: \`${PARENT_HOST}\`). The label is read only when the env is created. Remove the \`deploy\` label, wait for the env to disappear, then add \`customer:<hostBase>\` first and \`deploy\` second."
-            post_blocking_comment "$comment"
-            echo "::error::Refusing to deploy: customer label '${LABEL_HOST}' does not match the existing env's hostBase '${PARENT_HOST}'."
-            exit 1
-          fi
-        fi
-
-        # Turn the staff console off when nothing selects it any more. Only the
-        # two staff console parameters go: a parent can carry other parameters
-        # set by hand, which this must keep. A parent that does not exist yet
-        # has none to unset.
-        if [ -n "$PARENT_JSON" ] && ! staff_console_selected; then
-          unset_args=()
-          while IFS= read -r param; do
-            unset_args+=(-p "$param")
-          done < <(staff_console_params "$PARENT_JSON")
-          if [ "${#unset_args[@]}" -gt 0 ]; then
-            echo "argocd app unset ${PARENT_APP} ${unset_args[*]}"
-            "$ARGOCD_BIN" app unset "$PARENT_APP" "${ARGOCD_FLAGS[@]}" "${unset_args[@]}"
-            echo "Staff console turned off: no mindshub_stafftools anchor or Deploys line selects it."
-          fi
-        fi
-
-        # Retry `app set` directly until the parent App is set-able. Three
-        # transient states are tolerated; anything else is fatal:
-        #   1. App doesn't exist yet — ApplicationSet hasn't run its 60s
-        #      requeue cycle and created it (NotFound, or PermissionDenied
-        #      for API-key accounts that can't see non-existent apps).
-        #   2. App exists but is being DELETED — label was removed then
-        #      re-added; AppSet is mid-delete before recreating. `app set`
-        #      returns "application is being deleted".
-        #   3. Network blip — covered by the same retry.
-        # 5 minutes is comfortably past both the AppSet requeue and the
-        # typical Application finaliser cleanup.
-        echo "argocd app set ${PARENT_APP} ${set_args[*]}"
-        for i in $(seq 1 30); do
-          if set_err="$("$ARGOCD_BIN" app set "$PARENT_APP" "${ARGOCD_FLAGS[@]}" "${set_args[@]}" 2>&1)"; then
-            break
-          fi
-          case "$set_err" in
-            *PermissionDenied*|*NotFound*|*"not found"*|*"permission denied"*|*"being deleted"*) ;;
-            *)
-              echo "argocd app set ${PARENT_APP} failed unexpectedly:" >&2
-              echo "$set_err" >&2
-              exit 1
-              ;;
-          esac
-          if [ "$i" -eq 30 ]; then
-            echo "Timed out waiting for Application ${PARENT_APP} to be set-able." >&2
-            echo "Last error: $set_err" >&2
-            echo "Check the PR carries the 'deploy' label and the ApplicationSet controller is healthy." >&2
-            exit 1
-          fi
-          echo "Application ${PARENT_APP} not set-able (attempt ${i}/30): $set_err"
-          sleep 10
         done
+        printf 'Deploying %s with:\n' "$PARENT_APP"
+        printf '  %s\n' "${settings[@]}"
 
-        # A sync operation may be in flight — e.g. the parent's very first
-        # automated sync, or a rollout from a previous commit stuck waiting on
-        # an unhealthy wave. `app set` updates the spec but does NOT interrupt
-        # a running operation, and ArgoCD won't start the auto-sync carrying
-        # the new parameters until the current operation ends — which it never
-        # does if a wave is wedged (e.g. ImagePullBackOff). Terminate it; the
-        # terminated operation ran with the OLD parameters, so automated sync
-        # immediately starts a fresh one with the parameters set above. When
-        # nothing is running the CLI errors ("Unable to terminate operation.
-        # No operation is in progress"), which is the normal case and fine.
-        # (TerminateOperation requires the `applications, sync` RBAC grant.)
-        if term_err="$("$ARGOCD_BIN" app terminate-op "$PARENT_APP" "${ARGOCD_FLAGS[@]}" 2>&1)"; then
-          echo "Terminated in-flight sync on ${PARENT_APP}; automated sync will restart with the new parameters."
-        else
-          echo "No in-flight sync to terminate on ${PARENT_APP} (${term_err})."
-        fi
+        # Write the environment's file in argocd-state. The parent Application
+        # reads it as its values; the push is retried when another deploy
+        # lands first.
+        python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet --user PyYAML
+        git -C argocd-state config user.name "mindsdb-release-train[bot]"
+        git -C argocd-state config user.email "mindsdb-release-train[bot]@users.noreply.github.com"
+        set_flags=()
+        for setting in "${settings[@]}"; do set_flags+=(--set "$setting"); done
+        write_out="${RUNNER_TEMP:-/tmp}/write-pr-env-state.out"
+        : > "$write_out"
+        python3 "$ACTION_PATH/../scripts/write_pr_env_state.py" \
+          --repo-dir argocd-state --branch "$STATE_BRANCH" --env "$PARENT_APP" \
+          "${set_flags[@]}" --github-output "$write_out"
+        STATUS_URL="${ARGOCD_URL}/applications/${PARENT_APP}?operation=true"
 
-        # Explicitly request a sync rather than waiting for the application
-        # controller's reconciliation poll to notice the spec change. The CLI
-        # call returns once the operation has been *queued* (--async); we
-        # don't wait for the full rollout here because parent syncs are
-        # wave-gated and can take minutes — that's argocd's job to drive
-        # from this point on.
-        #
-        # FailedPrecondition: "another operation is already in progress"
-        # means automated.sync ALREADY queued an op in response to our
-        # `app set` (which happens within ~ms when automated sync is on).
-        # That's the success case for us — bail with a friendly log, not
-        # exit 1. Any other failure (RBAC, connectivity) still fatals.
-        echo "argocd app sync ${PARENT_APP} --async"
-        if sync_err="$("$ARGOCD_BIN" app sync "$PARENT_APP" "${ARGOCD_FLAGS[@]}" --async 2>&1)"; then
-          echo "Sync queued."
+        # Mark the head commit as waiting for Argo CD. The notifications
+        # controller flips this status once the parent has synced, so a
+        # commit that pushed nothing keeps the status its last sync left.
+        if grep -qx 'pushed=true' "$write_out"; then
+          jq -n --arg url "$STATUS_URL" '{state: "pending", context: "argocd/pr-env", description: "Waiting for Argo CD to sync", target_url: $url}' \
+            | curl -sfX POST -H "Authorization: Bearer $STATUS_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$OWN_REPO/statuses/$OWN_HEAD_SHA" \
+                --data @- >/dev/null
         else
-          case "$sync_err" in
-            *"another operation is already in progress"*)
-              echo "Sync was already in progress (automated.sync picked up the app set change); nothing to do."
-              ;;
-            *)
-              echo "$sync_err" >&2
-              exit 1
-              ;;
-          esac
+          echo "Nothing pushed: reading the status Argo CD last set for ${OWN_HEAD_SHA}."
         fi
 
         # The env's mindshub_services SAM stack is not an ArgoCD child: the
         # pr-env-stacks workflow in mindsdb/mindshub_services deploys it from
-        # revisions.mindshub_services (just set above). Dispatch it for this
+        # revisions.mindshub_services (just written). Dispatch it for this
         # env now so the stack builds while the env rolls out, instead of on
         # that workflow's next scheduled run. Best-effort: a refused dispatch
         # (token without actions:write, or the workflow not yet on that
@@ -718,32 +524,27 @@ runs:
           fi
         fi
 
-        # Block until the whole env reaches Synced+Healthy with no in-flight
-        # sync, or fail the job after 30m. We wait on the LABEL SET (parent
-        # + every child Application), not just the parent: the parent's
-        # status.health.status is Healthy as soon as its rendered children
-        # exist, even when those children are still OutOfSync from the spec
-        # we just `app set`. Without `--sync` and `--operation`, wait would
-        # return immediately on the old pods' Healthy state. The label is
-        # written by the AppSet template onto the parent and by `prenv.labels`
-        # onto every child, so this one selector covers both.
-        WAIT_SELECTOR="pr-env.mindsdb.com/anchor-repo=${OWN_SLUG},pr-env.mindsdb.com/pr-number=${PR_NUMBER}"
-        echo "argocd app wait -l ${WAIT_SELECTOR} --sync --health --operation --timeout ${WAIT_TIMEOUT}"
-        if "$ARGOCD_BIN" app wait -l "$WAIT_SELECTOR" "${ARGOCD_FLAGS[@]}" --sync --health --operation --timeout "$WAIT_TIMEOUT"; then
-          exit 0
-        fi
-
-        # On timeout the CLI cancels its own watch stream and all it prints is
-        # `rpc error: code = Canceled desc = context canceled`, which names
-        # neither the stuck app nor the reason. Every Application already
-        # carries both in its status, so dump that instead. An app stuck
-        # Healthy-but-never-Synced is a spec ArgoCD cannot converge rather than
-        # a slow or crash-looping rollout; two apps rendering one Secret shows
-        # up here as SharedResourceWarning. Never let the diagnostics
-        # themselves fail the step ahead of the explicit exit below.
-        echo "::error::PR env did not converge within ${WAIT_TIMEOUT}s. State at timeout:"
-        "$ARGOCD_BIN" app list -l "$WAIT_SELECTOR" "${ARGOCD_FLAGS[@]}" -o json 2>/dev/null | jq -r '
-          .[] | "  \(.metadata.name)  sync=\(.status.sync.status)  health=\(.status.health.status)",
-                (.status.conditions[]? | "      \(.type): \(.message)")
-        ' >&2 || true
-        exit 1
+        # Wait for Argo CD's report on the head commit: success once the
+        # parent has synced and every child is Healthy, failure when the sync
+        # failed or timed out. Argo CD's own sync timeout is 30 minutes, so
+        # the wait ends one way or the other.
+        echo "Waiting for commit status argocd/pr-env on ${OWN_HEAD_SHA} (up to ${WAIT_TIMEOUT}s): ${STATUS_URL}"
+        deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
+        while :; do
+          state="$(gh_api "/repos/$OWN_REPO/commits/$OWN_HEAD_SHA/status" | jq -r '.statuses[] | select(.context == "argocd/pr-env") | .state' || true)"
+          case "$state" in
+            success)
+              echo "Argo CD deployed ${PARENT_APP} from ${OWN_HEAD_SHA}."
+              exit 0
+              ;;
+            failure|error)
+              echo "::error::Argo CD reported ${state} for ${PARENT_APP}: the parent's sync failed or timed out. The parent and each child's state: ${STATUS_URL}"
+              exit 1
+              ;;
+          esac
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "::error::Argo CD has not reported on ${OWN_HEAD_SHA} within ${WAIT_TIMEOUT}s. The parent and each child's state: ${STATUS_URL}"
+            exit 1
+          fi
+          sleep 20
+        done

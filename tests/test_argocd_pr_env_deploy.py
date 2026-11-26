@@ -4,13 +4,13 @@ When a `Deploys:` link cannot be resolved, the action refuses the deploy and
 comments on the PR. That comment is where the author learns how to retry, so
 it has to name a retry that keeps the env: removing the `deploy` label deletes
 the env and its database. The comment is rendered with the action's own
-`printf` line, run through bash, so the test reads the text authors see.
+`printf` line, run through bash, so the test reads the text authors see. A
+`Deploys: argocd-envs#N` line gets a comment naming the label that replaced it.
 
-The staff console is opt-in, and `app set` only ever adds parameters, so the
-action unsets the two staff console parameters when nothing selects the
-console any more. Those tests run the action's own shell, from the anchor's
-parameters through the `Deploys:` link loop, with GitHub stubbed and a fake
-`argocd` that records its arguments.
+The staff console is opt-in: it is selected by a mindshub_stafftools anchor or
+a `Deploys: mindshub_stafftools#...` line, and by nothing else. Those tests run
+the action's own shell, from the anchor's parameters through the `Deploys:`
+link loop, with GitHub stubbed, and read what the action hands the writer.
 """
 
 import os
@@ -66,10 +66,9 @@ NEEDS_RUNNER_BASH = pytest.mark.skipif(BASH_MAJOR < 4, reason="the action's link
 STAFF_FUNCTIONS_START = "is_revision_only_repo() {"
 LINKS_START = 'if is_revision_only_repo "$OWN_SHORT"; then'
 LINKS_END = "\n\n# Post a comment on the anchor PR"
-STAFF_OFF_START = "# Turn the staff console off when nothing selects it any more."
-STAFF_OFF_END = "\n\n# Retry `app set` directly"
-APP_SET_CALL = '"$ARGOCD_BIN" app set "$PARENT_APP"'
-PARENT_GET_CALL = '"$ARGOCD_BIN" app get "$PARENT_APP"'
+ENVS_BRANCH = 'if [ "${#envs_links[@]}" -gt 0 ]; then'
+SETTINGS_START = "# What this run resolved, as tags.<repo>=<tag>"
+SETTINGS_END = "\n\n# Write the environment's file in argocd-state."
 
 # Every linked PR resolves, and an argocd-envs link resolves to a branch on
 # argocd-envs itself, so the link loop runs without GitHub.
@@ -124,27 +123,30 @@ def staff_console_selected(own_short: str, body: str) -> bool:
     return run.stdout.splitlines()[-1] == "selected"
 
 
-def argocd_calls(tmp_path: Path, own_short: str, body: str, parent_json: str) -> list[str]:
-    """Run the switch-off block and return each `argocd` call it made."""
-    calls = tmp_path / "calls"
-    fake = tmp_path / "argocd"
-    fake.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >>"$CALLS"\n', encoding="utf-8")
-    fake.chmod(0o755)
-    script = deploy_script("ARGOCD_FLAGS=(--grpc-web --plaintext)", run_slice(STAFF_OFF_START, STAFF_OFF_END))
-    env = {
-        **deploy_env(own_short, body),
-        "CALLS": str(calls),
-        "ARGOCD_BIN": str(fake),
-        "PARENT_APP": "pr-mindshub-frontend-7",
-        "PARENT_JSON": parent_json,
-    }
-    subprocess.run(["bash", "-c", script], env=env, check=True)
-    return calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+def settings(own_short: str, body: str) -> list[str]:
+    """What the action hands the writer for this anchor and PR body: the lines after `Deploying <env> with:`."""
+    script = deploy_script("post_blocking_comment() { :; }", run_slice(ENVS_BRANCH, SETTINGS_START), run_slice(SETTINGS_START, SETTINGS_END))
+    env = {**deploy_env(own_short, body), "PARENT_APP": f"pr-{own_short.replace('_', '-')}-7"}
+    run = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=True)
+    lines = run.stdout.splitlines()
+    return [line.strip() for line in lines[lines.index(f"Deploying pr-{own_short.replace('_', '-')}-7 with:") + 1:]]
 
 
-def parent_with(*names: str) -> str:
-    params = ",".join(f'{{"name": "{name}", "value": "x"}}' for name in names)
-    return f'{{"spec": {{"source": {{"helm": {{"parameters": [{params}]}}}}}}}}'
+def envs_links_comment(links: str) -> str:
+    """Render the comment the action posts for a `Deploys: argocd-envs#N` line."""
+    branch = RUN.split(ENVS_BRANCH, 1)[1]
+    line = next(line.strip() for line in branch.splitlines() if line.strip().startswith('comment="$(printf'))
+    script = f'links="$1"\n{line}\nprintf "%s" "$comment"'
+    return subprocess.run(["bash", "-c", script, "_", links], capture_output=True, text=True, check=True).stdout
+
+
+class TestArgocdEnvsLinkComment:
+    def test_names_the_label_that_replaced_the_line(self):
+        comment = envs_links_comment("mindsdb/argocd-envs#40")
+        assert comment.startswith("**PR-env deploy blocked.**")
+        assert "is no longer read: mindsdb/argocd-envs#40\n" in comment
+        assert "`argocd-envs:<branch>`" in comment
+        assert "Removing the label puts the environment back on `main`." in comment
 
 
 @NEEDS_RUNNER_BASH
@@ -180,31 +182,41 @@ class TestStaffConsoleSelection:
 
 
 @NEEDS_RUNNER_BASH
-class TestStaffConsoleSwitchOff:
-    def test_unsets_only_the_two_staff_console_parameters(self, tmp_path):
-        parent = parent_with(
-            "tags.auth", "tags.mindshub_stafftools", "revisions.mindshub_stafftools", "revisions.mindshub_services"
-        )
-        assert argocd_calls(tmp_path, "mindshub_frontend", "Deploys: auth#5", parent) == [
-            "app unset pr-mindshub-frontend-7 --grpc-web --plaintext"
-            " -p tags.mindshub_stafftools -p revisions.mindshub_stafftools"
+class TestWhatTheWriterGets:
+    def test_the_anchors_own_image_and_chart_commit(self):
+        assert settings("mindshub_frontend", "") == ["tags.mindshub_frontend=development-merge", "revisions.mindshub_frontend=head"]
+
+    def test_every_kind_of_link(self):
+        body = "Deploys: auth#5\nDeploys: cowork-server#staging\nDeploys: mindshub_services#9\nDeploys: mindshub_stafftools#main"
+        assert settings("mindshub_frontend", body) == [
+            "tags.mindshub_frontend=development-merge", "revisions.mindshub_frontend=head",
+            "tags.auth=development-m", "revisions.auth=h",
+            "tags.cowork-server=staging", "revisions.cowork-server=staging",
+            "revisions.mindshub_services=h",
+            "tags.mindshub_stafftools=production", "revisions.mindshub_stafftools=main",
         ]
 
-    def test_leaves_a_parent_without_staff_console_parameters_alone(self, tmp_path):
-        # A customer env pins stafftools in its argocd-envs branch's values,
-        # not as parameters, so its console stays.
-        parent = parent_with("tags.mindshub_frontend", "revisions.mindshub_services")
-        assert argocd_calls(tmp_path, "mindshub_frontend", "Deploys: argocd-envs#5", parent) == []
+    def test_a_services_anchor_has_a_revision_and_no_image(self):
+        assert settings("mindshub_services", "") == ["revisions.mindshub_services=head"]
 
-    def test_keeps_a_selected_console(self, tmp_path):
-        parent = parent_with("tags.mindshub_stafftools", "revisions.mindshub_stafftools")
-        body = "Deploys: mindshub_stafftools#staging"
-        assert argocd_calls(tmp_path, "mindshub_frontend", body, parent) == []
-        assert argocd_calls(tmp_path, "mindshub_stafftools", "", parent) == []
+    def test_an_unselected_console_has_no_keys_to_keep(self):
+        # The writer replaces the file's maps with these, so the console's keys go with its line.
+        assert not any("mindshub_stafftools" in line for line in settings("mindshub_frontend", "Deploys: auth#5"))
 
-    def test_does_nothing_before_the_parent_exists(self, tmp_path):
-        assert argocd_calls(tmp_path, "mindshub_frontend", "", "") == []
+    def test_an_argocd_envs_link_is_refused_before_anything_is_written(self):
+        script = deploy_script("post_blocking_comment() { echo \"commented: $1\"; }", run_slice(ENVS_BRANCH, SETTINGS_START))
+        env = {**deploy_env("mindshub_frontend", "Deploys: argocd-envs#40\nDeploys: auth#5"), "PARENT_APP": "pr-mindshub-frontend-7"}
+        run = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        assert run.returncode == 1
+        assert "commented: **PR-env deploy blocked.**" in run.stdout
+        assert "::error::Refusing to deploy: Deploys: argocd-envs links (mindsdb/argocd-envs#40)" in run.stdout
 
 
-def test_the_switch_off_runs_after_reading_the_parent_and_before_app_set():
-    assert RUN.index(PARENT_GET_CALL) < RUN.index(STAFF_OFF_START) < RUN.index(APP_SET_CALL)
+def test_the_customer_label_is_refused_before_the_links_are_read():
+    assert RUN.index('if [ -n "$LABEL_HOST" ]; then') < RUN.index(STAFF_FUNCTIONS_START)
+    assert "A customer environment's file, pr-envs/${PARENT_APP}.yaml in argocd-state, is written by hand" in RUN
+
+
+def test_the_status_is_set_only_on_a_push_and_waited_on_either_way():
+    assert RUN.index("grep -qx 'pushed=true'") < RUN.index('context: "argocd/pr-env"') < RUN.index('select(.context == "argocd/pr-env")')
+    assert "argocd app" not in RUN
