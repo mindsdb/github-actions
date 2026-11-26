@@ -129,6 +129,26 @@ class TestRecord:
         with pytest.raises(StateError, match="not tags"):
             write_pr_env_state.record(tmp_path, "main", ENV, ["hostBase=acme"])
 
+    def test_api_host_alone_touches_nothing_else(self, remote):
+        bare, _seed, clone = remote
+        pushed, message = write_pr_env_state.record(clone, "main", ENV, api_host="new.execute-api.us-east-1.amazonaws.com")
+        assert pushed and message.startswith(f"pr-envs/{ENV}.yaml: services.apiHost=new.execute-api")
+        assert main_file(bare) == {**EXISTING, "services": {"apiHost": "new.execute-api.us-east-1.amazonaws.com"}}
+        assert git(bare, "log", "-1", "--format=%s", "main").strip() == f"{ENV}: services.apiHost new.execute-api.us-east-1.amazonaws.com"
+
+    def test_api_host_waits_for_the_environments_first_deploy(self, remote):
+        _bare, _seed, clone = remote
+        with pytest.raises(StateError, match="does not exist yet"):
+            write_pr_env_state.record(clone, "main", "pr-auth-3", api_host="x.execute-api.us-east-1.amazonaws.com")
+
+    def test_api_host_and_settings_are_one_or_the_other(self, tmp_path):
+        with pytest.raises(StateError, match="not both"):
+            write_pr_env_state.record(tmp_path, "main", ENV, OWN, api_host="x.example.com")
+        with pytest.raises(StateError, match="not neither"):
+            write_pr_env_state.record(tmp_path, "main", ENV)
+        with pytest.raises(StateError, match="not a hostname"):
+            write_pr_env_state.record(tmp_path, "main", ENV, api_host="https://x")
+
     def test_retries_when_the_branch_moves_during_the_push(self, remote, monkeypatch):
         bare, seed, clone = remote
         real_git = write_pr_env_state.push_change.__globals__["git"]
