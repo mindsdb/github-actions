@@ -503,10 +503,13 @@ set. To deploy again, push a commit.
 ```yaml
   deploy-pr-env:
     runs-on: ubuntu-latest
+    # Above the action's 30-minute wait-timeout, so the action reports why it
+    # stopped waiting before the job is cancelled.
+    timeout-minutes: 35
     permissions:
       contents: read
       id-token: write   # the ECR push role
-      statuses: write   # argocd/pr-env pending on the head commit
+      statuses: write   # set argocd/pr-env to pending, then read it while waiting
     steps:
       - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:

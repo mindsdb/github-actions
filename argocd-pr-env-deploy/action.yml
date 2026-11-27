@@ -58,7 +58,10 @@
 # synced and every child is healthy, or to failure when the sync fails or
 # times out (Kubernetes-Foundational-Services, argo-cd chart). The step waits
 # on the status (`wait-timeout`, 30m default) so the job stays open until the
-# env is actually up, and the integration tests after it run against it.
+# env is actually up, and the integration tests after it run against it. It
+# reads the status with `status-token`, the token that set it. The calling
+# job's `timeout-minutes` must exceed `wait-timeout`, or the job is cancelled
+# before the step can report why it stopped waiting.
 # Nothing here talks to Argo CD, so this runs on ubuntu-latest.
 #
 # A re-run of the same commit with nothing changed pushes nothing and reads
@@ -90,7 +93,10 @@ inputs:
     required: false
     default: main
   status-token:
-    description: A token that may write commit statuses on the calling repository.
+    description: >-
+      A token that may read and write commit statuses on the calling
+      repository. It sets argocd/pr-env to pending and reads it while the step
+      waits.
     required: false
     default: ${{ github.token }}
   argocd-url:
@@ -527,11 +533,24 @@ runs:
         # Wait for Argo CD's report on the head commit: success once the
         # parent has synced and every child is Healthy, failure when the sync
         # failed or timed out. Argo CD's own sync timeout is 30 minutes, so
-        # the wait ends one way or the other.
+        # the wait ends one way or the other. The read uses STATUS_TOKEN, the
+        # token that set the pending status: GH_TOKEN may read pull requests
+        # without the commit-status permission. A refused read is logged with
+        # its HTTP code, because it would otherwise look like no report yet.
         echo "Waiting for commit status argocd/pr-env on ${OWN_HEAD_SHA} (up to ${WAIT_TIMEOUT}s): ${STATUS_URL}"
+        status_out="${RUNNER_TEMP:-/tmp}/argocd-pr-env-status.json"
         deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
         while :; do
-          state="$(gh_api "/repos/$OWN_REPO/commits/$OWN_HEAD_SHA/status" | jq -r '.statuses[] | select(.context == "argocd/pr-env") | .state' || true)"
+          code="$(curl -sS -o "$status_out" -w '%{http_code}' \
+                    -H "Authorization: Bearer $STATUS_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/$OWN_REPO/commits/$OWN_HEAD_SHA/status" || true)"
+          state=""
+          if [ "$code" = 200 ]; then
+            state="$(jq -r '.statuses[] | select(.context == "argocd/pr-env") | .state' "$status_out" || true)"
+          else
+            echo "::warning::Reading the argocd/pr-env status on ${OWN_HEAD_SHA} returned HTTP ${code}. Retrying in 20s."
+          fi
           case "$state" in
             success)
               echo "Argo CD deployed ${PARENT_APP} from ${OWN_HEAD_SHA}."
@@ -543,7 +562,7 @@ runs:
               ;;
           esac
           if [ "$(date +%s)" -ge "$deadline" ]; then
-            echo "::error::Argo CD has not reported on ${OWN_HEAD_SHA} within ${WAIT_TIMEOUT}s. The parent and each child's state: ${STATUS_URL}"
+            echo "::error::Argo CD has not reported on ${OWN_HEAD_SHA} within ${WAIT_TIMEOUT}s (the last status read returned HTTP ${code}). The parent and each child's state: ${STATUS_URL}"
             exit 1
           fi
           sleep 20
