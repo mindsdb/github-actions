@@ -11,6 +11,10 @@ The staff console is opt-in: it is selected by a mindshub_stafftools anchor or
 a `Deploys: mindshub_stafftools#...` line, and by nothing else. Those tests run
 the action's own shell, from the anchor's parameters through the `Deploys:`
 link loop, with GitHub stubbed, and read what the action hands the writer.
+
+The wait for Argo CD's report reads the commit status with the status token,
+not the pull-request token, and a refused read names its HTTP code. Those tests
+run the action's wait loop against a stubbed `curl`.
 """
 
 import os
@@ -220,3 +224,57 @@ def test_the_customer_label_is_refused_before_the_links_are_read():
 def test_the_status_is_set_only_on_a_push_and_waited_on_either_way():
     assert RUN.index("grep -qx 'pushed=true'") < RUN.index('context: "argocd/pr-env"') < RUN.index('select(.context == "argocd/pr-env")')
     assert "argocd app" not in RUN
+
+
+WAIT_START = 'echo "Waiting for commit status argocd/pr-env'
+
+# GitHub answers the status read for the status token alone, as it does when the
+# pull-request token lacks the commit-status permission.
+CURL_STUB = r"""
+curl() {
+  local out="" auth=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) out="$2"; shift ;;
+      -H) case "$2" in Authorization:*) auth="$2" ;; esac; shift ;;
+    esac
+    shift
+  done
+  if [ "$auth" = "Authorization: Bearer status-token" ]; then
+    printf '%s' '{"statuses": [{"context": "argocd/pr-env", "state": "success"}]}' > "$out"; printf 200
+  else
+    printf '%s' '{"message": "Resource not accessible by personal access token"}' > "$out"; printf 403
+  fi
+}
+sleep() { :; }
+"""
+
+
+def wait_for_argocd(status_token: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run the action's wait loop once (WAIT_TIMEOUT=0) with the given status token."""
+    script = "\n".join(["set -euo pipefail", CURL_STUB, RUN[RUN.index(WAIT_START):]])
+    env = {
+        **os.environ,
+        "OWN_REPO": "mindsdb/repo",
+        "OWN_HEAD_SHA": "head",
+        "PARENT_APP": "pr-repo-7",
+        "STATUS_URL": "https://argo.example/applications/pr-repo-7",
+        "WAIT_TIMEOUT": "0",
+        "GH_TOKEN": "pull-request-token",
+        "STATUS_TOKEN": status_token,
+        "RUNNER_TEMP": str(tmp_path),
+    }
+    return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+
+
+class TestWaitingForArgocd:
+    def test_reads_the_status_with_the_status_token(self, tmp_path):
+        run = wait_for_argocd("status-token", tmp_path)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert "Argo CD deployed pr-repo-7 from head." in run.stdout
+
+    def test_a_refused_read_names_its_http_code(self, tmp_path):
+        run = wait_for_argocd("pull-request-token", tmp_path)
+        assert run.returncode == 1
+        assert "::warning::Reading the argocd/pr-env status on head returned HTTP 403." in run.stdout
+        assert "within 0s (the last status read returned HTTP 403)" in run.stdout
